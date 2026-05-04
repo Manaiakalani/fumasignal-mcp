@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "fumadocs": {
+      "command": "npx",
+      "args": ["-y", "fumasignal-mcp", "--url", "https://fumadocs.dev"]
+    }
+  }
+}

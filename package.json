@@ -1,0 +1,65 @@
+{
+  "name": "fumasignal-mcp",
+  "version": "0.1.0",
+  "description": "MCP server that lets AI assistants search and read any Fumadocs documentation site.",
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "fumadocs",
+    "documentation",
+    "ai",
+    "claude",
+    "cursor",
+    "llm"
+  ],
+  "homepage": "https://github.com/Manaiakalani/fumasignal-mcp#readme",
+  "bugs": "https://github.com/Manaiakalani/fumasignal-mcp/issues",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Manaiakalani/fumasignal-mcp.git"
+  },
+  "license": "MIT",
+  "author": "Manaiakalani",
+  "type": "module",
+  "bin": {
+    "fumasignal-mcp": "./dist/index.js"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "build": "tsup",
+    "dev": "tsup --watch",
+    "start": "node dist/index.js",
+    "typecheck": "tsc --noEmit && tsc --noEmit -p tsconfig.test.json",
+    "lint": "eslint .",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "prepublishOnly": "npm run build",
+    "inspector": "npx -y @modelcontextprotocol/inspector node dist/index.js"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.4",
+    "commander": "^12.1.0",
+    "gray-matter": "^4.0.3",
+    "pino": "^9.5.0",
+    "turndown": "^7.2.0",
+    "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "@changesets/cli": "^2.27.10",
+    "@types/node": "^22.10.1",
+    "@types/turndown": "^5.0.5",
+    "@typescript-eslint/eslint-plugin": "^8.18.0",
+    "@typescript-eslint/parser": "^8.18.0",
+    "eslint": "^9.16.0",
+    "tsup": "^8.3.5",
+    "typescript": "^5.7.2",
+    "vitest": "^2.1.8"
+  }
+}

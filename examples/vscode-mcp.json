@@ -1,0 +1,9 @@
+{
+  "servers": {
+    "fumadocs": {
+      "type": "stdio",
+      "command": "npx",
+      "args": ["-y", "fumasignal-mcp", "--url", "https://fumadocs.dev"]
+    }
+  }
+}

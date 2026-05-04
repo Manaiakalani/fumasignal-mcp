@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "fumadocs-local": {
+      "command": "npx",
+      "args": ["-y", "fumasignal-mcp", "--local", "/path/to/your/docs-project"]
+    }
+  }
+}
