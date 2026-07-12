@@ -1,7 +1,7 @@
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
 import { extractSection, extractToc } from '../lib/markdown.js';
-import { parseFrontmatter } from '../lib/frontmatter.js';
+import { parseFrontmatter, asNonEmptyString } from '../lib/frontmatter.js';
 import { hasPathPrefix } from '../lib/sitemap.js';
 import { logger } from '../lib/logger.js';
 import {
@@ -96,18 +96,19 @@ export class LocalFumadocsSource implements FumadocsSource {
         continue;
       }
       const toc = extractToc(body);
-      // Frontmatter is untrusted content: `meta.title` may be a YAML number,
-      // boolean, etc. despite the `string | undefined` cast below being a
-      // compile-time-only assertion. A non-string title would otherwise
-      // reach `search()`'s `.toLowerCase()` call and throw, breaking search
-      // for every page (not just this one) until the process restarts.
-      const rawTitle = meta.title;
+      // Frontmatter is untrusted content: `meta.title`/`meta.description`
+      // may be a YAML number, boolean, etc. A non-string title would
+      // otherwise reach `search()`'s `.toLowerCase()` call and throw,
+      // breaking search for every page (not just this one) until the
+      // process restarts; `asNonEmptyString()` guards both fields so a
+      // wrong-typed value falls through to the usual fallback chain
+      // instead of silently propagating.
       const title =
-        (typeof rawTitle === 'string' && rawTitle.trim() ? rawTitle : undefined) ??
+        asNonEmptyString(meta.title) ??
         firstHeading(body) ??
         slug.split('/').pop() ??
         'Untitled';
-      const description = meta.description as string | undefined;
+      const description = asNonEmptyString(meta.description);
       map.set(url, {
         filePath: file,
         slug,
