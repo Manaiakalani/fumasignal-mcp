@@ -94,6 +94,28 @@ export interface HeadingIndex {
 const MAX_HEADINGS = 5000;
 
 /**
+ * Upper bound on how many lines of a document `collectHeadings()` will
+ * scan and retain in the returned `HeadingIndex.lines`. Without this, an
+ * adversarial-but-plausible input - e.g. a file that's mostly newlines,
+ * well within `maxFileBytes`/`maxResponseBytes` on its own - splits into
+ * millions of (mostly empty) array entries that are then retained for
+ * the process's lifetime as part of the cached `HeadingIndex` (see its
+ * doc comment), long after `MAX_HEADINGS` above would have kicked in (a
+ * file with few/no actual headings never reaches it, since that bound
+ * only counts *headings found*, not lines scanned). Empirically
+ * confirmed: a 10MB input consisting of ~5,000,000 newlines retained a
+ * `lines` array that added ~85MB to the heap, indefinitely, for a
+ * single page - and `maxTotalBytes` permits many such files at once, so
+ * this is a real amplification of the byte caps rather than a one-off.
+ * 50,000 is far beyond any real documentation page's line count (a page
+ * with anywhere near that many lines would be unusable as a single
+ * document in any normal viewer), matching `MAX_HEADINGS`'s own
+ * reasoning: bound the pathological case to a small, predictable
+ * multiple of a reasonable page's actual size, not the raw byte cap.
+ */
+const MAX_LINES = 50_000;
+
+/**
  * Scan markdown for headings (outside fenced code blocks), assigning each a
  * unique anchor. Anchors are de-duplicated globally (not just against same
  * "base" text) so a generated anchor like "foo-1" can never collide with
@@ -103,7 +125,12 @@ const MAX_HEADINGS = 5000;
  * report and the anchors they can look up by are always in sync.
  */
 function collectHeadings(markdown: string): HeadingIndex {
-  const lines = markdown.split(/\r?\n/);
+  const allLines = markdown.split(/\r?\n/);
+  // Slicing (rather than just scanning fewer of `allLines`) lets the
+  // original, potentially huge array be garbage-collected once this
+  // function returns, instead of keeping it alive as part of `lines`'
+  // backing store - see MAX_LINES's doc comment for why that matters.
+  const lines = allLines.length > MAX_LINES ? allLines.slice(0, MAX_LINES) : allLines;
   const headings: Heading[] = [];
   let inFence = false;
   const nextSuffix = new Map<string, number>();

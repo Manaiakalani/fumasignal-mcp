@@ -77,6 +77,22 @@ describe('isPrivateOrReservedAddress', () => {
     expect(isPrivateOrReservedAddress('fe80::1%25eth0')).toBe(true); // percent-encoded zone id delimiter
   });
 
+  it('flags the deprecated IPv6 site-local range (fec0::/10)', () => {
+    // Regression: fe80::/10 (link-local) was checked, but the adjacent
+    // fec0::/10 site-local block - deprecated by RFC 3879 but still
+    // syntactically valid and potentially still configured on some
+    // networks - was not, leaving a gap a DNS-rebinding attacker could
+    // resolve a hostname into.
+    expect(isPrivateOrReservedAddress('fec0::1')).toBe(true); // fec0::/10 start
+    expect(isPrivateOrReservedAddress('feff::1')).toBe(true); // fec0::/10 end
+    expect(isPrivateOrReservedAddress('fedc:ba98::1')).toBe(true); // mid-range
+  });
+
+  it('does not misclassify addresses just outside the fe80::/10 and fec0::/10 boundaries', () => {
+    expect(isPrivateOrReservedAddress('fe7f:ffff::1')).toBe(false); // just below fe80::/10
+    expect(isPrivateOrReservedAddress('ff00::1')).toBe(true); // ff00::/8 multicast, not fe.. anymore - still private via multicast rule
+  });
+
   it('fails closed (treats as unsafe) for anything that is not a recognizable literal IP', () => {
     expect(isPrivateOrReservedAddress('not-an-ip')).toBe(true);
     expect(isPrivateOrReservedAddress('example.com')).toBe(true);

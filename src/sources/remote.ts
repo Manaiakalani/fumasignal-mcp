@@ -688,9 +688,18 @@ export class RemoteFumadocsSource implements FumadocsSource {
       // silently propagating a non-string into a `string`-typed field.
       const title = asNonEmptyString(meta.title) ?? extractTitle(markdown) ?? titleFromPath(target.pathname);
       const description = asNonEmptyString(meta.description);
+      // Include the query string in id/url, not just pathname: the cache
+      // key above already does (a query can genuinely change the fetched
+      // content - see its comment), so a query-bearing ref's returned
+      // id/url should identify the exact content actually returned rather
+      // than silently colliding with the query-less page's identity. This
+      // also keeps id/url round-trippable as a `ref` back into
+      // get_page/get_toc/get_section (resolveRef() parses a leading-slash
+      // ref through `new URL()`, which preserves the query string).
+      const identity = target.pathname + target.search;
       const content: PageContent = {
-        id: target.pathname,
-        url: target.pathname,
+        id: identity,
+        url: identity,
         title,
         description,
         segments: target.pathname.split('/').filter(Boolean),

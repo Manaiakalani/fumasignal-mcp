@@ -220,6 +220,58 @@ describe('LocalFumadocsSource', () => {
     expect(section.markdown).not.toContain('beta');
   });
 
+  it('produces a body-relevant excerpt when only a later query token (not the first) appears in the body', async () => {
+    // Regression: search() called snippet(page.body, tokens[0] ?? '') -
+    // only the *first* query token. A page can match a multi-token query
+    // because its title contains one token while its body contains a
+    // *different* one (search()'s own scoring checks title/description/
+    // toc/body independently) - in that case the old code's snippet()
+    // found no match for tokens[0] anywhere in body and silently fell
+    // back to an arbitrary body.slice(0, 200), producing an excerpt with
+    // no relevance to why the page actually matched.
+    const dir = await mkdtemp(path.join(os.tmpdir(), 'fumasignal-local-multitoken-'));
+    try {
+      const docs = path.join(dir, 'content', 'docs');
+      await mkdir(docs, { recursive: true });
+      // "gizmo" only appears in the frontmatter title, never in the
+      // markdown body (the heading itself is deliberately different
+      // text) - enough filler before "widget" that body.slice(0, 200)
+      // would not reach it either.
+      const filler = 'unrelated filler text. '.repeat(20);
+      await writeFile(
+        path.join(docs, 'gizmo.md'),
+        `---\ntitle: Gizmo Manual\n---\n\n# Product Docs\n\n${filler}The special widget assembly process is described here.`,
+      );
+      const src = new LocalFumadocsSource({ rootDir: dir });
+      const hits = await src.search({ query: 'gizmo widget' });
+      expect(hits).toHaveLength(1);
+      const excerpt = hits[0]!.excerpt;
+      expect(excerpt).toBeDefined();
+      expect(excerpt).toContain('widget assembly process');
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('does not collapse the root page url to an empty string when urlPrefix is "/"', async () => {
+    // Regression: buildIndex()'s url computation was
+    // `slug ? \`${this.urlPrefix}/${slug}\` : this.urlPrefix` - for the
+    // root page (empty slug) with a root-mounted docs site (urlPrefix
+    // "/", normalized to "" by the trailing-slash-stripping regex above),
+    // this produced url === "": not a valid path, and unusable as a ref
+    // back into get_page/get_toc/get_section (MCP tool schemas require a
+    // non-empty `ref` string). resolveRef()'s own empty-ref fallback had
+    // the matching bug, so even calling getPage('') couldn't reach it.
+    const src = new LocalFumadocsSource({ rootDir: tmpDir, urlPrefix: '/' });
+    const pages = await src.listPages();
+    const root = pages.find((p) => p.title === 'Hello');
+    expect(root).toBeDefined();
+    expect(root!.url).toBe('/');
+    const page = await src.getPage('/');
+    expect(page.title).toBe('Hello');
+    expect(page.url).toBe('/');
+  });
+
   it('returns correct, independent results across repeated getSection()/getToc() calls for the same page', async () => {
     // Functional regression for the getSection()/buildIndex() refactor:
     // IndexedPage now stores one HeadingIndex, computed once in

@@ -90,6 +90,30 @@ describe('pickArticle', () => {
     expect(elapsed).toBeLessThan(500);
     expect(result).toBe(html);
   });
+
+  it('stays fast and does not blow up memory when the target tag appears just once amid a huge amount of unrelated ">" characters (existence-precheck-bypass regression)', () => {
+    // Regression: the "tag entirely absent" pre-check above only helps
+    // when `tag` never appears at all. Once the tag genuinely appears
+    // even a single time, the *old* implementation still unconditionally
+    // built a position array over every literal '>' in the *entire*
+    // remaining document via findAngleClosePositions(), regardless of
+    // how far away those '>' characters were from any real opener/
+    // closer. Empirically confirmed against the pre-fix logic: one real
+    // <article> tag followed by 8MB of unrelated '>' padding measured
+    // ~233MB of heap - almost identical to the "no tag at all" case
+    // above, because the fix for *that* case didn't help once the tag
+    // was actually present. The lazy, on-demand finders this was
+    // rewritten to use must only ever scan as far as the real match
+    // requires, so a genuine tag followed by a large amount of unrelated
+    // trailing content must resolve near-instantly, not scale with how
+    // much unrelated content follows it.
+    const html = '<article>hello</article>' + '>'.repeat(8_000_000);
+    const start = performance.now();
+    const result = pickArticle(html);
+    const elapsed = performance.now() - start;
+    expect(elapsed).toBeLessThan(500);
+    expect(result).toBe('hello');
+  });
 });
 
 describe('stripChrome', () => {
@@ -148,6 +172,22 @@ describe('stripChrome', () => {
     const elapsed = performance.now() - start;
     expect(elapsed).toBeLessThan(500);
     expect(result).toBe(html);
+  });
+
+  it('stays fast when a stripped tag appears just once amid a huge amount of unrelated ">" characters (existence-precheck-bypass regression)', () => {
+    // Same blind spot as pickArticle's matching test: once a tag is
+    // confirmed present, the old removeTagBlocks() still unconditionally
+    // scanned the *entire* remaining document for every literal '>'
+    // before ever using the tag's own position. A single real <nav>
+    // block followed by a large amount of unrelated trailing content
+    // must resolve near-instantly and correctly remove just that block.
+    const padding = '>'.repeat(8_000_000);
+    const html = '<nav>chrome</nav>' + padding;
+    const start = performance.now();
+    const result = stripChrome(html);
+    const elapsed = performance.now() - start;
+    expect(elapsed).toBeLessThan(500);
+    expect(result).toBe(padding);
   });
 });
 

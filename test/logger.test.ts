@@ -144,6 +144,23 @@ describe('redactUrlForLogging', () => {
     expect(redacted).not.toContain('s3cret');
   });
 
+  it('masks userinfo in a scheme-prefixed URL that WHATWG cannot parse', () => {
+    // Regression: the fallback regex required the string to start with
+    // "//" (or whitespace then "//"), so a value that has a *scheme*
+    // before the "//" - but is otherwise malformed enough that `new URL()`
+    // throws, e.g. an unterminated IPv6 literal bracket - fell all the way
+    // through to "return unchanged", leaking the credential in full.
+    const redacted = redactUrlForLogging('https://user:SuperSecret123@[::1');
+    expect(redacted).toBe('https://***@[::1');
+    expect(redacted).not.toContain('SuperSecret123');
+  });
+
+  it('masks userinfo in a scheme-prefixed unparseable URL with leading whitespace', () => {
+    const redacted = redactUrlForLogging('  http://alice:s3cret@[::1');
+    expect(redacted).toBe('  http://***@[::1');
+    expect(redacted).not.toContain('s3cret');
+  });
+
   it('returns an empty string unchanged, without throwing', () => {
     expect(() => redactUrlForLogging('')).not.toThrow();
     expect(redactUrlForLogging('')).toBe('');

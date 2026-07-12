@@ -95,17 +95,22 @@ export function redactUrlForLogging(url: string): string {
     // Not parseable as a standalone absolute URL by the WHATWG parser.
     // Most commonly this is just a bare path (e.g. "/docs/foo"), which
     // structurally can't carry userinfo - safe to return unchanged rather
-    // than risk mangling it. But a *protocol-relative* URL
-    // ("//user:pass@host/...") is ALSO rejected here (the parser requires
-    // a base to resolve a leading "//" with no scheme), and unlike a bare
-    // path, that shape can carry real userinfo - operator-typed config
-    // values in particular aren't guaranteed to include a scheme. Mask it
-    // via a targeted pattern match on the original string rather than
-    // resolving against a synthetic base, which would fabricate a scheme
-    // that was never actually present and risk producing a misleading
-    // logged value.
+    // than risk mangling it. But two other shapes ALSO land here and can
+    // carry real userinfo: (1) a *protocol-relative* URL
+    // ("//user:pass@host/...") - the parser requires a base to resolve a
+    // leading "//" with no scheme; and (2) a URL that DOES have a scheme
+    // but that the parser otherwise rejects as malformed - e.g. an
+    // invalid port, an empty/missing host, or an unterminated IPv6
+    // bracket (empirically confirmed: "https://user:pass@[::1" throws
+    // "Invalid URL" despite unambiguously carrying userinfo). Operator
+    // config values aren't guaranteed to be well-formed, and a malformed
+    // URL is exactly the kind of value likely to end up echoed into an
+    // error message or log line. Mask both shapes via a targeted pattern
+    // match on the original string rather than resolving against a
+    // synthetic base, which would fabricate a scheme that was never
+    // actually present and risk producing a misleading logged value.
     //
-    // Two things the pattern has to get right that a naive "up to the
+    // Three things the pattern has to get right that a naive "up to the
     // first @" match doesn't: (1) WHATWG userinfo parsing treats the
     // *last* "@" before the next "/", "?", or "#" as the delimiter, not
     // the first - a password can itself contain "@" (e.g.
@@ -125,13 +130,18 @@ export function redactUrlForLogging(url: string): string {
     // unredacted) if there's leading whitespace before it. Capturing
     // optional leading whitespace alongside the "//" marker and preserving
     // it in the replacement handles that without weakening the match.
+    // (3) an optional `scheme:` immediately before the "//" - covering
+    // shape (2) above - is captured as part of the same leading-marker
+    // group so it's preserved unchanged in the output rather than eaten.
     //
     // Wrapped in truncateForLog(): this fallback runs on values the
     // WHATWG parser couldn't parse at all, which imposes no length limit
     // of its own (e.g. sitemap `<loc>` entries are bounded only by the
     // overall response-size cap, not any per-URL limit - see
     // MAX_LOGGED_FIELD_CHARS' doc comment).
-    return truncateForLog(url.replace(/^(\s*\/\/)([^/?#]*)@/, '$1***@'));
+    return truncateForLog(
+      url.replace(/^(\s*(?:[a-zA-Z][a-zA-Z0-9+.-]*:)?\/\/)([^/?#]*)@/, '$1***@'),
+    );
   }
   if (!parsed.username && !parsed.password) return truncateForLog(url);
   parsed.username = '***';

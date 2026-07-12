@@ -84,6 +84,28 @@ describe('extractToc', () => {
     expect(toc.length).toBeGreaterThan(0);
     expect(toc[0]!.title).toBe('Heading 0');
   });
+
+  it('caps the number of lines retained for a single document, independent of heading count (memory regression)', () => {
+    // Regression: collectHeadings() split the whole document into a
+    // `lines` array with no bound of its own - MAX_HEADINGS only limits
+    // *headings found*, not lines scanned/retained, so a file with few
+    // or no headings never triggered it. A newline-heavy file well
+    // within any per-file byte cap (e.g. 10MB of pure newlines - ~5M
+    // lines) split into millions of array entries that were then
+    // retained for the process's lifetime as part of the cached
+    // HeadingIndex, adding ~85MB of heap for a single such page.
+    // Line count must now be bounded regardless of heading count.
+    const bigMd = '\n'.repeat(200_000) + '# too far to see';
+    const index = buildHeadingIndex(bigMd);
+    expect(index.lines.length).toBeLessThanOrEqual(50_000);
+    // The one heading lives past the cap, so it must not be found.
+    expect(tocFromHeadingIndex(index)).toHaveLength(0);
+  });
+
+  it('still finds headings comfortably within the line cap', () => {
+    const md = '\n'.repeat(10) + '# Reachable';
+    expect(extractToc(md).map((t) => t.title)).toEqual(['Reachable']);
+  });
 });
 
 describe('extractSection', () => {
