@@ -1,3 +1,4 @@
+import { posix as posixPath } from 'node:path';
 import { logger } from '../lib/logger.js';
 import { TtlCache } from '../lib/cache.js';
 import { htmlToMarkdown } from '../lib/html-to-md.js';
@@ -69,6 +70,45 @@ async function discardBody(res: Response): Promise<void> {
 }
 
 /**
+ * Percent-decode and normalize a URL pathname so a `hasPathPrefix()`
+ * authorization check can't be bypassed by encoded traversal segments.
+ *
+ * The WHATWG URL parser collapses *literal* "." / ".." path segments
+ * while parsing, but leaves percent-encoded ones untouched:
+ * `new URL('/docs/%2e%2e%2fapi/private', base).pathname` is unchanged
+ * (still literally "/docs/%2e%2e%2fapi/private"). `hasPathPrefix()`'s
+ * plain string-prefix check therefore sees this as "under /docs" - but
+ * a real upstream server/proxy/framework that decodes-then-normalizes
+ * (a very common, standard pattern) would resolve it to "/api/private",
+ * genuinely outside the configured docs prefix. Since an Authorization
+ * header (if configured) is attached to every same-origin request, that
+ * mismatch between what *we* validate and what the *upstream* actually
+ * serves is a real authorization-boundary bypass, not just a cosmetic
+ * quirk.
+ *
+ * Returns `null` (rather than throwing) if the pathname contains
+ * malformed percent-encoding - including "overlong" UTF-8 encodings
+ * sometimes used to smuggle traversal sequences past naive decoders,
+ * which `decodeURIComponent` also correctly rejects - so callers can
+ * fail closed with their own error type/message.
+ */
+function decodeAndNormalizePathname(pathname: string): string | null {
+  let decoded: string;
+  try {
+    decoded = decodeURIComponent(pathname);
+  } catch {
+    return null;
+  }
+  let normalized = posixPath.normalize(decoded);
+  if (normalized === '.') normalized = '/';
+  // path.posix.normalize() on an absolute ("/"-prefixed) input clamps at
+  // root rather than producing a leading ".." - but fail closed instead
+  // of assuming that holds for every possible input.
+  if (normalized !== '/' && !normalized.startsWith('/')) return null;
+  return normalized;
+}
+
+/**
  * A FumadocsSource that talks to a deployed Fumadocs site over HTTP.
  *
  * Strategy:
@@ -111,7 +151,7 @@ export class RemoteFumadocsSource implements FumadocsSource {
     const ttl = opts.cacheTtlMs ?? 5 * 60 * 1000;
     this.pageCache = new TtlCache(ttl, 500, {
       maxTotalSize: maxPageCacheBytes,
-      sizeOf: (page) => page.markdown.length,
+      sizeOf: (page) => pageContentSize(page, this.maxResponseBytes),
     });
     this.listCache = new TtlCache(ttl);
     this.llmsCache = new TtlCache(ttl);
@@ -157,11 +197,20 @@ export class RemoteFumadocsSource implements FumadocsSource {
     // attached to ANY same-origin fetch - so without this check,
     // getPage("/api/private") would happily fetch and return whatever
     // lives at that same-origin path. Restrict refs to docsPrefix.
-    if (!hasPathPrefix(u.pathname, this.docsPrefix)) {
+    //
+    // Check (and use) the *decoded, normalized* pathname rather than the
+    // raw one - see `decodeAndNormalizePathname()`'s doc comment for why
+    // the raw form alone is bypassable via encoded traversal segments.
+    const normalizedPath = decodeAndNormalizePathname(u.pathname);
+    if (normalizedPath === null) {
+      throw new SourceError(`Refusing to fetch a URL with an unresolvable path: ${u.pathname}`);
+    }
+    if (!hasPathPrefix(normalizedPath, this.docsPrefix)) {
       throw new SourceError(
         `Refusing to fetch a page outside the configured docs prefix "${this.docsPrefix}": ${u.pathname}`,
       );
     }
+    u.pathname = normalizedPath;
     return u;
   }
 
@@ -200,10 +249,17 @@ export class RemoteFumadocsSource implements FumadocsSource {
           `Refusing to fetch cross-origin URL: ${current.origin} (server is bound to ${this.base.origin})`,
         );
       }
-      if (hop > 0 && init.pathPrefix !== undefined && !hasPathPrefix(current.pathname, init.pathPrefix)) {
-        throw new SourceError(
-          `Refusing to follow a redirect outside the configured docs prefix "${init.pathPrefix}": ${current.pathname}`,
-        );
+      if (hop > 0 && init.pathPrefix !== undefined) {
+        // Same decode-then-normalize treatment as `resolveRef()` - a
+        // redirect Location header is just as capable of carrying an
+        // encoded traversal segment as a caller-supplied ref.
+        const normalizedPath = decodeAndNormalizePathname(current.pathname);
+        if (normalizedPath === null || !hasPathPrefix(normalizedPath, init.pathPrefix)) {
+          throw new SourceError(
+            `Refusing to follow a redirect outside the configured docs prefix "${init.pathPrefix}": ${current.pathname}`,
+          );
+        }
+        current.pathname = normalizedPath;
       }
       const res = await this.fetchImpl(current.toString(), {
         headers: init.headers,
@@ -285,14 +341,24 @@ export class RemoteFumadocsSource implements FumadocsSource {
     if (!all) {
       const urls = await this.fetchSitemapUrls(new URL('/sitemap.xml', this.base), 0, {
         fetches: 0,
+        visited: new Set(),
       });
       const filtered = filterToDocs(urls, this.base.toString(), this.docsPrefix);
-      all = filtered.map<PageSummary>(({ url: _url, path }) => ({
-        id: path,
-        url: path,
-        title: titleFromPath(path),
-        segments: path.split('/').filter(Boolean),
-      }));
+      // Dedup by path: a repeated <loc> (within one sitemap, or the same
+      // page legitimately listed in more than one) would otherwise
+      // inflate the returned/cached list with duplicate entries.
+      const seen = new Set<string>();
+      all = [];
+      for (const { path } of filtered) {
+        if (seen.has(path)) continue;
+        seen.add(path);
+        all.push({
+          id: path,
+          url: path,
+          title: titleFromPath(path),
+          segments: path.split('/').filter(Boolean),
+        });
+      }
       this.listCache.set('all', all);
       logger.debug({ count: all.length }, 'remote: built page list from sitemap');
     }
@@ -310,12 +376,24 @@ export class RemoteFumadocsSource implements FumadocsSource {
    * limit and a shared total-fetch budget (via `state`) so a malicious or
    * misconfigured site can't trigger unbounded fetching through deep
    * nesting or wide fan-out.
+   *
+   * `state.visited` dedupes by exact sitemap URL: without it, a
+   * `<sitemapindex>` that lists the same sub-sitemap `<loc>` many times
+   * would re-fetch and re-parse it every time (wasting the shared
+   * `MAX_SITEMAP_FETCHES` budget on redundant work instead of genuinely
+   * distinct sitemaps) and re-append its full URL list into `pages` each
+   * time, which - for a large leaf sitemap repeated near the fetch
+   * budget's limit - could transiently balloon memory well beyond what
+   * the *distinct* URL count would ever justify.
    */
   private async fetchSitemapUrls(
     url: URL,
     depth: number,
-    state: { fetches: number },
+    state: { fetches: number; visited: Set<string> },
   ): Promise<string[]> {
+    const key = url.toString();
+    if (state.visited.has(key)) return [];
+    state.visited.add(key);
     if (state.fetches >= MAX_SITEMAP_FETCHES) return [];
     state.fetches++;
     const res = await this.fetchSameOrigin(url, { headers: this.headers() });
@@ -497,6 +575,45 @@ function titleFromPath(pathname: string): string {
     .replace(/\b\w/g, (c) => c.toUpperCase());
 }
 
+/**
+ * Approximate a `PageContent`'s total in-memory footprint for the
+ * pageCache's byte budget. `markdown.length` alone (the original
+ * implementation) undercounts pages whose *frontmatter* (`meta`) is
+ * large but the markdown body is small: `meta` is arbitrary,
+ * caller-controlled YAML/JSON data bounded only by `maxResponseBytes`
+ * (10MB default), so a metadata-heavy/markdown-light page could occupy
+ * close to that per cache entry while being charged almost nothing
+ * against `maxPageCacheBytes` - defeating the exact aggregate-memory
+ * protection that option exists for (see its doc comment).
+ *
+ * `JSON.stringify` can throw on a circular object graph. YAML supports
+ * anchors/aliases (e.g. `a: &x\n  b: *x`), which js-yaml (via
+ * gray-matter) happily turns into a genuinely self-referential JS
+ * object - so this isn't just a theoretical concern for
+ * attacker-controlled frontmatter. Rather than let that throw escape a
+ * cache `set()` call, fall back to `maxResponseBytes` as a deliberately
+ * conservative (never-under-counting) estimate: the response that
+ * produced this page was already capped to that many bytes, so it's a
+ * safe upper bound regardless of the object's shape. `toc` is always
+ * built fresh from parsed markdown headings (see `extractToc()`), never
+ * aliased from untrusted input, so it can't be circular.
+ */
+function pageContentSize(page: PageContent, maxResponseBytes: number): number {
+  let metaSize: number;
+  try {
+    metaSize = JSON.stringify(page.meta).length;
+  } catch {
+    metaSize = maxResponseBytes;
+  }
+  return (
+    page.markdown.length +
+    page.title.length +
+    (page.description?.length ?? 0) +
+    metaSize +
+    JSON.stringify(page.toc).length
+  );
+}
+
 function extractTitle(markdown: string): string | undefined {
   const m = /^#\s+(.+?)\s*$/m.exec(markdown);
   return m ? m[1] : undefined;
@@ -504,8 +621,14 @@ function extractTitle(markdown: string): string | undefined {
 
 function extractHtmlMeta(html: string): Record<string, unknown> {
   const meta: Record<string, unknown> = {};
-  const titleMatch = /<title[^>]*>([^<]*)<\/title>/i.exec(html);
-  if (titleMatch) meta.title = decodeHtml(titleMatch[1]!.trim());
+  const title = extractTagText(html, 'title');
+  if (title !== null) meta.title = decodeHtml(title.trim());
+  // Note: the description/og:title regexes below use `[^"']*` (bounded
+  // by the surrounding quote characters, which the pattern's own literal
+  // prefix already contains) rather than `[^>]*` - empirically verified
+  // this doesn't reproduce the same quadratic blowup as the title regex
+  // did, since any two adjacent "attempts" are always within a small,
+  // constant distance of each other's quote characters. Left as-is.
   const descMatch =
     /<meta\s+name=["']description["']\s+content=["']([^"']*)["']/i.exec(html) ??
     /<meta\s+content=["']([^"']*)["']\s+name=["']description["']/i.exec(html);
@@ -513,6 +636,37 @@ function extractHtmlMeta(html: string): Record<string, unknown> {
   const ogTitle = /<meta\s+property=["']og:title["']\s+content=["']([^"']*)["']/i.exec(html);
   if (ogTitle && !meta.title) meta.title = decodeHtml(ogTitle[1]!);
   return meta;
+}
+
+/**
+ * Extract the text content of the first `<tag>...</tag>` in `html`,
+ * without the classic `<tag[^>]*>([^<]*)<\/tag>` regex's quadratic
+ * blowup on adversarial input with no reachable closing `>` (the same
+ * class of bug as `html-to-md.ts`'s `findLargestTagBlock` - see its doc
+ * comment for the full mechanism). Empirically confirmed: the original
+ * title regex alone took ~5.3s against 200KB of "<title" repeated with
+ * no ">" anywhere, scaling quadratically.
+ *
+ * Uses a *bounded* regex (`<tag\b`, no unbounded quantifier) to find the
+ * opening tag, then `String.indexOf` (never backtracks) to find first
+ * the opening tag's closing `>`, then the `</tag>` closer. Returns
+ * `null` (no title) if there's no opening tag, no closing `>` for it, no
+ * `</tag>` after that, or - matching the original `[^<]*` capture's
+ * semantics - if a stray `<` appears before the real closer.
+ */
+function extractTagText(html: string, tag: string): string | null {
+  const openMatch = new RegExp(`<${tag}\\b`, 'i').exec(html);
+  if (!openMatch) return null;
+  const openEnd = html.indexOf('>', openMatch.index + openMatch[0].length);
+  if (openEnd === -1) return null;
+  const contentStart = openEnd + 1;
+  const closeRe = new RegExp(`<\\/${tag}>`, 'gi');
+  closeRe.lastIndex = contentStart;
+  const closeMatch = closeRe.exec(html);
+  if (!closeMatch) return null;
+  const strayAngle = html.indexOf('<', contentStart);
+  if (strayAngle !== -1 && strayAngle < closeMatch.index) return null;
+  return html.slice(contentStart, closeMatch.index);
 }
 
 function decodeHtml(s: string): string {

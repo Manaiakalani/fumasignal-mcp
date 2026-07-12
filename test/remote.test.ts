@@ -124,6 +124,65 @@ describe('RemoteFumadocsSource', () => {
     expect(fetchCalls).toBeLessThan(10);
   });
 
+  it('fetches a sub-sitemap only once even if it is listed multiple times in one sitemap index', async () => {
+    // Regression: fetchSitemapUrls() previously had no visited-set (only
+    // a fetch-count budget), so a <sitemapindex> listing the same
+    // sub-sitemap <loc> multiple times would re-fetch and re-parse it
+    // every time - wasting the shared MAX_SITEMAP_FETCHES budget on
+    // redundant work instead of genuinely distinct sitemaps, and
+    // re-appending its full URL list each time.
+    const indexXml = `<?xml version="1.0"?>
+<sitemapindex>
+  <loc>https://example.com/sitemap-a.xml</loc>
+  <loc>https://example.com/sitemap-a.xml</loc>
+  <loc>https://example.com/sitemap-a.xml</loc>
+</sitemapindex>`;
+    const sitemapA = `<?xml version="1.0"?>
+<urlset>
+  <url><loc>https://example.com/docs/a1</loc></url>
+</urlset>`;
+    let fetchCalls = 0;
+    let sitemapAFetches = 0;
+    const baseFetch = makeFetch({
+      'https://example.com/sitemap.xml': { body: indexXml, contentType: 'application/xml' },
+      'https://example.com/sitemap-a.xml': { body: sitemapA, contentType: 'application/xml' },
+    });
+    const src = new RemoteFumadocsSource({
+      baseUrl,
+      fetchImpl: async (input, init) => {
+        fetchCalls++;
+        const url = (typeof input === 'string' ? input : input.toString()).split('?')[0];
+        if (url === 'https://example.com/sitemap-a.xml') sitemapAFetches++;
+        return baseFetch(input, init);
+      },
+    });
+    const pages = await src.listPages();
+    expect(sitemapAFetches).toBe(1);
+    expect(fetchCalls).toBe(2); // 1 for the index + 1 for sitemap-a (deduped)
+    expect(pages.map((p) => p.url)).toEqual(['/docs/a1']);
+  });
+
+  it('dedups the final page list when the same page appears more than once in a sitemap', async () => {
+    // Regression: filterToDocs()/listPages() never deduped the final page
+    // list - a repeated <loc> within one sitemap (or the same page
+    // legitimately listed more than once) would inflate the
+    // returned/cached list with duplicate entries.
+    const sitemapWithDup = `<?xml version="1.0"?>
+<urlset>
+  <url><loc>https://example.com/docs/dup</loc></url>
+  <url><loc>https://example.com/docs/dup</loc></url>
+  <url><loc>https://example.com/docs/other</loc></url>
+</urlset>`;
+    const src = new RemoteFumadocsSource({
+      baseUrl,
+      fetchImpl: makeFetch({
+        'https://example.com/sitemap.xml': { body: sitemapWithDup, contentType: 'application/xml' },
+      }),
+    });
+    const pages = await src.listPages();
+    expect(pages.map((p) => p.url).sort()).toEqual(['/docs/dup', '/docs/other']);
+  });
+
   it('bounds total sitemap fetches on wide fan-out instead of fetching every shard', async () => {
     // A single-level index with far more children than the total-fetch
     // budget allows. The depth guard alone wouldn't help here (depth
@@ -181,6 +240,69 @@ describe('RemoteFumadocsSource', () => {
     const afterTwoFetches = fetchCount;
     await src.getPage('/docs/a'); // must re-fetch over the network since 'a' was evicted
     expect(fetchCount).toBeGreaterThan(afterTwoFetches);
+  });
+
+  it('counts frontmatter/meta size toward maxPageCacheBytes, not just markdown length', async () => {
+    // Regression: pageCache's sizeOf used to be `page.markdown.length`
+    // only, ignoring meta/title/description/toc entirely. A page with
+    // near-zero markdown but a huge frontmatter block could occupy
+    // megabytes of memory while registering as ~0 bytes against
+    // maxPageCacheBytes - the "500 metadata-heavy pages -> ~5GB" scenario
+    // maxPageCacheBytes's own doc comment warns about. pageContentSize()
+    // must count meta too, so this budget (far larger than either page's
+    // tiny markdown, but smaller than two pages' combined frontmatter)
+    // still triggers eviction.
+    const bigFrontmatter = 'x'.repeat(300);
+    let fetchCount = 0;
+    const baseFetch = makeFetch({
+      'https://example.com/docs/a.md': {
+        body: `---\ntitle: A\nextra: "${bigFrontmatter}"\n---\n\ntiny`,
+        contentType: 'text/markdown',
+      },
+      'https://example.com/docs/b.md': {
+        body: `---\ntitle: B\nextra: "${bigFrontmatter}"\n---\n\ntiny`,
+        contentType: 'text/markdown',
+      },
+    });
+    const src = new RemoteFumadocsSource({
+      baseUrl,
+      // Markdown alone ("tiny", 4 bytes) would never trip this budget -
+      // only counting the frontmatter too does.
+      maxPageCacheBytes: 350,
+      fetchImpl: async (input, init) => {
+        fetchCount++;
+        return baseFetch(input, init);
+      },
+    });
+    await src.getPage('/docs/a');
+    await src.getPage('/docs/b'); // combined meta size pushes over budget -> evicts 'a'
+    const afterTwoFetches = fetchCount;
+    await src.getPage('/docs/a'); // must re-fetch since 'a' was evicted
+    expect(fetchCount).toBeGreaterThan(afterTwoFetches);
+  });
+
+  it('does not crash when a page has circular-reference frontmatter (YAML anchors/aliases)', async () => {
+    // Regression: pageContentSize() computes metadata size via
+    // JSON.stringify(page.meta).length. YAML anchors/aliases (gray-matter's
+    // underlying js-yaml engine) can produce a genuinely self-referential
+    // object (`a: &x\n  b: *x` parses to `a.b === a`), which
+    // JSON.stringify() throws on ("Converting circular structure to
+    // JSON"). Must fall back to a conservative size estimate instead of
+    // crashing getPage()/the cache on attacker-controlled frontmatter.
+    const src = new RemoteFumadocsSource({
+      baseUrl,
+      fetchImpl: makeFetch({
+        'https://example.com/docs/circular.md': {
+          body: `---\na: &anchor\n  b: *anchor\n---\n\n# Circular\n\nbody`,
+          contentType: 'text/markdown',
+        },
+      }),
+    });
+    const page = await src.getPage('/docs/circular');
+    expect(page.title).toBe('Circular');
+    // Confirms the frontmatter is genuinely circular (not silently
+    // stripped by some other code path) and getPage() still succeeded.
+    expect((page.meta.a as Record<string, unknown>).b).toBe(page.meta.a);
   });
 
   it('parses Orama-style search responses', async () => {
@@ -294,6 +416,29 @@ describe('RemoteFumadocsSource', () => {
     expect(page.markdown).not.toContain('nav junk');
   });
 
+  it('extracts the title from HTML in bounded time despite adversarial "<title" input with no ">" anywhere', async () => {
+    // Regression: the original title regex (`<title[^>]*>([^<]*)<\/title>`)
+    // had an independent, unbounded backtracking blowup - on input with
+    // many "<title" occurrences and no reachable ">", each attempt scans
+    // to the end of the string before failing, repeated at every position
+    // -> O(n^2), even for a single non-global .exec(). Empirically ~5.3s
+    // for 200KB before the fix; extractTagText() must resolve this in
+    // bounded (roughly linear) time.
+    const adversarial = '<title'.repeat(50_000);
+    const html = `<!doctype html><head>${adversarial}</head><body><article><h1>Real</h1><p>content that should appear in the markdown output</p></article></body></html>`;
+    const src = new RemoteFumadocsSource({
+      baseUrl,
+      fetchImpl: makeFetch({
+        'https://example.com/docs/slow': { body: html, contentType: 'text/html' },
+      }),
+    });
+    const start = Date.now();
+    const page = await src.getPage('/docs/slow');
+    const elapsed = Date.now() - start;
+    expect(elapsed).toBeLessThan(1000);
+    expect(page.markdown).toContain('content that should appear');
+  });
+
   it('returns null for missing llms.txt', async () => {
     const src = new RemoteFumadocsSource({
       baseUrl,
@@ -348,6 +493,51 @@ describe('RemoteFumadocsSource', () => {
     await expect(src.getPage('/api/private')).rejects.toThrow(/docs prefix/i);
   });
 
+  it('rejects a percent-encoded path-traversal ref that would escape the docs prefix', async () => {
+    // Regression (CWE-22): the WHATWG URL parser collapses *literal* "."
+    // / ".." segments while parsing, but leaves percent-encoded ones
+    // ("%2e%2e%2f") untouched in .pathname - hasPathPrefix()'s plain
+    // string-prefix check was fooled by this, since "/docs/%2e%2e%2fapi/private"
+    // starts with "/docs" even though it decodes+normalizes to
+    // "/api/private", outside the configured prefix.
+    const src = new RemoteFumadocsSource({
+      baseUrl,
+      authHeader: '******',
+      fetchImpl: makeFetch({
+        'https://example.com/api/private': { body: 'top secret', contentType: 'text/plain' },
+      }),
+    });
+    await expect(src.getPage('/docs/%2e%2e%2fapi/private')).rejects.toThrow(/docs prefix/i);
+  });
+
+  it('rejects a ref with malformed percent-encoding instead of treating it as a literal path', async () => {
+    // Regression: decodeURIComponent throws on malformed percent-encoding
+    // (including "overlong" UTF-8 encodings sometimes used to smuggle
+    // traversal sequences past naive decoders) - must fail closed rather
+    // than silently falling back to the raw, unvalidated pathname.
+    const src = new RemoteFumadocsSource({
+      baseUrl,
+      fetchImpl: makeFetch({}),
+    });
+    await expect(src.getPage('/docs/%zz')).rejects.toThrow(/unresolvable path/i);
+  });
+
+  it('still fetches a page whose ref contains a legitimate percent-encoded character', async () => {
+    // The decode+normalize fix must not break legitimate encoded
+    // characters that don't involve any "." / ".." segment.
+    const src = new RemoteFumadocsSource({
+      baseUrl,
+      fetchImpl: makeFetch({
+        'https://example.com/docs/getting%20started.md': {
+          body: '# Getting Started\n\nbody',
+          contentType: 'text/markdown',
+        },
+      }),
+    });
+    const page = await src.getPage('/docs/getting%20started');
+    expect(page.title).toBe('Getting Started');
+  });
+
   it('allows a ref exactly at the docs prefix root', async () => {
     // The docs-prefix check must not reject the prefix itself (e.g. "/docs"
     // exactly, with no trailing segment) - only paths outside of it.
@@ -375,6 +565,27 @@ describe('RemoteFumadocsSource', () => {
           status: 302,
           body: '',
           headers: { location: '/api/private' },
+        },
+        'https://example.com/api/private': { body: 'top secret', contentType: 'text/plain' },
+      }),
+    });
+    await expect(src.getPage('/docs/redir')).rejects.toThrow(/docs prefix/i);
+  });
+
+  it('refuses a redirect Location header containing a percent-encoded path traversal', async () => {
+    // Regression: a redirect Location header is just as capable of
+    // carrying an encoded traversal segment ("%2e%2e%2f") as a
+    // caller-supplied ref - the literal-prefix check on the raw
+    // (non-normalized) pathname would miss it, the same way resolveRef's
+    // did before the decode+normalize fix.
+    const src = new RemoteFumadocsSource({
+      baseUrl,
+      authHeader: '******',
+      fetchImpl: makeFetch({
+        'https://example.com/docs/redir.md': {
+          status: 302,
+          body: '',
+          headers: { location: '/docs/%2e%2e%2fapi/private' },
         },
         'https://example.com/api/private': { body: 'top secret', contentType: 'text/plain' },
       }),
