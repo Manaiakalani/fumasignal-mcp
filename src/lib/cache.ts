@@ -44,18 +44,35 @@ export class Coalescer<K, V> {
  * however many distinct requests a caller decides to issue at once, with
  * nothing in this file capping it. A semaphore bounds that directly,
  * regardless of how many distinct keys are involved.
+ *
+ * The *active* slot count above is bounded by construction, but callers
+ * that lose the race for a slot wait in `queue` instead - and that queue
+ * has its own unbounded-growth risk: a caller issuing many concurrent
+ * `run()` calls for distinct keys (e.g. one MCP tool call per call, each
+ * with its own ref/query) queues one closure per call beyond the active
+ * cap, with nothing bounding how many can pile up. `maxQueueLength`
+ * closes that the same way every other budget in this file is enforced -
+ * reject once the limit is hit rather than let the backlog grow
+ * unboundedly - instead of only bounding how much work runs at once.
  */
 export class Semaphore {
   private available: number;
   private queue: Array<() => void> = [];
+  private readonly maxQueueLength: number;
 
-  constructor(maxConcurrent: number) {
+  constructor(maxConcurrent: number, maxQueueLength = 1000) {
     if (!Number.isInteger(maxConcurrent) || maxConcurrent < 1) {
       throw new RangeError(
         `Semaphore: maxConcurrent must be a positive integer, got ${maxConcurrent}`,
       );
     }
+    if (!Number.isInteger(maxQueueLength) || maxQueueLength < 0) {
+      throw new RangeError(
+        `Semaphore: maxQueueLength must be a non-negative integer, got ${maxQueueLength}`,
+      );
+    }
     this.available = maxConcurrent;
+    this.maxQueueLength = maxQueueLength;
   }
 
   async run<T>(fn: () => Promise<T>): Promise<T> {
@@ -71,6 +88,13 @@ export class Semaphore {
     if (this.available > 0) {
       this.available--;
       return Promise.resolve();
+    }
+    if (this.queue.length >= this.maxQueueLength) {
+      return Promise.reject(
+        new Error(
+          `Semaphore: queue limit (${this.maxQueueLength}) exceeded - too many callers waiting for a slot`,
+        ),
+      );
     }
     return new Promise((resolve) => {
       this.queue.push(() => {

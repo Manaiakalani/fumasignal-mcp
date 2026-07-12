@@ -1074,6 +1074,30 @@ describe('RemoteFumadocsSource', () => {
     await expect(src.getPage('/docs/intro')).rejects.toThrow(/private\/internal address/i);
   });
 
+  it('rejects a fetch when the DNS check itself fails to resolve (fails closed, not open)', async () => {
+    // Regression: this used to fail *open* - a lookup error was swallowed
+    // and the request allowed to proceed, on the assumption that fetch()'s
+    // own resolution would fail moments later anyway. That assumption
+    // isn't safe against a DNS-controlled adversary who can make this
+    // explicit lookup fail while a differently-shaped query from fetch()'s
+    // own resolution still succeeds - see net-safety.ts's catch-block
+    // comment. An inability to verify a hostname is public must now be
+    // treated as unsafe, not waved through.
+    const src = new RemoteFumadocsSource({
+      baseUrl,
+      dnsLookup: async () => {
+        throw new Error('ENOTFOUND');
+      },
+      fetchImpl: makeFetch({
+        'https://example.com/docs/intro.md': {
+          body: `---\ntitle: Intro\n---\n\nbody`,
+          contentType: 'text/markdown',
+        },
+      }),
+    });
+    await expect(src.getPage('/docs/intro')).rejects.toThrow(/DNS resolution failed/i);
+  });
+
   it('does not perform a DNS check when baseUrl is a literal IP (no resolution step to hijack)', async () => {
     const dnsLookup = vi.fn().mockResolvedValue([{ address: '169.254.169.254' }]);
     const src = new RemoteFumadocsSource({
