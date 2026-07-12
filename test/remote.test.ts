@@ -44,6 +44,145 @@ describe('RemoteFumadocsSource', () => {
     expect(pages.map((p) => p.url).sort()).toEqual(['/docs/api/auth', '/docs/intro']);
   });
 
+  it('recurses into a sitemap index and aggregates pages from nested sitemaps', async () => {
+    // Regression: large/sharded sites often serve a <sitemapindex> whose
+    // <loc> entries point to OTHER sitemaps, not pages. Previously
+    // unhandled: parseSitemap() would extract those sub-sitemap URLs as if
+    // they were page URLs, filterToDocs() would reject them (they don't
+    // match docsPrefix), and listPages() would silently return zero pages.
+    const indexXml = `<?xml version="1.0"?>
+<sitemapindex>
+  <loc>https://example.com/sitemap-a.xml</loc>
+  <loc>https://example.com/sitemap-b.xml</loc>
+</sitemapindex>`;
+    const sitemapA = `<?xml version="1.0"?>
+<urlset>
+  <url><loc>https://example.com/docs/a1</loc></url>
+</urlset>`;
+    const sitemapB = `<?xml version="1.0"?>
+<urlset>
+  <url><loc>https://example.com/docs/b1</loc></url>
+</urlset>`;
+    const src = new RemoteFumadocsSource({
+      baseUrl,
+      fetchImpl: makeFetch({
+        'https://example.com/sitemap.xml': { body: indexXml, contentType: 'application/xml' },
+        'https://example.com/sitemap-a.xml': { body: sitemapA, contentType: 'application/xml' },
+        'https://example.com/sitemap-b.xml': { body: sitemapB, contentType: 'application/xml' },
+      }),
+    });
+    const pages = await src.listPages();
+    expect(pages.map((p) => p.url).sort()).toEqual(['/docs/a1', '/docs/b1']);
+  });
+
+  it('skips a nested sitemap that fails to fetch, rather than failing listPages entirely', async () => {
+    const indexXml = `<?xml version="1.0"?>
+<sitemapindex>
+  <loc>https://example.com/sitemap-a.xml</loc>
+  <loc>https://example.com/sitemap-missing.xml</loc>
+</sitemapindex>`;
+    const sitemapA = `<?xml version="1.0"?>
+<urlset>
+  <url><loc>https://example.com/docs/a1</loc></url>
+</urlset>`;
+    const src = new RemoteFumadocsSource({
+      baseUrl,
+      fetchImpl: makeFetch({
+        'https://example.com/sitemap.xml': { body: indexXml, contentType: 'application/xml' },
+        'https://example.com/sitemap-a.xml': { body: sitemapA, contentType: 'application/xml' },
+        // sitemap-missing.xml intentionally absent -> fetchImpl 404s it
+      }),
+    });
+    const pages = await src.listPages();
+    expect(pages.map((p) => p.url)).toEqual(['/docs/a1']);
+  });
+
+  it('bounds recursion depth on a self-referential sitemap index instead of hanging', async () => {
+    // A sitemap index whose single entry points back to itself. The depth
+    // guard (MAX_SITEMAP_INDEX_DEPTH) must stop this quickly rather than
+    // relying solely on the total-fetch-count guard, which would take many
+    // more sequential round-trips to kick in on a single-child chain.
+    const selfIndexXml = `<?xml version="1.0"?>
+<sitemapindex>
+  <loc>https://example.com/sitemap.xml</loc>
+</sitemapindex>`;
+    let fetchCalls = 0;
+    const baseFetch = makeFetch({
+      'https://example.com/sitemap.xml': { body: selfIndexXml, contentType: 'application/xml' },
+    });
+    const src = new RemoteFumadocsSource({
+      baseUrl,
+      fetchImpl: async (input, init) => {
+        fetchCalls++;
+        return baseFetch(input, init);
+      },
+    });
+    const pages = await src.listPages();
+    expect(pages).toEqual([]);
+    // Depth-bounded: a handful of hops (depth limit + 1), nowhere near the
+    // 200-fetch total budget.
+    expect(fetchCalls).toBeLessThan(10);
+  });
+
+  it('bounds total sitemap fetches on wide fan-out instead of fetching every shard', async () => {
+    // A single-level index with far more children than the total-fetch
+    // budget allows. The depth guard alone wouldn't help here (depth
+    // never exceeds 1) - this exercises the shared fetch-count budget.
+    const subCount = 250;
+    const routes: Record<string, { body: string; contentType?: string }> = {
+      'https://example.com/sitemap.xml': {
+        body: `<?xml version="1.0"?>\n<sitemapindex>\n${Array.from(
+          { length: subCount },
+          (_, i) => `  <loc>https://example.com/sitemap-${i}.xml</loc>`,
+        ).join('\n')}\n</sitemapindex>`,
+        contentType: 'application/xml',
+      },
+    };
+    for (let i = 0; i < subCount; i++) {
+      routes[`https://example.com/sitemap-${i}.xml`] = {
+        body: `<?xml version="1.0"?>\n<urlset>\n  <url><loc>https://example.com/docs/page-${i}</loc></url>\n</urlset>`,
+        contentType: 'application/xml',
+      };
+    }
+    let fetchCalls = 0;
+    const baseFetch = makeFetch(routes);
+    const src = new RemoteFumadocsSource({
+      baseUrl,
+      fetchImpl: async (input, init) => {
+        fetchCalls++;
+        return baseFetch(input, init);
+      },
+    });
+    const pages = await src.listPages();
+    expect(fetchCalls).toBeLessThanOrEqual(200);
+    expect(pages.length).toBeLessThan(subCount);
+  });
+
+  it('evicts least-recently-used pages from pageCache once maxPageCacheBytes is exceeded', async () => {
+    // Regression: without a byte budget, up to 500 (default maxEntries)
+    // cached pages could each hold up to maxResponseBytes of markdown,
+    // letting aggregate pageCache memory grow to ~5GB worst case.
+    // maxPageCacheBytes bounds the *combined* size of cached markdown.
+    let fetchCount = 0;
+    const baseFetch = makeFetch({
+      'https://example.com/docs/a.md': { body: `# A\n\n${'x'.repeat(20)}`, contentType: 'text/markdown' },
+      'https://example.com/docs/b.md': { body: `# B\n\n${'x'.repeat(20)}`, contentType: 'text/markdown' },
+    });
+    const src = new RemoteFumadocsSource({
+      baseUrl,
+      maxPageCacheBytes: 30, // smaller than the combined size of both pages' markdown (~25 each)
+      fetchImpl: async (input, init) => {
+        fetchCount++;
+        return baseFetch(input, init);
+      },
+    });
+    await src.getPage('/docs/a');
+    await src.getPage('/docs/b'); // pushes combined size over budget -> evicts 'a'
+    const afterTwoFetches = fetchCount;
+    await src.getPage('/docs/a'); // must re-fetch over the network since 'a' was evicted
+    expect(fetchCount).toBeGreaterThan(afterTwoFetches);
+  });
+
   it('parses Orama-style search responses', async () => {
     const src = new RemoteFumadocsSource({
       baseUrl,
@@ -190,6 +329,57 @@ describe('RemoteFumadocsSource', () => {
       fetchImpl: makeFetch({}),
     });
     await expect(src.getPage('//evil.com/steal')).rejects.toThrow(/cross-origin/i);
+  });
+
+  it('refuses a same-origin ref outside the configured docs prefix', async () => {
+    // Regression: same-origin is necessary but not sufficient as an
+    // authorization boundary. `ref` is caller-supplied (an MCP tool
+    // argument), and if an Authorization header is configured it would be
+    // attached to ANY same-origin fetch - so getPage("/api/private") must
+    // not be allowed to fetch and return an arbitrary same-origin path
+    // just because it shares the configured origin.
+    const src = new RemoteFumadocsSource({
+      baseUrl,
+      authHeader: 'Bearer secret-token',
+      fetchImpl: makeFetch({
+        'https://example.com/api/private': { body: 'top secret', contentType: 'text/plain' },
+      }),
+    });
+    await expect(src.getPage('/api/private')).rejects.toThrow(/docs prefix/i);
+  });
+
+  it('allows a ref exactly at the docs prefix root', async () => {
+    // The docs-prefix check must not reject the prefix itself (e.g. "/docs"
+    // exactly, with no trailing segment) - only paths outside of it.
+    const src = new RemoteFumadocsSource({
+      baseUrl,
+      fetchImpl: makeFetch({
+        'https://example.com/docs.md': { body: '# Docs Root\n\nbody', contentType: 'text/markdown' },
+      }),
+    });
+    const page = await src.getPage('/docs');
+    expect(page.title).toBe('Docs Root');
+  });
+
+  it('refuses a same-origin redirect that leaves the configured docs prefix', async () => {
+    // Regression: the initial ref passing the docsPrefix check in
+    // resolveRef() isn't enough on its own - a same-origin redirect could
+    // still carry a page fetch outside docsPrefix (e.g. to an internal
+    // API), still attaching the Authorization header. fetchSameOrigin's
+    // pathPrefix option must re-check every hop, not just the first.
+    const src = new RemoteFumadocsSource({
+      baseUrl,
+      authHeader: 'Bearer secret-token',
+      fetchImpl: makeFetch({
+        'https://example.com/docs/redir.md': {
+          status: 302,
+          body: '',
+          headers: { location: '/api/private' },
+        },
+        'https://example.com/api/private': { body: 'top secret', contentType: 'text/plain' },
+      }),
+    });
+    await expect(src.getPage('/docs/redir')).rejects.toThrow(/docs prefix/i);
   });
 
   it('transparently follows a same-origin redirect', async () => {

@@ -37,6 +37,15 @@ export function hasPathPrefix(pathname: string, prefix: string): boolean {
   return pathname === p || pathname.startsWith(`${p}/`);
 }
 
+/**
+ * True if `xml` is a sitemap *index* document (per the sitemaps.org
+ * protocol, its `<loc>` entries point to OTHER sitemaps, not pages) rather
+ * than a page-level `<urlset>` sitemap.
+ */
+export function isSitemapIndex(xml: string): boolean {
+  return /<sitemapindex[\s>]/i.test(xml);
+}
+
 /** Filter URLs to those under a given path prefix on the same host as baseUrl. */
 export function filterToDocs(
   urls: string[],

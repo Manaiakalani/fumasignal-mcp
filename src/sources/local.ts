@@ -43,13 +43,23 @@ export class LocalFumadocsSource implements FumadocsSource {
   readonly label: string;
   private rootDir: string;
   private contentDir: string;
+  /**
+   * True when `contentDir` was derived by joining `rootDir` with a
+   * relative path (the default, or a relative `--content-dir`), meaning
+   * the caller's intent is that it lives *inside* `rootDir`. False when
+   * the caller passed an explicit absolute `--content-dir`, which is
+   * allowed to point anywhere by design. Used by `buildIndex()` to decide
+   * whether a symlink-escape check applies (see there for why).
+   */
+  private contentDirIsRelative: boolean;
   private urlPrefix: string;
   private indexPromise: Promise<Map<string, IndexedPage>> | null = null;
 
   constructor(opts: LocalSourceOptions) {
     this.rootDir = path.resolve(opts.rootDir);
     const cd = opts.contentDir ?? 'content/docs';
-    this.contentDir = path.isAbsolute(cd) ? cd : path.join(this.rootDir, cd);
+    this.contentDirIsRelative = !path.isAbsolute(cd);
+    this.contentDir = this.contentDirIsRelative ? path.join(this.rootDir, cd) : cd;
     this.urlPrefix = (opts.urlPrefix ?? '/docs').replace(/\/+$/, '');
     this.label = `local:${this.rootDir}`;
   }
@@ -76,6 +86,18 @@ export class LocalFumadocsSource implements FumadocsSource {
     }
     if (!stat.isDirectory()) {
       throw new SourceError(`Not a directory: ${this.contentDir}`);
+    }
+    if (this.contentDirIsRelative) {
+      // `fs.stat` above follows symlinks, and `fs.readdir` on a symlinked
+      // directory transparently follows it too - so if `contentDir` (or any
+      // ancestor of it under rootDir) is itself a symlink, indexing would
+      // silently walk and serve files from wherever it resolves, even
+      // though `walk()`'s own dirent-type check only skips symlinks found
+      // *during* the walk (entries below the starting directory), not the
+      // starting directory itself. This is the same "untrusted cloned docs
+      // repo" threat model as `readFileWithinRoot()` below, just at the
+      // content-directory boundary instead of a fixed filename.
+      await this.assertRealpathWithinRoot(this.contentDir);
     }
     const files = await walk(this.contentDir);
     for (const file of files) {
@@ -250,6 +272,21 @@ export class LocalFumadocsSource implements FumadocsSource {
   }
 
   /**
+   * Resolve `candidate` to its real (symlink-free) path and throw if it
+   * falls outside `rootDir`'s own real path. Shared by the contentDir
+   * boundary check above and `readFileWithinRoot()` below.
+   */
+  private async assertRealpathWithinRoot(candidate: string): Promise<string> {
+    const real = await fs.realpath(candidate);
+    const realRoot = await fs.realpath(this.rootDir);
+    const rel = path.relative(realRoot, real);
+    if (rel === '..' || rel.startsWith(`..${path.sep}`) || path.isAbsolute(rel)) {
+      throw new SourceError(`Refusing to access a path outside the project root: ${candidate}`);
+    }
+    return real;
+  }
+
+  /**
    * Read a file, refusing to follow a symlink that resolves outside
    * `rootDir`. Git supports committing symlinks, so cloning an untrusted
    * docs repo and pointing `--local` at it could otherwise let a symlink
@@ -257,12 +294,7 @@ export class LocalFumadocsSource implements FumadocsSource {
    * fixed-name read.
    */
   private async readFileWithinRoot(candidate: string): Promise<string> {
-    const real = await fs.realpath(candidate);
-    const realRoot = await fs.realpath(this.rootDir);
-    const rel = path.relative(realRoot, real);
-    if (rel === '..' || rel.startsWith(`..${path.sep}`) || path.isAbsolute(rel)) {
-      throw new SourceError(`Refusing to read a file outside the project root: ${candidate}`);
-    }
+    const real = await this.assertRealpathWithinRoot(candidate);
     return fs.readFile(real, 'utf8');
   }
 }
