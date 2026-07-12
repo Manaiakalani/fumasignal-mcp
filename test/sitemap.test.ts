@@ -54,4 +54,21 @@ describe('hasPathPrefix', () => {
     expect(hasPathPrefix('/docs-legacy', '/docs')).toBe(false);
     expect(hasPathPrefix('/other', '/docs')).toBe(false);
   });
+
+  it('normalizes a trailing slash on prefix so descendants still match', () => {
+    // Regression: a caller-supplied prefix (e.g. the `list_pages` tool's
+    // `prefix` argument, which bypasses the CLI's own normalizePrefix())
+    // could include a trailing slash. Appending "/" to an
+    // already-trailing-slash prefix produced "//" which never matched a
+    // real single-slash descendant path, silently returning zero results.
+    expect(hasPathPrefix('/docs/x', '/docs/')).toBe(true);
+    expect(hasPathPrefix('/docs/x/y', '/docs/')).toBe(true);
+    expect(hasPathPrefix('/docs', '/docs/')).toBe(true);
+    expect(hasPathPrefix('/docs2/x', '/docs/')).toBe(false);
+  });
+
+  it('treats "/" and "" as a no-op filter (matches everything)', () => {
+    expect(hasPathPrefix('/anything', '/')).toBe(true);
+    expect(hasPathPrefix('/anything', '')).toBe(true);
+  });
 });

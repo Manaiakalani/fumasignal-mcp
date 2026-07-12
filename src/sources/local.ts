@@ -96,8 +96,14 @@ export class LocalFumadocsSource implements FumadocsSource {
         continue;
       }
       const toc = extractToc(body);
+      // Frontmatter is untrusted content: `meta.title` may be a YAML number,
+      // boolean, etc. despite the `string | undefined` cast below being a
+      // compile-time-only assertion. A non-string title would otherwise
+      // reach `search()`'s `.toLowerCase()` call and throw, breaking search
+      // for every page (not just this one) until the process restarts.
+      const rawTitle = meta.title;
       const title =
-        (meta.title as string | undefined) ??
+        (typeof rawTitle === 'string' && rawTitle.trim() ? rawTitle : undefined) ??
         firstHeading(body) ??
         slug.split('/').pop() ??
         'Untitled';
@@ -133,10 +139,6 @@ export class LocalFumadocsSource implements FumadocsSource {
     if (r === '') r = this.urlPrefix;
     const direct = idx.get(r);
     if (direct) return direct;
-    // Try matching by slug suffix
-    for (const page of idx.values()) {
-      if (page.url === r || page.slug === r.replace(`${this.urlPrefix}/`, '')) return page;
-    }
     throw new NotFoundError(`Local page not found for ref "${ref}" (looked up "${r}")`);
   }
 
