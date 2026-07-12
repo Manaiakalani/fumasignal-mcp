@@ -1,7 +1,12 @@
 import { logger, redactUrlForLogging } from '../lib/logger.js';
 import { TtlCache, Coalescer, Semaphore } from '../lib/cache.js';
 import { htmlToMarkdown } from '../lib/html-to-md.js';
-import { extractSection, extractToc } from '../lib/markdown.js';
+import {
+  type HeadingIndex,
+  buildHeadingIndex,
+  sectionFromHeadingIndex,
+  tocFromHeadingIndex,
+} from '../lib/markdown.js';
 import { parseFrontmatter, asNonEmptyString } from '../lib/frontmatter.js';
 import {
   decodeAndNormalizePathname,
@@ -191,6 +196,17 @@ export class RemoteFumadocsSource implements FumadocsSource {
   private pageCache: TtlCache<string, PageContent>;
   private listCache: TtlCache<'all', PageSummary[]>;
   private llmsCache: TtlCache<string, string | null>;
+  /**
+   * Side-table keyed by the *same* `PageContent` object instances held in
+   * `pageCache`, so `getSection()` can reuse the heading scan already done
+   * in `getPage()` instead of re-running `buildHeadingIndex()` from
+   * scratch on every call - see `HeadingIndex`'s doc comment. A `WeakMap`
+   * (rather than a second cache keyed by `cacheKey`) means entries are
+   * reclaimed automatically once `pageCache` evicts/replaces the
+   * corresponding entry and nothing else references it, with no need to
+   * manually keep two caches' evictions in sync.
+   */
+  private headingIndexCache = new WeakMap<PageContent, HeadingIndex>();
   // Coalesce concurrent cache-miss fetches for the same key so parallel
   // callers share one fetch chain instead of each independently repeating
   // it (see `Coalescer`'s doc comment).
@@ -205,6 +221,24 @@ export class RemoteFumadocsSource implements FumadocsSource {
 
   constructor(opts: RemoteSourceOptions) {
     this.base = new URL(opts.baseUrl);
+    // fetch() refuses to send credentials embedded in a URL's authority
+    // (RFC 3986 userinfo) and, per the WHATWG fetch spec, throws a
+    // TypeError whose *message* includes the offending URL verbatim -
+    // credentials included. That error's message is what `errorResult()`
+    // in server.ts both logs and returns as the MCP tool's response text,
+    // so a configured baseUrl carrying credentials would leak them in
+    // full on the very first request that hits this code path. Rejecting
+    // it here, before it can ever reach fetch(), fails fast on a
+    // misconfiguration instead of leaking it later. (A redirect can also
+    // *introduce* userinfo on a later hop - that's handled separately,
+    // inside fetchSameOrigin().)
+    if (this.base.username || this.base.password) {
+      throw new Error(
+        'baseUrl must not contain embedded credentials (a "user:pass@" prefix). ' +
+          'fetch() echoes them verbatim in any error it throws for such a URL, which this server would otherwise log and return to callers. ' +
+          'Use --auth-header/FUMASIGNAL_AUTH_HEADER (or the authHeader option) to send credentials instead.',
+      );
+    }
     // Strip trailing slash for consistent URL building
     if (this.base.pathname.endsWith('/') && this.base.pathname !== '/') {
       this.base.pathname = this.base.pathname.replace(/\/+$/, '');
@@ -330,6 +364,20 @@ export class RemoteFumadocsSource implements FumadocsSource {
       if (current.origin !== this.base.origin) {
         throw new SourceError(
           `Refusing to fetch cross-origin URL: ${current.origin} (server is bound to ${this.base.origin})`,
+        );
+      }
+      // `origin` (checked above) doesn't include userinfo, so a
+      // same-origin redirect can still smuggle credentials into `current`
+      // on a later hop even though the *constructor* already rejected
+      // `baseUrl` carrying any. Checked on every hop (not just hop 0) for
+      // that reason. See the constructor's userinfo check for why this
+      // matters: fetch() would otherwise echo them verbatim in a thrown
+      // error's message. `current.origin` (never `current.href`/
+      // `.toString()`) is used in the error so the message itself can't
+      // leak whatever credentials triggered it.
+      if (current.username || current.password) {
+        throw new SourceError(
+          `Refusing to fetch a URL with embedded credentials (origin ${current.origin})`,
         );
       }
       try {
@@ -631,7 +679,8 @@ export class RemoteFumadocsSource implements FumadocsSource {
       if (raced) return raced;
 
       const { markdown, meta } = await this.fetchSemaphore.run(() => this.fetchPageBody(target));
-      const toc = extractToc(markdown);
+      const headingIndex = buildHeadingIndex(markdown);
+      const toc = tocFromHeadingIndex(headingIndex);
       // meta.title/description are untrusted frontmatter values (see
       // asNonEmptyString's doc comment) - guard both instead of an `as
       // string` cast so a wrong-typed value (e.g. `title: 42`) falls
@@ -649,6 +698,10 @@ export class RemoteFumadocsSource implements FumadocsSource {
         meta,
         toc,
       };
+      // Keyed by this exact object instance - see headingIndexCache's doc
+      // comment - so getSection() can reuse this scan instead of redoing
+      // it from scratch.
+      this.headingIndexCache.set(content, headingIndex);
       this.pageCache.set(cacheKey, content);
       return content;
     });
@@ -664,7 +717,12 @@ export class RemoteFumadocsSource implements FumadocsSource {
 
   async getSection(ref: string, anchor: string): Promise<{ title: string; markdown: string }> {
     const page = await this.getPage(ref);
-    const section = extractSection(page.markdown, anchor);
+    // getPage() always populates headingIndexCache for the object it
+    // returns (whether fresh or from pageCache) - the fallback rebuild
+    // below is defensive only, so a future change that breaks that
+    // invariant fails open to "recompute it" rather than a crash.
+    const headingIndex = this.headingIndexCache.get(page) ?? buildHeadingIndex(page.markdown);
+    const section = sectionFromHeadingIndex(headingIndex, anchor);
     if (!section) {
       throw new NotFoundError(
         `Section "#${anchor}" not found on ${page.url}. Available: ${page.toc.map((t) => t.anchor).join(', ') || '(none)'}`,

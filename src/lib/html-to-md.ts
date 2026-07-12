@@ -96,6 +96,17 @@ function findAngleClosePositions(html: string): number[] {
  * exists at all.
  */
 function findLargestTagBlock(html: string, tag: string): string | null {
+  // Cheap existence pre-check before the position-array scans below.
+  // findAngleClosePositions() in particular collects *every* literal '>'
+  // in `html` regardless of whether `tag` appears anywhere at all -
+  // empirically ~200MB+ of heap for a 10MB adversarial input consisting
+  // of nothing but '>' characters, run unconditionally on every call
+  // (pickArticle() alone tries up to 2 tags, stripChrome() up to 6 more -
+  // and a page with no semantic <article>/<main>/<nav>/etc. tags at all,
+  // which is common on non-Fumadocs sites, hits every one of them). A
+  // non-global one-off RegExp (no `g` flag) is used here so it can't
+  // perturb `openRe`'s own `lastIndex` state in the loop below.
+  if (!new RegExp(`<${tag}\\b`, 'i').test(html)) return null;
   const openRe = new RegExp(`<${tag}\\b`, 'gi');
   const closers = findCloserPositions(html, tag);
   const angles = findAngleClosePositions(html);
@@ -133,6 +144,9 @@ export function stripChrome(html: string): string {
  * for the closing-tag search and the opening-tag search).
  */
 function removeTagBlocks(html: string, tag: string): string {
+  // Same pre-check as findLargestTagBlock() above, for the same reason -
+  // see its comment.
+  if (!new RegExp(`<${tag}\\b`, 'i').test(html)) return html;
   const openRe = new RegExp(`<${tag}\\b`, 'gi');
   const closers = findCloserPositions(html, tag);
   const angles = findAngleClosePositions(html);

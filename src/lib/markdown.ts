@@ -53,12 +53,24 @@ function stripAtxClosingSequence(text: string): string {
   return trimmed.slice(0, end).trimEnd();
 }
 
-interface Heading {
+export interface Heading {
   depth: number;
   title: string;
   anchor: string;
   /** 0-based index into the line array this heading appears on. */
   line: number;
+}
+
+/**
+ * The result of scanning a document once for its lines/headings - see
+ * `buildHeadingIndex()`. Exported so callers (local.ts/remote.ts) can hold
+ * on to one of these per cached page and reuse it across repeated
+ * `getToc()`/`getSection()` calls instead of re-scanning the same markdown
+ * from scratch every time.
+ */
+export interface HeadingIndex {
+  lines: string[];
+  headings: Heading[];
 }
 
 /**
@@ -90,7 +102,7 @@ const MAX_HEADINGS = 5000;
  * `extractToc` and `extractSection` both build on this so the anchors they
  * report and the anchors they can look up by are always in sync.
  */
-function collectHeadings(markdown: string): { lines: string[]; headings: Heading[] } {
+function collectHeadings(markdown: string): HeadingIndex {
   const lines = markdown.split(/\r?\n/);
   const headings: Heading[] = [];
   let inFence = false;
@@ -124,23 +136,39 @@ function collectHeadings(markdown: string): { lines: string[]; headings: Heading
   return { lines, headings };
 }
 
-export function extractToc(markdown: string): TocEntry[] {
-  return collectHeadings(markdown).headings.map(({ depth, title, anchor }) => ({
-    depth,
-    title,
-    anchor,
-  }));
+/**
+ * Scan `markdown` once for its lines/headings, in a form cheap to hold on
+ * to and reuse. Callers that will need *both* a TOC and (potentially
+ * several) section lookups for the same document - or that already cache
+ * the document itself and can cache this alongside it - should call this
+ * once and pass the result to `tocFromHeadingIndex()`/
+ * `sectionFromHeadingIndex()` instead of calling `extractToc()`/
+ * `extractSection()` (which each re-scan from scratch) repeatedly.
+ *
+ * This was empirically the difference between a one-time, index-build-time
+ * cost and a *repeated-per-request* one: `getSection()` in both
+ * local.ts/remote.ts otherwise called `extractSection()` - and therefore
+ * re-ran the full `.split(/\r?\n/)` and heading scan below - on every
+ * single `get_section` tool call, even for a page whose body/TOC was
+ * already fully cached.
+ */
+export function buildHeadingIndex(markdown: string): HeadingIndex {
+  return collectHeadings(markdown);
+}
+
+export function tocFromHeadingIndex(index: HeadingIndex): TocEntry[] {
+  return index.headings.map(({ depth, title, anchor }) => ({ depth, title, anchor }));
 }
 
 /**
  * Extract a section of markdown starting at the heading whose slug matches
  * `anchor`, ending at the next heading of equal-or-lesser depth.
  */
-export function extractSection(
-  markdown: string,
+export function sectionFromHeadingIndex(
+  index: HeadingIndex,
   anchor: string,
 ): { title: string; markdown: string } | null {
-  const { lines, headings } = collectHeadings(markdown);
+  const { lines, headings } = index;
   const targetIdx = headings.findIndex((h) => h.anchor === anchor);
   if (targetIdx === -1) return null;
   const target = headings[targetIdx]!;
@@ -156,4 +184,24 @@ export function extractSection(
     title: target.title,
     markdown: lines.slice(target.line, endIdx).join('\n').trim(),
   };
+}
+
+/**
+ * Convenience one-shot wrapper for callers that only need a TOC once and
+ * have no reason to hold on to a `HeadingIndex` (e.g. tests, or a single
+ * ad hoc lookup). Prefer `buildHeadingIndex()` + `tocFromHeadingIndex()`/
+ * `sectionFromHeadingIndex()` when both a TOC and section lookups are
+ * needed for the same document, or when the caller can cache the index
+ * itself - see their doc comments.
+ */
+export function extractToc(markdown: string): TocEntry[] {
+  return tocFromHeadingIndex(buildHeadingIndex(markdown));
+}
+
+/** One-shot wrapper around `sectionFromHeadingIndex()` - see its doc comment. */
+export function extractSection(
+  markdown: string,
+  anchor: string,
+): { title: string; markdown: string } | null {
+  return sectionFromHeadingIndex(buildHeadingIndex(markdown), anchor);
 }

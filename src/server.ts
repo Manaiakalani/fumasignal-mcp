@@ -113,7 +113,17 @@ function registerTools(server: McpServer, source: FumadocsSource): void {
     async (args) => {
       try {
         const pages = await source.listPages(args.prefix);
-        const limited = args.limit ? pages.slice(0, args.limit) : pages;
+        // Default to the schema's own max (1000) when `limit` is omitted,
+        // instead of falling through to the full, unbounded `pages` list.
+        // Any *explicit* limit is already capped at 1000 by the schema
+        // above, so this can never return fewer results to a caller who
+        // could have gotten more via an explicit value - it only closes
+        // off the one path (omitting `limit` entirely) that used to skip
+        // the cap. Without it, `.map()`/`.join()` below build one huge
+        // string for a source with tens of thousands of pages *before*
+        // capToolResultChars() ever gets a chance to trim it.
+        const limit = args.limit ?? 1000;
+        const limited = pages.slice(0, limit);
         if (limited.length === 0) {
           return textResult('No pages found.');
         }

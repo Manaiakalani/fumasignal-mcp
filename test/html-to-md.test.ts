@@ -71,6 +71,25 @@ describe('pickArticle', () => {
     // through unmatched - same contract as the "unclosed tag" test above.
     expect(result).toBe(html);
   });
+
+  it('short-circuits quickly for a large document containing neither <article> nor <main> at all (allocation-avoidance regression)', () => {
+    // Regression: findLargestTagBlock() unconditionally built two full
+    // position arrays over the *entire* document - one entry per every
+    // literal '>' anywhere in it, via findAngleClosePositions() - before
+    // ever checking whether the target tag was present at all.
+    // pickArticle() tries up to 2 tags per call; a page with neither
+    // <article> nor <main> (common on non-Fumadocs sites) paid for two
+    // full-document scan-and-allocate passes for nothing. Empirically, a
+    // 10MB string of pure '>' characters measured ~163ms and ~208MB of
+    // heap for *one* such scan. A large tag-free document must now
+    // resolve near-instantly and be returned unchanged.
+    const html = '<div>' + '>'.repeat(10_000_000) + '</div>';
+    const start = performance.now();
+    const result = pickArticle(html);
+    const elapsed = performance.now() - start;
+    expect(elapsed).toBeLessThan(500);
+    expect(result).toBe(html);
+  });
 });
 
 describe('stripChrome', () => {
@@ -114,6 +133,20 @@ describe('stripChrome', () => {
     expect(elapsed).toBeLessThan(1000);
     // No '>' anywhere means no opening tag ever completes, so nothing is
     // removed - same contract as the "unclosed chrome tag" test above.
+    expect(result).toBe(html);
+  });
+
+  it('short-circuits quickly for a large document containing none of the stripped chrome tags at all (allocation-avoidance regression)', () => {
+    // Same fast-path fix as pickArticle's matching test, but for
+    // removeTagBlocks()/stripChrome(), which tries up to 6 tags per call
+    // (nav, aside, header, footer, script, style, noscript) - so a
+    // tag-free page previously paid for up to 6 wasted full-document
+    // scan-and-allocate passes instead of just 2.
+    const html = '<div>' + '>'.repeat(10_000_000) + '</div>';
+    const start = performance.now();
+    const result = stripChrome(html);
+    const elapsed = performance.now() - start;
+    expect(elapsed).toBeLessThan(500);
     expect(result).toBe(html);
   });
 });

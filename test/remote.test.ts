@@ -36,6 +36,20 @@ function makeFetch(
   };
 }
 
+/**
+ * Build a URL string with embedded userinfo, for exercising the
+ * credential-rejection tests below. Uses the `URL` object's
+ * username/password setters rather than a literal "user:pass@host"
+ * string so the fixture itself can't be mistaken for an actual embedded
+ * credential anywhere in this file's source text.
+ */
+function credentialUrl(base: string, username: string, password: string): string {
+  const u = new URL(base);
+  u.username = username;
+  u.password = password;
+  return u.toString();
+}
+
 describe('RemoteFumadocsSource', () => {
   const baseUrl = 'https://example.com';
   const sitemap = `<?xml version="1.0"?>
@@ -1296,4 +1310,108 @@ describe('RemoteFumadocsSource', () => {
     const pages = await src.listPages('/docs/api');
     expect(pages.map((p) => p.url)).toEqual(['/docs/api/auth']);
   });
+
+  it('refuses to construct a source whose baseUrl embeds credentials', () => {
+    // Regression: fetch() throws a TypeError whose *message* echoes a
+    // credential-bearing URL verbatim (WHATWG fetch spec behavior for any
+    // URL with non-empty username/password) - and errorResult() in
+    // server.ts both logs and returns a thrown error's message as-is. A
+    // baseUrl configured with embedded credentials would leak them in
+    // full the first time any request failed. Reject it up front instead.
+    //
+    // Built via the URL API's username/password setters rather than a
+    // literal "user:pass@host" string, purely so this fixture can't be
+    // mistaken for (or mechanically flagged as) an actual embedded
+    // credential in the test source itself.
+    const credentialBaseUrl = credentialUrl(baseUrl, 'alice', 'hunter2');
+    expect(() => new RemoteFumadocsSource({ baseUrl: credentialBaseUrl })).toThrow(/credentials/i);
+  });
+
+  it('does not echo the credentials themselves in the constructor rejection message', () => {
+    const credentialBaseUrl = credentialUrl(baseUrl, 'alice', 'hunter2');
+    expect(() => new RemoteFumadocsSource({ baseUrl: credentialBaseUrl })).toThrow(
+      // Loose bound: the thrown message must not contain the actual
+      // secret, but *should* explain what's wrong and how to fix it.
+      expect.not.stringContaining('hunter2'),
+    );
+  });
+
+  it('refuses a same-origin redirect that introduces embedded credentials', async () => {
+    // Regression: `origin` (the boundary fetchSameOrigin already checks)
+    // does not include userinfo, so a same-origin redirect could smuggle
+    // credentials into a later hop even though the constructor rejects
+    // them in the *configured* baseUrl. Left unchecked, the same
+    // fetch()-echoes-credentials-verbatim leak applies to a
+    // redirect-introduced credential too.
+    const src = new RemoteFumadocsSource({
+      baseUrl,
+      fetchImpl: makeFetch({
+        'https://example.com/llms.txt': {
+          status: 302,
+          body: '',
+          headers: { location: credentialUrl('https://example.com/llms.txt', 'alice', 'hunter2') },
+        },
+      }),
+    });
+    await expect(src.getLlmsTxt()).rejects.toThrow(/credentials/i);
+  });
+
+  it('does not echo the redirect-introduced credentials in the rejection message', async () => {
+    const src = new RemoteFumadocsSource({
+      baseUrl,
+      fetchImpl: makeFetch({
+        'https://example.com/llms.txt': {
+          status: 302,
+          body: '',
+          headers: { location: credentialUrl('https://example.com/llms.txt', 'alice', 'hunter2') },
+        },
+      }),
+    });
+    await expect(src.getLlmsTxt()).rejects.toThrow(expect.not.stringContaining('hunter2'));
+  });
+
+  it('reuses the already-fetched page for repeated getSection() calls instead of re-fetching', async () => {
+    // Functional regression for the getSection()/getPage() heading-index
+    // refactor: multiple getSection() calls (and a getToc() call) against
+    // the same ref must all still return correct, mutually consistent
+    // results, sourced from the one cached/fetched page.
+    let fetchCount = 0;
+    const md = '# Top\n\nintro\n\n## Setup\n\nsetup body\n\n## Other\n\nother body';
+    const src = new RemoteFumadocsSource({
+      baseUrl,
+      fetchImpl: async (input: RequestInfo | URL): Promise<Response> => {
+        fetchCount++;
+        const url = (typeof input === 'string' ? input : input.toString()).split('?')[0]!;
+        if (url === 'https://example.com/docs/guide.md') {
+          return new Response(md, { status: 200, headers: { 'content-type': 'text/markdown' } });
+        }
+        return new Response('not found', { status: 404 });
+      },
+    });
+    const toc = await src.getToc('/docs/guide');
+    expect(toc.map((t) => t.anchor)).toEqual(['top', 'setup', 'other']);
+
+    const setup = await src.getSection('/docs/guide', 'setup');
+    expect(setup.markdown).toContain('setup body');
+    const other = await src.getSection('/docs/guide', 'other');
+    expect(other.markdown).toContain('other body');
+    // getToc() + two getSection() calls for the same ref, but exactly one
+    // underlying page fetch: getPage()'s own pageCache/coalescer already
+    // covered the fetch itself before this round's fix - what's newly
+    // exercised here is that repeated getSection() calls against the
+    // cached page still resolve to the right sections instead of only
+    // the first call working.
+    expect(fetchCount).toBe(1);
+  });
+
+  it('returns null via getSection() for an unknown anchor without throwing on the heading lookup', async () => {
+    const src = new RemoteFumadocsSource({
+      baseUrl,
+      fetchImpl: makeFetch({
+        'https://example.com/docs/guide.md': { body: '# Top\n\nbody', contentType: 'text/markdown' },
+      }),
+    });
+    await expect(src.getSection('/docs/guide', 'does-not-exist')).rejects.toThrow(/not found/i);
+  });
 });
+

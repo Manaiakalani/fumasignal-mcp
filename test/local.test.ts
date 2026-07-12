@@ -121,6 +121,24 @@ describe('LocalFumadocsSource', () => {
     expect(section.markdown).not.toContain('beta');
   });
 
+  it('returns correct, independent results across repeated getSection()/getToc() calls for the same page', async () => {
+    // Functional regression for the getSection()/buildIndex() refactor:
+    // IndexedPage now stores one HeadingIndex, computed once in
+    // buildIndex(), that getSection() reads from on every call instead of
+    // recomputing from the page body each time. Repeated calls - in a
+    // different order, and interleaved with getToc() - against the same
+    // page must all still return correct, mutually independent results.
+    const src = new LocalFumadocsSource({ rootDir: tmpDir });
+    const b = await src.getSection('/docs', 'section-b');
+    const toc = await src.getToc('/docs');
+    const a = await src.getSection('/docs', 'section-a');
+    expect(b.markdown).toContain('beta bananas');
+    expect(b.markdown).not.toContain('alpha');
+    expect(a.markdown).toContain('alpha apples');
+    expect(a.markdown).not.toContain('beta');
+    expect(toc.map((t) => t.anchor)).toEqual(['hello', 'section-a', 'section-b']);
+  });
+
   it('returns toc with anchors', async () => {
     const src = new LocalFumadocsSource({ rootDir: tmpDir });
     const toc = await src.getToc('/docs');

@@ -148,4 +148,37 @@ describe('redactUrlForLogging', () => {
     expect(() => redactUrlForLogging('')).not.toThrow();
     expect(redactUrlForLogging('')).toBe('');
   });
+
+  it('truncates a very long parseable URL that has no userinfo, instead of logging it in full', () => {
+    // Regression: redactUrlForLogging()'s "no userinfo" return path
+    // (`return truncateForLog(url)`, added alongside the other two return
+    // paths below) used to return the URL verbatim with no length bound -
+    // a sitemap <loc> entry (or any operator/site-supplied URL) is
+    // bounded only by the overall response-size cap, not any per-URL
+    // limit, reproducing the same huge-log-line cost errSerializer() is
+    // regression-tested against above.
+    const url = `https://example.com/${'x'.repeat(500_000)}`;
+    const redacted = redactUrlForLogging(url);
+    expect(redacted.length).toBeLessThan(2_100);
+    expect(redacted).toContain('truncated for log');
+  });
+
+  it('truncates a very long parseable URL that DOES have userinfo, instead of logging it in full', () => {
+    const url = `https://alice:s3cret@example.com/${'x'.repeat(500_000)}`;
+    const redacted = redactUrlForLogging(url);
+    expect(redacted.length).toBeLessThan(2_100);
+    expect(redacted).toContain('truncated for log');
+    expect(redacted).not.toContain('s3cret');
+  });
+
+  it('truncates a very long value that is not parseable as a URL at all (fallback path), instead of logging it in full', () => {
+    // Exercises the third (unparseable) return path's own truncateForLog()
+    // wrap - a bare path with no scheme and no "//user:pass@" shape at
+    // all, so the fallback regex is a no-op and the original untruncated
+    // string would otherwise flow straight through unchanged.
+    const bare = '/'.repeat(500_000);
+    const redacted = redactUrlForLogging(bare);
+    expect(redacted.length).toBeLessThan(2_100);
+    expect(redacted).toContain('truncated for log');
+  });
 });
