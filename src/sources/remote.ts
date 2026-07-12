@@ -1,10 +1,15 @@
-import { posix as posixPath } from 'node:path';
 import { logger } from '../lib/logger.js';
 import { TtlCache } from '../lib/cache.js';
 import { htmlToMarkdown } from '../lib/html-to-md.js';
 import { extractSection, extractToc } from '../lib/markdown.js';
 import { parseFrontmatter, asNonEmptyString } from '../lib/frontmatter.js';
-import { filterToDocs, hasPathPrefix, isSitemapIndex, parseSitemap } from '../lib/sitemap.js';
+import {
+  decodeAndNormalizePathname,
+  filterToDocs,
+  hasPathPrefix,
+  isSitemapIndex,
+  parseSitemap,
+} from '../lib/sitemap.js';
 import {
   type FumadocsSource,
   type PageContent,
@@ -59,6 +64,27 @@ const DEFAULT_UA = 'fumasignal-mcp/0.1 (+https://github.com/Manaiakalani/fumasig
  */
 const MAX_SITEMAP_INDEX_DEPTH = 5;
 const MAX_SITEMAP_FETCHES = 200;
+/**
+ * Hard cap on the total number of <loc> URLs accumulated across every
+ * sitemap fetched while resolving a (possibly multi-level) sitemap index.
+ * `MAX_SITEMAP_FETCHES` only bounds the *number of HTTP requests* - each
+ * individual response can still hold up to `maxResponseBytes` (10MB by
+ * default) of tightly packed `<loc>` entries, so without an independent
+ * cap on the accumulated *URL count* a malicious/compromised site can
+ * fan out to `MAX_SITEMAP_FETCHES` maximally-packed leaf sitemaps and
+ * force a multi-GB in-memory URL list - empirically confirmed: 20 leaf
+ * sitemaps x 50k URLs each (1M URLs) grew the heap by ~608MB, and that
+ * scales linearly, so the real 200-fetch budget extrapolates to ~6GB,
+ * enough to crash the process. The result also gets held indefinitely in
+ * `listCache` until TTL expiry, and `listCache`'s own `maxTotalSize`
+ * can't help here (see its construction below) since it only ever holds
+ * one key ('all') - eviction never has anything else to reclaim from, so
+ * the single oversized entry is always let through. Capping accumulation
+ * at the source, here, is what actually bounds memory. No real
+ * documentation site remotely approaches this limit, so it's generous
+ * headroom, not a functional restriction.
+ */
+const MAX_SITEMAP_URLS = 200_000;
 
 /**
  * Cancel a response body we're intentionally not reading, so the
@@ -67,45 +93,6 @@ const MAX_SITEMAP_FETCHES = 200;
  */
 async function discardBody(res: Response): Promise<void> {
   await res.body?.cancel().catch(() => {});
-}
-
-/**
- * Percent-decode and normalize a URL pathname so a `hasPathPrefix()`
- * authorization check can't be bypassed by encoded traversal segments.
- *
- * The WHATWG URL parser collapses *literal* "." / ".." path segments
- * while parsing, but leaves percent-encoded ones untouched:
- * `new URL('/docs/%2e%2e%2fapi/private', base).pathname` is unchanged
- * (still literally "/docs/%2e%2e%2fapi/private"). `hasPathPrefix()`'s
- * plain string-prefix check therefore sees this as "under /docs" - but
- * a real upstream server/proxy/framework that decodes-then-normalizes
- * (a very common, standard pattern) would resolve it to "/api/private",
- * genuinely outside the configured docs prefix. Since an Authorization
- * header (if configured) is attached to every same-origin request, that
- * mismatch between what *we* validate and what the *upstream* actually
- * serves is a real authorization-boundary bypass, not just a cosmetic
- * quirk.
- *
- * Returns `null` (rather than throwing) if the pathname contains
- * malformed percent-encoding - including "overlong" UTF-8 encodings
- * sometimes used to smuggle traversal sequences past naive decoders,
- * which `decodeURIComponent` also correctly rejects - so callers can
- * fail closed with their own error type/message.
- */
-function decodeAndNormalizePathname(pathname: string): string | null {
-  let decoded: string;
-  try {
-    decoded = decodeURIComponent(pathname);
-  } catch {
-    return null;
-  }
-  let normalized = posixPath.normalize(decoded);
-  if (normalized === '.') normalized = '/';
-  // path.posix.normalize() on an absolute ("/"-prefixed) input clamps at
-  // root rather than producing a leading ".." - but fail closed instead
-  // of assuming that holds for every possible input.
-  if (normalized !== '/' && !normalized.startsWith('/')) return null;
-  return normalized;
 }
 
 /**
@@ -342,6 +329,7 @@ export class RemoteFumadocsSource implements FumadocsSource {
       const urls = await this.fetchSitemapUrls(new URL('/sitemap.xml', this.base), 0, {
         fetches: 0,
         visited: new Set(),
+        totalUrls: 0,
       });
       const filtered = filterToDocs(urls, this.base.toString(), this.docsPrefix);
       // Dedup by path: a repeated <loc> (within one sitemap, or the same
@@ -385,11 +373,17 @@ export class RemoteFumadocsSource implements FumadocsSource {
    * time, which - for a large leaf sitemap repeated near the fetch
    * budget's limit - could transiently balloon memory well beyond what
    * the *distinct* URL count would ever justify.
+   *
+   * `state.totalUrls` enforces `MAX_SITEMAP_URLS`: applied where `locs`
+   * is actually produced (both the leaf-sitemap return and the
+   * fetch-count-exhausted early return below) so the cap holds no matter
+   * how the fan-out is shaped - one huge leaf sitemap, or many smaller
+   * ones spread across the fetch budget.
    */
   private async fetchSitemapUrls(
     url: URL,
     depth: number,
-    state: { fetches: number; visited: Set<string> },
+    state: { fetches: number; visited: Set<string>; totalUrls: number },
   ): Promise<string[]> {
     const key = url.toString();
     if (state.visited.has(key)) return [];
@@ -404,11 +398,11 @@ export class RemoteFumadocsSource implements FumadocsSource {
     const xml = await this.readCappedText(res);
     const locs = parseSitemap(xml);
     if (!isSitemapIndex(xml) || depth >= MAX_SITEMAP_INDEX_DEPTH) {
-      return locs;
+      return this.takeWithinUrlBudget(locs, state);
     }
     const pages: string[] = [];
     for (const loc of locs) {
-      if (state.fetches >= MAX_SITEMAP_FETCHES) break;
+      if (state.fetches >= MAX_SITEMAP_FETCHES || state.totalUrls >= MAX_SITEMAP_URLS) break;
       let subUrl: URL;
       try {
         subUrl = new URL(loc);
@@ -423,6 +417,21 @@ export class RemoteFumadocsSource implements FumadocsSource {
       }
     }
     return pages;
+  }
+
+  /**
+   * Truncate `locs` (URLs from a single leaf sitemap) to whatever remains
+   * of the shared `MAX_SITEMAP_URLS` budget, advancing `state.totalUrls`
+   * accordingly. See `MAX_SITEMAP_URLS`'s doc comment for why this needs
+   * to be enforced here rather than (or in addition to) at the cache
+   * layer.
+   */
+  private takeWithinUrlBudget(locs: string[], state: { totalUrls: number }): string[] {
+    const remaining = MAX_SITEMAP_URLS - state.totalUrls;
+    if (remaining <= 0) return [];
+    const slice = locs.length > remaining ? locs.slice(0, remaining) : locs;
+    state.totalUrls += slice.length;
+    return slice;
   }
 
   async getPage(ref: string): Promise<PageContent> {
