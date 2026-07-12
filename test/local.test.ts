@@ -185,6 +185,33 @@ describe('LocalFumadocsSource', () => {
     }
   });
 
+  it('returns a real search excerpt even when case-folding would change the match offset', async () => {
+    // Regression: snippet() found the match's offset in
+    // `body.toLowerCase()` and then sliced the *original* `body` at that
+    // same numeric offset - silently assuming toLowerCase() never
+    // changes a string's length. Turkish "İ" (U+0130) lowercases to a
+    // 2-code-unit "i" + combining dot above, so 120 of them before a
+    // match shifted the lowercased offset 120 UTF-16 units past the real
+    // one in `body`, producing a `start > end` slice - empirically
+    // confirmed against the pre-fix logic, this returned just "…" with
+    // no excerpt content at all despite a genuine match.
+    const dir = await mkdtemp(path.join(os.tmpdir(), 'fumasignal-local-casefold-'));
+    try {
+      const docs = path.join(dir, 'content', 'docs');
+      await mkdir(docs, { recursive: true });
+      const padding = 'İ'.repeat(120);
+      await writeFile(path.join(docs, 'casefold.md'), `# Casefold\n\n${padding} target text here`);
+      const src = new LocalFumadocsSource({ rootDir: dir });
+      const hits = await src.search({ query: 'target' });
+      expect(hits).toHaveLength(1);
+      const excerpt = hits[0]!.excerpt;
+      expect(excerpt).toBeDefined();
+      expect(excerpt).toContain('target text here');
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
   it('extracts a section by anchor', async () => {
     const src = new LocalFumadocsSource({ rootDir: tmpDir });
     const section = await src.getSection('/docs', 'section-a');

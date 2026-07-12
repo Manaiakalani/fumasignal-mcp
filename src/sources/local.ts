@@ -618,11 +618,40 @@ function countOccurrences(haystack: string, needle: string): number {
   return count;
 }
 
+/** Escape regex metacharacters so a plain-text needle is matched literally. */
+function escapeRegExp(s: string): string {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+/**
+ * Find `needle` in `body` case-insensitively and return an excerpt around
+ * the match.
+ *
+ * Searches `body` directly via a case-insensitive regex instead of the
+ * more obvious `body.toLowerCase().indexOf(needle)` - that approach finds
+ * the match's offset in a *lowercased copy* of `body`, then uses that
+ * offset to slice the *original* `body`, which silently assumes
+ * `toLowerCase()` never changes a string's length. It can: Turkish
+ * "İ" (U+0130) lowercases to a 2-code-unit "i" + combining dot above
+ * (U+0069 U+0307), so 120 of them before a match shifted the lowercased
+ * offset 120 UTF-16 units ahead of the real one in `body` - empirically,
+ * this produced a `start > end` slice and returned just "…" with no
+ * excerpt content at all, for a query that legitimately matched.
+ * `RegExp`'s `i` flag doesn't have this problem: per the spec's
+ * `Canonicalize` operation, a character is only case-folded for `/i`
+ * matching if doing so keeps it a single code unit, so `match[0].length`
+ * is always exactly `needle.length` and `match.index` is always a valid
+ * offset into the *original* `body`. `needle` is escaped since it's
+ * caller-supplied (a search query token) and would otherwise be
+ * interpreted as regex syntax; escaping makes every character literal,
+ * so this can't reintroduce a ReDoS shape (no quantifiers/alternation are
+ * ever present in the compiled pattern).
+ */
 function snippet(body: string, needle: string, contextChars = 80): string {
   if (!needle) return body.slice(0, 200);
-  const lower = body.toLowerCase();
-  const idx = lower.indexOf(needle);
-  if (idx === -1) return body.slice(0, 200);
+  const match = new RegExp(escapeRegExp(needle), 'i').exec(body);
+  if (!match) return body.slice(0, 200);
+  const idx = match.index;
   const start = safeSliceStart(body, Math.max(0, idx - contextChars));
   const end = safeTruncateLength(body, Math.min(body.length, idx + needle.length + contextChars));
   const prefix = start > 0 ? '…' : '';
