@@ -6,12 +6,21 @@ import { RemoteFumadocsSource } from '../src/sources/remote.js';
 // reach their mocked `fetchImpl`. Rather than threading an explicit
 // `dnsLookup` override through every one of those call sites, stub the
 // module the real default (`defaultDnsLookup` in remote.ts) is built on
-// so it resolves any hostname to a public-looking (RFC 5737 TEST-NET)
-// address instead of making a real DNS query. Tests that specifically
-// exercise the DNS-rebinding guard pass their own `dnsLookup` in options,
-// which takes priority over this default and bypasses the mock entirely.
+// so it resolves any hostname to an ordinary public address instead of
+// making a real DNS query. Tests that specifically exercise the
+// DNS-rebinding guard pass their own `dnsLookup` in options, which takes
+// priority over this default and bypasses the mock entirely.
+//
+// Deliberately NOT an RFC 5737/3849 "documentation" address (e.g.
+// 203.0.113.0/24): those ranges are rejected by `isPrivateOrReservedAddress()`
+// per RFC 5737 section 4's own recommendation that they be filtered "in
+// both local and public contexts" since packets/records bearing them can
+// still appear on real networks. 8.8.8.8 (Google Public DNS) is used
+// instead - a real, stable, unambiguously-public address that isn't a
+// reserved/special-use range, and no actual network request to it is ever
+// made since `fetchImpl` is separately mocked below.
 vi.mock('node:dns/promises', () => ({
-  lookup: async () => [{ address: '203.0.113.10', family: 4 }],
+  lookup: async () => [{ address: '8.8.8.8', family: 4 }],
 }));
 
 /** Build a fake fetch that responds based on URL→{status, body, contentType}. */

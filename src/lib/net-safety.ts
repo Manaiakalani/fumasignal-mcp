@@ -66,6 +66,9 @@ function isPrivateIPv4(ip: string): boolean {
   if (a === 0) return true; // 0.0.0.0/8 "this network"
   if (a === 100 && b >= 64 && b <= 127) return true; // 100.64.0.0/10 shared/CGNAT
   if (a === 198 && (b === 18 || b === 19)) return true; // 198.18.0.0/15 RFC 2544 benchmark testing
+  if (a === 192 && b === 0 && parts[2] === 2) return true; // 192.0.2.0/24 TEST-NET-1 (RFC 5737)
+  if (a === 198 && b === 51 && parts[2] === 100) return true; // 198.51.100.0/24 TEST-NET-2 (RFC 5737)
+  if (a === 203 && b === 0 && parts[2] === 113) return true; // 203.0.113.0/24 TEST-NET-3 (RFC 5737)
   if (a >= 224) return true; // 224.0.0.0/4 multicast + 240.0.0.0/4 reserved
   return false;
 }
@@ -106,6 +109,7 @@ function isPrivateIPv6(ip: string): boolean {
   if (/^fe[cdef]/.test(canonical)) return true; // fec0::/10 site-local (deprecated by RFC 3879, but still a syntactically valid, potentially-still-configured non-public range - a DNS-rebinding attacker controls the *resolved address*, not whether a target network happens to still use it)
   if (canonical.startsWith('fc') || canonical.startsWith('fd')) return true; // fc00::/7 unique local
   if (canonical.startsWith('ff')) return true; // ff00::/8 multicast
+  if (/^2001:db8:/.test(canonical)) return true; // 2001:db8::/32 documentation range (RFC 3849)
   return false;
 }
 

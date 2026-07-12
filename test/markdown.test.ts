@@ -98,12 +98,15 @@ describe('extractToc', () => {
     const bigMd = '\n'.repeat(200_000) + '# too far to see';
     const index = buildHeadingIndex(bigMd);
     expect(index.lines.length).toBeLessThanOrEqual(50_000);
+    expect(index.truncated).toBe(true);
     // The one heading lives past the cap, so it must not be found.
     expect(tocFromHeadingIndex(index)).toHaveLength(0);
   });
 
   it('still finds headings comfortably within the line cap', () => {
     const md = '\n'.repeat(10) + '# Reachable';
+    const index = buildHeadingIndex(md);
+    expect(index.truncated).toBe(false);
     expect(extractToc(md).map((t) => t.title)).toEqual(['Reachable']);
   });
 });
@@ -141,6 +144,31 @@ describe('extractSection', () => {
     expect(toc.map((t) => t.anchor)).toEqual(['foo', 'foo-1']);
     expect(extractSection(md, 'foo')?.markdown).toContain('textA');
     expect(extractSection(md, 'foo-1')?.markdown).toContain('textB');
+  });
+
+  it('appends a truncation notice only to the section that runs to the end of a line-capped document', () => {
+    // Regression: when a document exceeds MAX_LINES, collectHeadings()
+    // silently drops every line (and therefore heading) past the cap.
+    // The last heading found then has no "next heading" to bound it, so
+    // its section's end fell back to "end of retained lines" and was
+    // returned as if that were the genuine end of the section - even
+    // though the real document may continue for many more lines,
+    // possibly containing more of the same section or another heading
+    // that would have closed it. A section that *is* properly closed by
+    // a same-or-lesser-depth heading found well within the safely-
+    // scanned portion is unaffected by truncation elsewhere in the
+    // document and must not get the notice.
+    const md = `## First\nfirst body\n\n## Second\n${'x\n'.repeat(60_000)}`;
+    const second = extractSection(md, 'second')!;
+    expect(second.markdown).toContain('…[document exceeds the 50000-line indexing limit');
+    const first = extractSection(md, 'first')!;
+    expect(first.markdown).not.toContain('…[document exceeds');
+    expect(first.markdown).toBe('## First\nfirst body');
+  });
+
+  it('does not append a truncation notice when the document is within the line cap', () => {
+    const md = `# Top\n\nbody`;
+    expect(extractSection(md, 'top')?.markdown).not.toContain('…[document exceeds');
   });
 });
 

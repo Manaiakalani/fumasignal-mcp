@@ -16,6 +16,9 @@ describe('isPrivateOrReservedAddress', () => {
     expect(isPrivateOrReservedAddress('255.255.255.255')).toBe(true); // reserved
     expect(isPrivateOrReservedAddress('198.18.0.1')).toBe(true); // 198.18.0.0/15 RFC 2544 benchmark start
     expect(isPrivateOrReservedAddress('198.19.255.255')).toBe(true); // 198.18.0.0/15 RFC 2544 benchmark end
+    expect(isPrivateOrReservedAddress('192.0.2.1')).toBe(true); // 192.0.2.0/24 TEST-NET-1 (RFC 5737)
+    expect(isPrivateOrReservedAddress('198.51.100.1')).toBe(true); // 198.51.100.0/24 TEST-NET-2 (RFC 5737)
+    expect(isPrivateOrReservedAddress('203.0.113.1')).toBe(true); // 203.0.113.0/24 TEST-NET-3 (RFC 5737)
   });
 
   it('allows public IPv4 addresses, including just outside private range boundaries', () => {
@@ -30,6 +33,12 @@ describe('isPrivateOrReservedAddress', () => {
     expect(isPrivateOrReservedAddress('223.255.255.255')).toBe(false); // just below multicast
     expect(isPrivateOrReservedAddress('198.17.255.255')).toBe(false); // just below 198.18.0.0/15
     expect(isPrivateOrReservedAddress('198.20.0.0')).toBe(false); // just above 198.18.0.0/15
+    expect(isPrivateOrReservedAddress('192.0.1.255')).toBe(false); // just below TEST-NET-1
+    expect(isPrivateOrReservedAddress('192.0.3.0')).toBe(false); // just above TEST-NET-1
+    expect(isPrivateOrReservedAddress('198.51.99.255')).toBe(false); // just below TEST-NET-2
+    expect(isPrivateOrReservedAddress('198.51.101.0')).toBe(false); // just above TEST-NET-2
+    expect(isPrivateOrReservedAddress('203.0.112.255')).toBe(false); // just below TEST-NET-3
+    expect(isPrivateOrReservedAddress('203.0.114.0')).toBe(false); // just above TEST-NET-3
   });
 
   it('flags private/reserved IPv6 ranges', () => {
@@ -42,6 +51,7 @@ describe('isPrivateOrReservedAddress', () => {
     expect(isPrivateOrReservedAddress('fd12:3456:789a::1')).toBe(true); // unique local
     expect(isPrivateOrReservedAddress('ff02::1')).toBe(true); // multicast (all-nodes link-local)
     expect(isPrivateOrReservedAddress('ff00::')).toBe(true); // multicast (ff00::/8 start)
+    expect(isPrivateOrReservedAddress('2001:db8::1')).toBe(true); // 2001:db8::/32 documentation range (RFC 3849)
   });
 
   it('allows public IPv6 addresses', () => {
@@ -91,6 +101,18 @@ describe('isPrivateOrReservedAddress', () => {
   it('does not misclassify addresses just outside the fe80::/10 and fec0::/10 boundaries', () => {
     expect(isPrivateOrReservedAddress('fe7f:ffff::1')).toBe(false); // just below fe80::/10
     expect(isPrivateOrReservedAddress('ff00::1')).toBe(true); // ff00::/8 multicast, not fe.. anymore - still private via multicast rule
+  });
+
+  it('flags the IPv6 documentation range (2001:db8::/32) regardless of spelling, and allows just outside it', () => {
+    // RFC 3849 section 4 recommends this range be filtered the same way
+    // as other non-public space - see net-safety.ts's comment on this
+    // check for why "used only in documentation" doesn't mean "safe to
+    // allow": operators can and do misconfigure or repurpose it.
+    expect(isPrivateOrReservedAddress('2001:0db8::1')).toBe(true); // un-compressed leading zero, same address
+    expect(isPrivateOrReservedAddress('2001:DB8::1')).toBe(true); // uppercase hex
+    expect(isPrivateOrReservedAddress('2001:db8:ffff::ffff')).toBe(true); // still within /32
+    expect(isPrivateOrReservedAddress('2001:db7:ffff::1')).toBe(false); // just below 2001:db8::/32
+    expect(isPrivateOrReservedAddress('2001:db9::1')).toBe(false); // just above 2001:db8::/32
   });
 
   it('fails closed (treats as unsafe) for anything that is not a recognizable literal IP', () => {

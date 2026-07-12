@@ -71,6 +71,16 @@ export interface Heading {
 export interface HeadingIndex {
   lines: string[];
   headings: Heading[];
+  /**
+   * True if the source document had more lines than `MAX_LINES` and was
+   * cut off before every line was scanned/retained. When true, headings
+   * (and therefore sections) beyond the retained portion don't exist in
+   * this index at all - see `sectionFromHeadingIndex()`'s use of this
+   * flag to caveat the one section whose true end is actually ambiguous
+   * as a result (the last one found, which may have been cut off mid-
+   * section rather than ending where the document itself ends).
+   */
+  truncated: boolean;
 }
 
 /**
@@ -126,11 +136,12 @@ const MAX_LINES = 50_000;
  */
 function collectHeadings(markdown: string): HeadingIndex {
   const allLines = markdown.split(/\r?\n/);
+  const truncated = allLines.length > MAX_LINES;
   // Slicing (rather than just scanning fewer of `allLines`) lets the
   // original, potentially huge array be garbage-collected once this
   // function returns, instead of keeping it alive as part of `lines`'
   // backing store - see MAX_LINES's doc comment for why that matters.
-  const lines = allLines.length > MAX_LINES ? allLines.slice(0, MAX_LINES) : allLines;
+  const lines = truncated ? allLines.slice(0, MAX_LINES) : allLines;
   const headings: Heading[] = [];
   let inFence = false;
   const nextSuffix = new Map<string, number>();
@@ -160,7 +171,7 @@ function collectHeadings(markdown: string): HeadingIndex {
     usedAnchors.add(anchor);
     headings.push({ depth, title, anchor, line: i });
   }
-  return { lines, headings };
+  return { lines, headings, truncated };
 }
 
 /**
@@ -195,22 +206,33 @@ export function sectionFromHeadingIndex(
   index: HeadingIndex,
   anchor: string,
 ): { title: string; markdown: string } | null {
-  const { lines, headings } = index;
+  const { lines, headings, truncated } = index;
   const targetIdx = headings.findIndex((h) => h.anchor === anchor);
   if (targetIdx === -1) return null;
   const target = headings[targetIdx]!;
 
   let endIdx = lines.length;
+  let hasFollowingHeading = false;
   for (let j = targetIdx + 1; j < headings.length; j++) {
     if (headings[j]!.depth <= target.depth) {
       endIdx = headings[j]!.line;
+      hasFollowingHeading = true;
       break;
     }
   }
-  return {
-    title: target.title,
-    markdown: lines.slice(target.line, endIdx).join('\n').trim(),
-  };
+  let markdown = lines.slice(target.line, endIdx).join('\n').trim();
+  // Only the section that runs all the way to the end of the *retained*
+  // lines has an ambiguous true end when the document was truncated: an
+  // earlier section's end is always a heading position found within the
+  // safely-scanned portion, so truncation elsewhere in the document can't
+  // affect it. This section's real content past MAX_LINES - which may
+  // contain more of the same section, or the next heading that would
+  // otherwise have closed it - was never scanned, so presenting it as
+  // complete would be misleading.
+  if (truncated && !hasFollowingHeading) {
+    markdown += `\n\n…[document exceeds the ${MAX_LINES}-line indexing limit; this section may be incomplete]`;
+  }
+  return { title: target.title, markdown };
 }
 
 /**
