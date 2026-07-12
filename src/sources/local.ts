@@ -1,6 +1,11 @@
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
-import { extractSection, extractToc } from '../lib/markdown.js';
+import {
+  type HeadingIndex,
+  buildHeadingIndex,
+  sectionFromHeadingIndex,
+  tocFromHeadingIndex,
+} from '../lib/markdown.js';
 import { parseFrontmatter, asNonEmptyString } from '../lib/frontmatter.js';
 import { hasPathPrefix } from '../lib/sitemap.js';
 import { logger } from '../lib/logger.js';
@@ -114,6 +119,12 @@ interface IndexedPage {
   title: string;
   description?: string;
   toc: TocEntry[];
+  /**
+   * Cached alongside `toc` so `getSection()` can look up a section without
+   * re-splitting/re-scanning `body` from scratch on every call - see
+   * `buildHeadingIndex()`'s doc comment.
+   */
+  headingIndex: HeadingIndex;
 }
 
 export class LocalFumadocsSource implements FumadocsSource {
@@ -268,7 +279,8 @@ export class LocalFumadocsSource implements FumadocsSource {
         logger.warn({ err, file }, 'local: skipping page that failed to read/parse');
         continue;
       }
-      const toc = extractToc(body);
+      const headingIndex = buildHeadingIndex(body);
+      const toc = tocFromHeadingIndex(headingIndex);
       // Frontmatter is untrusted content: `meta.title`/`meta.description`
       // may be a YAML number, boolean, etc. A non-string title would
       // otherwise reach `search()`'s `.toLowerCase()` call and throw,
@@ -291,6 +303,7 @@ export class LocalFumadocsSource implements FumadocsSource {
         title,
         ...(description ? { description } : {}),
         toc,
+        headingIndex,
       });
       indexedCount++;
     }
@@ -400,7 +413,7 @@ export class LocalFumadocsSource implements FumadocsSource {
 
   async getSection(ref: string, anchor: string): Promise<{ title: string; markdown: string }> {
     const page = await this.resolveRef(ref);
-    const section = extractSection(page.body, anchor);
+    const section = sectionFromHeadingIndex(page.headingIndex, anchor);
     if (!section) {
       throw new NotFoundError(
         `Section "#${anchor}" not found on ${page.url}. Available: ${page.toc.map((t) => t.anchor).join(', ') || '(none)'}`,

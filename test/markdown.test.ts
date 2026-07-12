@@ -1,5 +1,12 @@
 import { describe, it, expect } from 'vitest';
-import { extractToc, extractSection, slugify } from '../src/lib/markdown.js';
+import {
+  extractToc,
+  extractSection,
+  slugify,
+  buildHeadingIndex,
+  tocFromHeadingIndex,
+  sectionFromHeadingIndex,
+} from '../src/lib/markdown.js';
 
 describe('slugify', () => {
   it('lowercases and hyphenates', () => {
@@ -112,5 +119,48 @@ describe('extractSection', () => {
     expect(toc.map((t) => t.anchor)).toEqual(['foo', 'foo-1']);
     expect(extractSection(md, 'foo')?.markdown).toContain('textA');
     expect(extractSection(md, 'foo-1')?.markdown).toContain('textB');
+  });
+});
+
+describe('buildHeadingIndex / tocFromHeadingIndex / sectionFromHeadingIndex', () => {
+  // local.ts/remote.ts now build one of these per cached page and reuse it
+  // across repeated getToc()/getSection() calls instead of re-scanning the
+  // markdown from scratch every time (see buildHeadingIndex's doc comment).
+  // These wrappers must stay behaviorally identical to the one-shot
+  // extractToc()/extractSection() functions they're built from.
+  const md = `# Top\n\nintro text\n\n## Setup\n\nsetup body\n\n### Sub\n\nsub body\n\n## Other\n\nother body`;
+
+  it('tocFromHeadingIndex(buildHeadingIndex(md)) matches extractToc(md)', () => {
+    expect(tocFromHeadingIndex(buildHeadingIndex(md))).toEqual(extractToc(md));
+  });
+
+  it('sectionFromHeadingIndex(buildHeadingIndex(md), anchor) matches extractSection(md, anchor) for every anchor in the toc', () => {
+    const index = buildHeadingIndex(md);
+    for (const { anchor } of tocFromHeadingIndex(index)) {
+      expect(sectionFromHeadingIndex(index, anchor)).toEqual(extractSection(md, anchor));
+    }
+  });
+
+  it('reuses one built index correctly across multiple different-anchor lookups, in a different order than they appear in the document', () => {
+    // The whole point of exporting these separately from extractToc()/
+    // extractSection() is that one HeadingIndex gets reused across many
+    // lookups against the same cached page - so looking up several
+    // different anchors against the *same* index object must return
+    // correct, mutually independent results each time, not just on the
+    // first call.
+    const index = buildHeadingIndex(md);
+    const other = sectionFromHeadingIndex(index, 'other');
+    const setup = sectionFromHeadingIndex(index, 'setup');
+    const top = sectionFromHeadingIndex(index, 'top');
+    expect(other?.markdown).toContain('other body');
+    expect(other?.markdown).not.toContain('setup body');
+    expect(setup?.markdown).toContain('setup body');
+    expect(setup?.markdown).toContain('sub body');
+    expect(setup?.markdown).not.toContain('other body');
+    expect(top?.markdown).toContain('intro text');
+  });
+
+  it('returns null from sectionFromHeadingIndex for an anchor not present in the index', () => {
+    expect(sectionFromHeadingIndex(buildHeadingIndex(md), 'nope')).toBeNull();
   });
 });

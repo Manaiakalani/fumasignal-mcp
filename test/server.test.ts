@@ -169,6 +169,26 @@ describe('MCP tool result size cap (MAX_TOOL_RESULT_CHARS)', () => {
     expect(text).toContain('response truncated');
   });
 
+  it('caps list_pages to 1000 entries by default when no explicit limit is given', async () => {
+    // Regression: omitting `limit` entirely used to skip the cap
+    // altogether and return every page - only an *explicit* limit was
+    // ever bounded, by the schema's own `.max(1000)`. A source with more
+    // than 1000 pages and no explicit limit must now be capped to 1000
+    // too, matching what the schema already enforces for an explicit
+    // value (so no caller loses anything they could otherwise have
+    // gotten), instead of building the full unbounded list first.
+    const pages: PageSummary[] = Array.from({ length: 2_000 }, (_, i) => ({
+      id: `/docs/p${i}`,
+      url: `/docs/p${i}`,
+      title: `Page ${i}`,
+    }));
+    const client = await connect(new FakeSource({ pages }));
+    const result = await client.callTool({ name: 'list_pages', arguments: {} });
+    const text = textOf(result as { content: Array<{ type: string; text?: string }> });
+    expect(text).toContain('1000 page(s) (of 2000 total):');
+    expect(text).not.toContain('/docs/p1000');
+  });
+
   it('truncates an oversized error message instead of returning it in full', async () => {
     // The cap applies to error results too, not just successful ones -
     // an underlying error message is just as capable of being huge as a

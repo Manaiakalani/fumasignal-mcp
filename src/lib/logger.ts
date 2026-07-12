@@ -1,29 +1,31 @@
 import pino from 'pino';
 
 /**
- * Cap on how many characters of an error's `message`/`stack` (or a plain
- * string logged under the `err` key) are ever written to a log line.
- * Generous for any real diagnostic need, but bounds a class of issue
- * empirically confirmed while auditing this file: several call sites log
- * `err` (or an error-derived string) built from content that can be
- * attacker/site-influenced and unbounded in length - e.g.
- * `errorResult()` in server.ts logs a tool's full error message before
- * `capToolResultChars()` ever truncates it for the *response*, and a
- * remote docs site controls what ends up in a fetch/parse error's
- * `.message`. A single multi-hundred-KB log line was measured to make a
- * CI job's synchronous stderr write (pino's well-known-fd destinations
- * default to sync mode) take *minutes* in one environment even though
- * the actual test logic finished in seconds - log destinations are not
- * guaranteed to drain quickly, and there is no reason a diagnostic log
- * line needs the *entire* value when the cap on the returned tool result
- * already makes anything past a few hundred characters redundant for
- * debugging purposes.
+ * Cap on how many characters of a logged value are ever written to a log
+ * line - an error's `message`/`stack` (or a plain string logged under the
+ * `err` key), or a URL passed through `redactUrlForLogging()`. Generous
+ * for any real diagnostic need, but bounds a class of issue empirically
+ * confirmed while auditing this file: several call sites log a value
+ * built from content that can be attacker/site-influenced and unbounded
+ * in length - e.g. `errorResult()` in server.ts logs a tool's full error
+ * message before `capToolResultChars()` ever truncates it for the
+ * *response*, a remote docs site controls what ends up in a fetch/parse
+ * error's `.message`, and a sitemap `<loc>` entry (also only bounded by
+ * the overall response-size cap, not any per-URL limit) is logged via
+ * `redactUrlForLogging()` on failure. A single multi-hundred-KB log line
+ * was measured to make a CI job's synchronous stderr write (pino's
+ * well-known-fd destinations default to sync mode) take *minutes* in one
+ * environment even though the actual test logic finished in seconds - log
+ * destinations are not guaranteed to drain quickly, and there is no
+ * reason a diagnostic log line needs the *entire* value when the cap on
+ * the returned tool result already makes anything past a few hundred
+ * characters redundant for debugging purposes.
  */
-const MAX_LOGGED_ERR_CHARS = 2_000;
+const MAX_LOGGED_FIELD_CHARS = 2_000;
 
 function truncateForLog(s: string): string {
-  return s.length > MAX_LOGGED_ERR_CHARS
-    ? `${s.slice(0, MAX_LOGGED_ERR_CHARS)}\u2026[truncated for log]`
+  return s.length > MAX_LOGGED_FIELD_CHARS
+    ? `${s.slice(0, MAX_LOGGED_FIELD_CHARS)}\u2026[truncated for log]`
     : s;
 }
 
@@ -123,10 +125,16 @@ export function redactUrlForLogging(url: string): string {
     // unredacted) if there's leading whitespace before it. Capturing
     // optional leading whitespace alongside the "//" marker and preserving
     // it in the replacement handles that without weakening the match.
-    return url.replace(/^(\s*\/\/)([^/?#]*)@/, '$1***@');
+    //
+    // Wrapped in truncateForLog(): this fallback runs on values the
+    // WHATWG parser couldn't parse at all, which imposes no length limit
+    // of its own (e.g. sitemap `<loc>` entries are bounded only by the
+    // overall response-size cap, not any per-URL limit - see
+    // MAX_LOGGED_FIELD_CHARS' doc comment).
+    return truncateForLog(url.replace(/^(\s*\/\/)([^/?#]*)@/, '$1***@'));
   }
-  if (!parsed.username && !parsed.password) return url;
+  if (!parsed.username && !parsed.password) return truncateForLog(url);
   parsed.username = '***';
   parsed.password = '';
-  return parsed.toString();
+  return truncateForLog(parsed.toString());
 }
