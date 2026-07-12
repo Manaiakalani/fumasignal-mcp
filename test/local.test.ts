@@ -1,7 +1,8 @@
 import { mkdtemp, mkdir, writeFile, rm, symlink } from 'node:fs/promises';
+import { promises as fsPromises } from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
-import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import { LocalFumadocsSource } from '../src/sources/local.js';
 
 let tmpDir: string;
@@ -314,6 +315,110 @@ describe('LocalFumadocsSource security fixes', () => {
       const pages = await src.listPages();
       expect(pages.map((p) => p.url)).toEqual(['/docs/normal']);
       expect(await src.getLlmsTxt()).toBe('ordinary llms.txt content');
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('stops indexing once the aggregate maxTotalBytes budget is exhausted, even though every file is under maxFileBytes', async () => {
+    // Regression: buildIndex() only ever capped a single file's size
+    // (maxFileBytes). An untrusted cloned docs repo with many files each
+    // just under that per-file cap can still, in aggregate, retain far
+    // more in memory than any one file would - every indexed page's
+    // body/toc/meta lives for the process's lifetime with no eviction.
+    // maxTotalBytes closes that gap. Three 100-byte files against a
+    // 150-byte aggregate budget: exactly one must fit regardless of which
+    // file the walk happens to process first (100 fits; a second 100
+    // always overshoots 150 no matter which two of the three are tried).
+    const dir = await mkdtemp(path.join(os.tmpdir(), 'fumasignal-local-maxtotal-'));
+    try {
+      const docs = path.join(dir, 'content', 'docs');
+      await mkdir(docs, { recursive: true });
+      for (const name of ['a', 'b', 'c']) {
+        await writeFile(path.join(docs, `${name}.md`), 'x'.repeat(100));
+      }
+      const src = new LocalFumadocsSource({ rootDir: dir, maxTotalBytes: 150 });
+      const pages = await src.listPages();
+      expect(pages.length).toBe(1);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('does not let maxTotalBytes affect a docs tree that fits comfortably under the default budget', async () => {
+    // Sanity check that the new aggregate cap doesn't affect ordinary,
+    // reasonably sized content using the default (no maxTotalBytes passed).
+    const dir = await mkdtemp(path.join(os.tmpdir(), 'fumasignal-local-maxtotal-default-'));
+    try {
+      const docs = path.join(dir, 'content', 'docs');
+      await mkdir(docs, { recursive: true });
+      for (const name of ['a', 'b', 'c']) {
+        await writeFile(path.join(docs, `${name}.md`), `# ${name}\n\nordinary sized page`);
+      }
+      const src = new LocalFumadocsSource({ rootDir: dir });
+      const pages = await src.listPages();
+      expect(pages.length).toBe(3);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('stops indexing once maxFileCount is reached, even though the aggregate byte budget has room to spare', async () => {
+    // Regression: maxTotalBytes alone doesn't bound the *number* of
+    // indexed pages - a directory with an extremely large number of tiny
+    // files (each far under maxFileBytes, and collectively far under
+    // maxTotalBytes) still costs a Map entry plus a toc/meta object per
+    // file. maxFileCount bounds that independently, the same way
+    // MAX_SITEMAP_URLS bounds sitemap URL count independently of
+    // MAX_SITEMAP_URL_BYTES in remote.ts. Five tiny files against a
+    // maxFileCount of 3 must index exactly 3, regardless of which three
+    // the walk happens to reach first.
+    const dir = await mkdtemp(path.join(os.tmpdir(), 'fumasignal-local-maxcount-'));
+    try {
+      const docs = path.join(dir, 'content', 'docs');
+      await mkdir(docs, { recursive: true });
+      for (let i = 0; i < 5; i++) {
+        await writeFile(path.join(docs, `p${i}.md`), `# Page ${i}`);
+      }
+      const src = new LocalFumadocsSource({ rootDir: dir, maxFileCount: 3 });
+      const pages = await src.listPages();
+      expect(pages.length).toBe(3);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('stops walk() itself from descending into further directories once maxFileCount is reached, not just from indexing further files', async () => {
+    // Regression: walk() used to fully enumerate every matching file path
+    // in the tree - recursing into every subdirectory no matter what -
+    // before buildIndex() ever got a chance to apply maxFileCount. For an
+    // extremely large tree, that means walk() itself (not just the later
+    // read/index step) could momentarily hold megabytes of path strings
+    // in memory before the budget was ever consulted. walk() now takes a
+    // limit and stops enumerating once it's reached, so verify fs.readdir
+    // is never even called for a sibling subdirectory once the budget is
+    // already exhausted. Uses two sibling subdirectories, each with one
+    // file, and maxFileCount: 1 - regardless of which of the two
+    // subdirectories the filesystem happens to enumerate first, walk()
+    // must find its one allowed file there and stop before descending
+    // into the other, so exactly 2 directories (the content root + one
+    // subdirectory) should ever be passed to fs.readdir, never 3.
+    const dir = await mkdtemp(path.join(os.tmpdir(), 'fumasignal-local-walklimit-'));
+    try {
+      const docs = path.join(dir, 'content', 'docs');
+      await mkdir(path.join(docs, 'a'), { recursive: true });
+      await mkdir(path.join(docs, 'z'), { recursive: true });
+      await writeFile(path.join(docs, 'a', 'one.md'), '# One');
+      await writeFile(path.join(docs, 'z', 'two.md'), '# Two');
+      const readdirSpy = vi.spyOn(fsPromises, 'readdir');
+      try {
+        const src = new LocalFumadocsSource({ rootDir: dir, maxFileCount: 1 });
+        const pages = await src.listPages();
+        expect(pages.length).toBe(1);
+        expect(readdirSpy.mock.calls.length).toBe(2);
+      } finally {
+        readdirSpy.mockRestore();
+      }
     } finally {
       await rm(dir, { recursive: true, force: true });
     }

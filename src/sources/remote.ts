@@ -1,4 +1,4 @@
-import { logger } from '../lib/logger.js';
+import { logger, redactUrlForLogging } from '../lib/logger.js';
 import { TtlCache, Coalescer, Semaphore } from '../lib/cache.js';
 import { htmlToMarkdown } from '../lib/html-to-md.js';
 import { extractSection, extractToc } from '../lib/markdown.js';
@@ -552,9 +552,19 @@ export class RemoteFumadocsSource implements FumadocsSource {
       }
       if (subUrl.origin !== this.base.origin) continue;
       try {
-        pages.push(...(await this.fetchSitemapUrls(subUrl, depth + 1, state)));
+        // Not `pages.push(...(await this.fetchSitemapUrls(...)))`: a leaf
+        // sitemap legitimately within the MAX_SITEMAP_URLS (200,000)
+        // budget can return an array large enough that spreading it as
+        // call arguments throws `RangeError: Maximum call stack size
+        // exceeded` - empirically confirmed on Node for arrays of roughly
+        // 125,000+ elements (varies by engine build/version). That would
+        // be caught by this try/catch and logged as "failed to fetch,
+        // skipping", silently dropping a large but *legitimate* leaf
+        // sitemap's worth of pages for a reason unrelated to the actual
+        // budget. A plain loop has no such limit.
+        for (const p of await this.fetchSitemapUrls(subUrl, depth + 1, state)) pages.push(p);
       } catch (err) {
-        logger.warn({ err, url: loc }, 'remote: failed to fetch nested sitemap, skipping');
+        logger.warn({ err, url: redactUrlForLogging(loc) }, 'remote: failed to fetch nested sitemap, skipping');
       }
     }
     return pages;
@@ -732,7 +742,10 @@ export class RemoteFumadocsSource implements FumadocsSource {
             // Malformed frontmatter on the markdown-flavored URL shouldn't
             // fail the whole page - fall through to the next candidate (or
             // the HTML scrape below) instead of throwing.
-            logger.warn({ err, url: candidate.toString() }, 'remote: failed to parse frontmatter, falling back');
+            logger.warn(
+              { err, url: redactUrlForLogging(candidate.toString()) },
+              'remote: failed to parse frontmatter, falling back',
+            );
           }
           continue;
         }

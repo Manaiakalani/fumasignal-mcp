@@ -13,6 +13,29 @@ const SERVER_VERSION = '0.1.0';
 /** Maximum characters of markdown returned per call (truncates with notice). */
 const MAX_PAGE_CHARS = 60_000;
 
+/**
+ * Hard ceiling on the text of any single tool result, enforced centrally
+ * in `textResult()`/`errorResult()` - the two functions every tool routes
+ * its output through - rather than in each tool individually, so new
+ * tools automatically inherit it. `MAX_PAGE_CHARS` already truncates
+ * `get_page`'s markdown body specifically, but every other tool -
+ * `get_toc`, `get_meta`, `get_section`, `list_pages`, `search_docs` - has
+ * no size cap of its own: their output is bounded only by the underlying
+ * page's `maxResponseBytes`/`maxFileBytes` cap (10MB by default), which is
+ * far larger than a reasonable MCP tool response. The content driving
+ * these tools is untrusted (same threat model as everywhere else in this
+ * codebase - see net-safety.ts, local.ts, remote.ts): a single crafted
+ * page - a huge HTML `<title>`, thousands of headings, a giant
+ * frontmatter block, or one section spanning the whole body (defeating
+ * `get_page`'s own truncation, since `get_section` has none) - could
+ * otherwise produce a multi-MB tool response, and concurrent calls
+ * multiply that cost. Set well above `MAX_PAGE_CHARS` so it never
+ * interferes with that tool's own, more specific truncation notice -
+ * this is a last-resort safety net for everything else, not a
+ * replacement for it.
+ */
+const MAX_TOOL_RESULT_CHARS = 200_000;
+
 export function createServer(source: FumadocsSource): McpServer {
   const server = new McpServer({
     name: SERVER_NAME,
@@ -131,7 +154,8 @@ function registerTools(server: McpServer, source: FumadocsSource): void {
         let body = page.markdown;
         let truncated = false;
         if (body.length > MAX_PAGE_CHARS) {
-          body = `${body.slice(0, MAX_PAGE_CHARS)}\n\n…[truncated; ${body.length - MAX_PAGE_CHARS} more chars available via get_section]`;
+          const cut = safeTruncateLength(body, MAX_PAGE_CHARS);
+          body = `${body.slice(0, cut)}\n\n…[truncated; ${body.length - cut} more chars available via get_section]`;
           truncated = true;
         }
         const head = `# ${page.title}\n\n_URL: ${page.url}_${page.description ? `\n\n${page.description}` : ''}`;
@@ -250,9 +274,10 @@ function textResult(
   text: string,
   meta?: Record<string, unknown>,
 ): { content: { type: 'text'; text: string }[]; _meta?: Record<string, unknown> } {
+  const [out, cappedHere] = capToolResultChars(text);
   return {
-    content: [{ type: 'text', text }],
-    ...(meta ? { _meta: meta } : {}),
+    content: [{ type: 'text', text: out }],
+    ...(meta || cappedHere ? { _meta: { ...meta, ...(cappedHere ? { truncated: true } : {}) } } : {}),
   };
 }
 
@@ -268,12 +293,47 @@ function errorResult(
           ? `Error: ${err.message}`
           : `Error: ${String(err)}`;
   logger.warn({ err: message }, 'fumasignal-mcp: tool error');
+  const [out] = capToolResultChars(message);
   return {
-    content: [{ type: 'text', text: message }],
+    content: [{ type: 'text', text: out }],
     isError: true,
   };
 }
 
 function truncate(s: string, max: number): string {
-  return s.length > max ? `${s.slice(0, max)}…` : s;
+  if (s.length <= max) return s;
+  return `${s.slice(0, safeTruncateLength(s, max))}…`;
+}
+
+/**
+ * Return a cut length `<= max` such that `text.slice(0, cut)` never splits
+ * a UTF-16 surrogate pair. Strings are sequences of UTF-16 code units, not
+ * code points: an emoji or other supplementary-plane character is stored
+ * as a high surrogate (0xD800-0xDBFF) followed by a low surrogate, and
+ * naively cutting at an arbitrary offset can land between the two. That
+ * leaves a dangling lone high surrogate at the end of the truncated
+ * string, which is not well-formed Unicode and can render as U+FFFD or
+ * confuse a downstream JSON/UTF-8 encoder. Used by every truncation site
+ * in this file so none of them can reintroduce this.
+ */
+function safeTruncateLength(text: string, max: number): number {
+  if (max <= 0 || max >= text.length) return Math.max(0, Math.min(max, text.length));
+  const before = text.charCodeAt(max - 1);
+  return before >= 0xd800 && before <= 0xdbff ? max - 1 : max;
+}
+
+/**
+ * Last-resort safety net applied to every tool result (success or error) -
+ * see `MAX_TOOL_RESULT_CHARS`'s doc comment for why this exists as a
+ * central check rather than relying on each tool to bound its own output.
+ * Returns the (possibly truncated) text plus whether truncation happened
+ * *here* specifically, so callers can merge that into their own
+ * truncation flag without clobbering one a tool already set for its own,
+ * more specific reason (e.g. get_page's MAX_PAGE_CHARS notice).
+ */
+function capToolResultChars(text: string): [string, boolean] {
+  if (text.length <= MAX_TOOL_RESULT_CHARS) return [text, false];
+  const cut = safeTruncateLength(text, MAX_TOOL_RESULT_CHARS);
+  const out = `${text.slice(0, cut)}\n\n…[response truncated at ${MAX_TOOL_RESULT_CHARS} characters; use a more targeted tool or a smaller limit/prefix to retrieve less at once]`;
+  return [out, true];
 }
