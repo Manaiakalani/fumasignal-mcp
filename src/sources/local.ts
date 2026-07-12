@@ -487,13 +487,6 @@ export class LocalFumadocsSource implements FumadocsSource {
    * `rootDir`. Git supports committing symlinks, so cloning an untrusted
    * docs repo and pointing `--local` at it could otherwise let a symlink
    * (e.g. `llms.txt -> /etc/passwd`) exfiltrate arbitrary host files via a
-   * fixed-name read.
-   */
-  /**
-   * Read a file, refusing to follow a symlink that resolves outside
-   * `rootDir`. Git supports committing symlinks, so cloning an untrusted
-   * docs repo and pointing `--local` at it could otherwise let a symlink
-   * (e.g. `llms.txt -> /etc/passwd`) exfiltrate arbitrary host files via a
    * fixed-name read. Also enforces `maxFileBytes` (see its doc comment) -
    * the same untrusted-repo threat model applies to file *size*, not just
    * symlink targets.
