@@ -12,8 +12,12 @@ jobs:
       matrix:
         node: [20, 22]
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      # SHA-pinned rather than the "v4" tag: even for GitHub's own first-
+      # party actions, a mutable major-version tag is one compromised or
+      # coerced re-tag away from arbitrary code running in CI. See
+      # release.yml's changesets/action pin for the fuller rationale.
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: ${{ matrix.node }}
           cache: npm

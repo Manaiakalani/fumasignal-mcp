@@ -1,5 +1,18 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import { RemoteFumadocsSource } from '../src/sources/remote.js';
+
+// Existing tests below construct many `RemoteFumadocsSource` instances
+// without caring about DNS behavior at all - they just want fetches to
+// reach their mocked `fetchImpl`. Rather than threading an explicit
+// `dnsLookup` override through every one of those call sites, stub the
+// module the real default (`defaultDnsLookup` in remote.ts) is built on
+// so it resolves any hostname to a public-looking (RFC 5737 TEST-NET)
+// address instead of making a real DNS query. Tests that specifically
+// exercise the DNS-rebinding guard pass their own `dnsLookup` in options,
+// which takes priority over this default and bypasses the mock entirely.
+vi.mock('node:dns/promises', () => ({
+  lookup: async () => [{ address: '203.0.113.10', family: 4 }],
+}));
 
 /** Build a fake fetch that responds based on URL→{status, body, contentType}. */
 function makeFetch(
@@ -256,6 +269,137 @@ describe('RemoteFumadocsSource', () => {
     // everything.
     expect(pages.length).toBeLessThanOrEqual(200_000);
     expect(pages.length).toBeLessThan(subCount * urlsPerShard);
+  });
+
+  it('bounds total accumulated URL *bytes*, not just count, when URLs are abnormally long (cache-OOM regression)', async () => {
+    // Regression: MAX_SITEMAP_URLS only bounds URL *count*. A single
+    // <loc>...</loc> has no per-URL length limit (parseSitemap captures
+    // the whole inner text), so packing every leaf sitemap with a small
+    // number of abnormally long URLs - instead of many short ones - can
+    // exhaust most of maxResponseBytes (10MB default) per shard while
+    // barely touching the 200,000 URL-count budget. Empirically confirmed
+    // pre-fix: ~11KB URLs across the real 200-fetch budget reached ~2GB of
+    // retained URL text while the count budget (200,000) was still
+    // ~18,600 short of triggering - the count cap never engaged.
+    // MAX_SITEMAP_URL_BYTES closes this by capping accumulated bytes
+    // independently of count, so it must kick in here despite the URL
+    // count staying tiny.
+    const shardCount = 5;
+    const urlLen = 8_000_000; // ~8MB per URL; comfortably under maxResponseBytes (10MB) per shard
+    const routes: Record<string, { body: string; contentType?: string }> = {
+      'https://example.com/sitemap.xml': {
+        body: `<?xml version="1.0"?>\n<sitemapindex>\n${Array.from(
+          { length: shardCount },
+          (_, i) => `  <loc>https://example.com/sitemap-${i}.xml</loc>`,
+        ).join('\n')}\n</sitemapindex>`,
+        contentType: 'application/xml',
+      },
+    };
+    for (let i = 0; i < shardCount; i++) {
+      const longUrl = `https://example.com/docs/${'a'.repeat(urlLen)}`;
+      routes[`https://example.com/sitemap-${i}.xml`] = {
+        body: `<?xml version="1.0"?>\n<urlset>\n<url><loc>${longUrl}</loc></url>\n</urlset>`,
+        contentType: 'application/xml',
+      };
+    }
+    const src = new RemoteFumadocsSource({ baseUrl, fetchImpl: makeFetch(routes) });
+    const pages = await src.listPages();
+    // Each shard contributes exactly one ~8MB URL. 5 shards would total
+    // ~40MB, well beyond MAX_SITEMAP_URL_BYTES (20MB), despite using only
+    // 5 of the 200,000 URL-count budget - so only the byte cap, not the
+    // count cap, can be what stops accumulation partway through.
+    expect(pages.length).toBeGreaterThan(0);
+    expect(pages.length).toBeLessThan(shardCount);
+  });
+
+  it('rejects a single URL outright if adding it would push accumulated bytes past the budget (overshoot regression)', async () => {
+    // Regression: takeWithinUrlBudget() used to check
+    // `totalUrlBytes >= MAX_SITEMAP_URL_BYTES` *before* adding a URL's
+    // length, rather than checking whether *adding* it would exceed the
+    // budget. That let a single URL push the running total past the 20MB
+    // budget by up to that URL's own length - a "cap plus one oversized
+    // URL" policy, not a true ceiling. Two shards: the first URL (~19MB)
+    // lands comfortably under the 20MB budget; the second (~2MB) would
+    // push the combined total to ~21MB, over budget. The fixed check
+    // must exclude the second URL entirely rather than let it through
+    // because the pre-add total alone was still under budget.
+    const prefix = 'https://example.com/docs/';
+    const firstUrl = prefix + 'a'.repeat(19_000_000 - prefix.length);
+    const secondUrl = prefix + 'b'.repeat(2_000_000 - prefix.length);
+    const routes: Record<string, { body: string; contentType?: string }> = {
+      'https://example.com/sitemap.xml': {
+        body: `<?xml version="1.0"?>\n<sitemapindex>\n  <loc>https://example.com/sitemap-0.xml</loc>\n  <loc>https://example.com/sitemap-1.xml</loc>\n</sitemapindex>`,
+        contentType: 'application/xml',
+      },
+      'https://example.com/sitemap-0.xml': {
+        body: `<?xml version="1.0"?>\n<urlset>\n<url><loc>${firstUrl}</loc></url>\n</urlset>`,
+        contentType: 'application/xml',
+      },
+      'https://example.com/sitemap-1.xml': {
+        body: `<?xml version="1.0"?>\n<urlset>\n<url><loc>${secondUrl}</loc></url>\n</urlset>`,
+        contentType: 'application/xml',
+      },
+    };
+    const src = new RemoteFumadocsSource({
+      baseUrl,
+      maxResponseBytes: 22_000_000, // large enough that neither individual shard response is truncated
+      fetchImpl: makeFetch(routes),
+    });
+    const pages = await src.listPages();
+    // Only the first (~19MB) URL should survive; the second must be
+    // excluded, not let through with the total overshooting to ~21MB.
+    expect(pages.length).toBe(1);
+    expect(pages[0]!.url.startsWith('/docs/aaaa')).toBe(true);
+  });
+
+  it('charges sitemap-index <loc> pointer URLs against the byte budget, not just leaf page URLs', async () => {
+    // Regression: takeWithinUrlBudget() only charges bytes for *leaf*
+    // sitemap page URLs. A <sitemapindex>'s own <loc> pointers (URLs of
+    // OTHER sitemaps, not pages) were never charged before being
+    // remembered in state.visited - so an index with abnormally long
+    // pointer URLs could retain far more than MAX_SITEMAP_URL_BYTES
+    // (bounded only by MAX_SITEMAP_FETCHES x maxResponseBytes, ~2GB
+    // worst case) independent of how few actual pages it ever returns.
+    // Three ~7MB sub-sitemap pointer URLs: the first two total ~14MB
+    // (under the 20MB budget, both fetched); the third would push the
+    // total to ~21MB and must be excluded *before* it's ever fetched.
+    const targetLen = 7_000_000;
+    const prefix = 'https://example.com/sitemap-';
+    const suffix = '.xml';
+    const pointerUrl = (ch: string) => prefix + ch.repeat(targetLen - prefix.length - suffix.length) + suffix;
+    const url0 = pointerUrl('x');
+    const url1 = pointerUrl('y');
+    const url2 = pointerUrl('z');
+    const routes: Record<string, { body: string; contentType?: string }> = {
+      'https://example.com/sitemap.xml': {
+        body: `<?xml version="1.0"?>\n<sitemapindex>\n  <loc>${url0}</loc>\n  <loc>${url1}</loc>\n  <loc>${url2}</loc>\n</sitemapindex>`,
+        contentType: 'application/xml',
+      },
+      [url0]: {
+        body: `<?xml version="1.0"?>\n<urlset>\n<url><loc>https://example.com/docs/shard-0</loc></url>\n</urlset>`,
+        contentType: 'application/xml',
+      },
+      [url1]: {
+        body: `<?xml version="1.0"?>\n<urlset>\n<url><loc>https://example.com/docs/shard-1</loc></url>\n</urlset>`,
+        contentType: 'application/xml',
+      },
+      [url2]: {
+        body: `<?xml version="1.0"?>\n<urlset>\n<url><loc>https://example.com/docs/shard-2</loc></url>\n</urlset>`,
+        contentType: 'application/xml',
+      },
+    };
+    const src = new RemoteFumadocsSource({
+      baseUrl,
+      maxResponseBytes: 23_000_000, // must fit the ~21MB index document itself
+      fetchImpl: makeFetch(routes),
+    });
+    const pages = await src.listPages();
+    const urls = pages.map((p) => p.url);
+    expect(urls).toContain('/docs/shard-0');
+    expect(urls).toContain('/docs/shard-1');
+    // The third pointer must never even be fetched, so its page can't appear.
+    expect(urls).not.toContain('/docs/shard-2');
+    expect(pages.length).toBe(2);
   });
 
   it('evicts least-recently-used pages from pageCache once maxPageCacheBytes is exceeded', async () => {
@@ -908,6 +1052,81 @@ describe('RemoteFumadocsSource', () => {
       }),
     });
     await expect(src.getLlmsTxt()).rejects.toThrow(/cross-origin/i);
+  });
+
+  it('rejects a fetch when the configured hostname resolves to a private/internal address (DNS rebinding guard)', async () => {
+    // A hijacked, dangling, or poisoned DNS record can point an otherwise
+    // legitimate, uncompromised hostname at a private/internal address.
+    // The origin-string check alone (`current.origin !== this.base.origin`)
+    // can't catch this - the origin string itself doesn't change. This
+    // must be rejected even though the URL is same-origin and the sitemap
+    // fetch would otherwise succeed.
+    const src = new RemoteFumadocsSource({
+      baseUrl,
+      dnsLookup: async () => [{ address: '169.254.169.254' }], // cloud metadata address
+      fetchImpl: makeFetch({
+        'https://example.com/docs/intro.md': {
+          body: `---\ntitle: Intro\n---\n\nbody`,
+          contentType: 'text/markdown',
+        },
+      }),
+    });
+    await expect(src.getPage('/docs/intro')).rejects.toThrow(/private\/internal address/i);
+  });
+
+  it('does not perform a DNS check when baseUrl is a literal IP (no resolution step to hijack)', async () => {
+    const dnsLookup = vi.fn().mockResolvedValue([{ address: '169.254.169.254' }]);
+    const src = new RemoteFumadocsSource({
+      baseUrl: 'http://127.0.0.1:4321',
+      dnsLookup,
+      fetchImpl: makeFetch({
+        'http://127.0.0.1:4321/docs/intro.md': {
+          body: `---\ntitle: Intro\n---\n\nbody`,
+          contentType: 'text/markdown',
+        },
+      }),
+    });
+    const page = await src.getPage('/docs/intro');
+    expect(page.title).toBe('Intro');
+    expect(dnsLookup).not.toHaveBeenCalled();
+  });
+
+  it('does not perform a DNS check when baseUrl is a bracketed IPv6 literal', async () => {
+    // Regression: `new URL('http://[::1]:4321/').hostname` is "[::1]"
+    // with brackets - the DNS check must strip them before recognizing
+    // it as a literal IP, or an IPv6 loopback dev server would
+    // incorrectly be sent through a real DNS lookup on every request.
+    const dnsLookup = vi.fn().mockResolvedValue([{ address: '169.254.169.254' }]);
+    const src = new RemoteFumadocsSource({
+      baseUrl: 'http://[::1]:4321',
+      dnsLookup,
+      fetchImpl: makeFetch({
+        'http://[::1]:4321/docs/intro.md': {
+          body: `---\ntitle: Intro\n---\n\nbody`,
+          contentType: 'text/markdown',
+        },
+      }),
+    });
+    const page = await src.getPage('/docs/intro');
+    expect(page.title).toBe('Intro');
+    expect(dnsLookup).not.toHaveBeenCalled();
+  });
+
+  it('does not perform a DNS check when baseUrl hostname is "localhost"', async () => {
+    const dnsLookup = vi.fn().mockResolvedValue([{ address: '169.254.169.254' }]);
+    const src = new RemoteFumadocsSource({
+      baseUrl: 'http://localhost:4321',
+      dnsLookup,
+      fetchImpl: makeFetch({
+        'http://localhost:4321/docs/intro.md': {
+          body: `---\ntitle: Intro\n---\n\nbody`,
+          contentType: 'text/markdown',
+        },
+      }),
+    });
+    const page = await src.getPage('/docs/intro');
+    expect(page.title).toBe('Intro');
+    expect(dnsLookup).not.toHaveBeenCalled();
   });
 
   it('enforces maxResponseBytes and rejects an oversized response body', async () => {
