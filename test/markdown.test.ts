@@ -7,6 +7,14 @@ describe('slugify', () => {
     expect(slugify('  Trim Me  ')).toBe('trim-me');
     expect(slugify('Special!@# chars')).toBe('special-chars');
   });
+
+  it('preserves non-ASCII letters instead of stripping them', () => {
+    // Regression: the old regex was ASCII-only ([^a-z0-9\s-]) and silently
+    // dropped every accented/CJK/etc. character, which could collapse
+    // distinct headings (e.g. "Café" and "Cafe") to the same anchor.
+    expect(slugify('Café Déjà Vu')).toBe('café-déjà-vu');
+    expect(slugify('日本語 Docs')).toBe('日本語-docs');
+  });
 });
 
 describe('extractToc', () => {
@@ -52,5 +60,18 @@ describe('extractSection', () => {
     const dup = `## Foo\nfirst\n## Foo\nsecond`;
     expect(extractSection(dup, 'foo')?.markdown).toContain('first');
     expect(extractSection(dup, 'foo-1')?.markdown).toContain('second');
+  });
+
+  it('stays consistent with extractToc when duplicate titles appear at different depths', () => {
+    // Regression: extractToc's dedup counter was depth-independent while
+    // extractSection recomputed occurrence counts per-depth, so a heading
+    // that extractToc listed as e.g. "foo-1" could not be found by
+    // extractSection (it would return null for an anchor the TOC itself
+    // advertised).
+    const md = `# Foo\ntextA\n## Foo\ntextB\n`;
+    const toc = extractToc(md);
+    expect(toc.map((t) => t.anchor)).toEqual(['foo', 'foo-1']);
+    expect(extractSection(md, 'foo')?.markdown).toContain('textA');
+    expect(extractSection(md, 'foo-1')?.markdown).toContain('textB');
   });
 });

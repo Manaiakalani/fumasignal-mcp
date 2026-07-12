@@ -2,7 +2,12 @@ import { describe, it, expect } from 'vitest';
 import { RemoteFumadocsSource } from '../src/sources/remote.js';
 
 /** Build a fake fetch that responds based on URL→{status, body, contentType}. */
-function makeFetch(routes: Record<string, { status?: number; body: string; contentType?: string }>) {
+function makeFetch(
+  routes: Record<
+    string,
+    { status?: number; body: string; contentType?: string; headers?: Record<string, string> }
+  >,
+) {
   return async (input: RequestInfo | URL, _init?: RequestInit): Promise<Response> => {
     const url = typeof input === 'string' ? input : input.toString();
     // Normalize: ignore query
@@ -13,7 +18,7 @@ function makeFetch(routes: Record<string, { status?: number; body: string; conte
     }
     return new Response(route.body, {
       status: route.status ?? 200,
-      headers: { 'content-type': route.contentType ?? 'text/plain' },
+      headers: { 'content-type': route.contentType ?? 'text/plain', ...route.headers },
     });
   };
 }
@@ -133,5 +138,83 @@ describe('RemoteFumadocsSource', () => {
       fetchImpl: makeFetch({}),
     });
     await expect(src.getPage('https://evil.com/docs/x')).rejects.toThrow(/cross-origin/i);
+  });
+
+  it('refuses protocol-relative refs that resolve to a different host', async () => {
+    // Regression: new URL('//evil.com/x', base) resolves host to "evil.com",
+    // but the old resolveRef() only host-checked the absolute-URL branch,
+    // not the "starts with /" branch that protocol-relative refs fall into.
+    const src = new RemoteFumadocsSource({
+      baseUrl,
+      fetchImpl: makeFetch({}),
+    });
+    await expect(src.getPage('//evil.com/steal')).rejects.toThrow(/cross-origin/i);
+  });
+
+  it('transparently follows a same-origin redirect', async () => {
+    const src = new RemoteFumadocsSource({
+      baseUrl,
+      fetchImpl: makeFetch({
+        'https://example.com/llms.txt': {
+          status: 302,
+          body: '',
+          headers: { location: '/llms-real.txt' },
+        },
+        'https://example.com/llms-real.txt': { body: 'real content', contentType: 'text/plain' },
+      }),
+    });
+    expect(await src.getLlmsTxt()).toBe('real content');
+  });
+
+  it('refuses to follow a redirect to a different origin', async () => {
+    // Regression: fetch() follows redirects by default, which would let a
+    // same-origin URL 30x-redirect to an attacker host while still
+    // attaching our Authorization/UA headers. fetchSameOrigin must
+    // validate every hop, not just the initial URL.
+    const src = new RemoteFumadocsSource({
+      baseUrl,
+      fetchImpl: makeFetch({
+        'https://example.com/llms.txt': {
+          status: 302,
+          body: '',
+          headers: { location: 'https://evil.com/steal' },
+        },
+      }),
+    });
+    await expect(src.getLlmsTxt()).rejects.toThrow(/cross-origin/i);
+  });
+
+  it('does not eval() a remote page frontmatter tagged with a javascript engine', async () => {
+    const src = new RemoteFumadocsSource({
+      baseUrl,
+      fetchImpl: makeFetch({
+        'https://example.com/docs/evil.md': {
+          body: `---javascript\nglobalThis.__fumasignal_pwned_remote = true;\n---\n\nbody`,
+          contentType: 'text/markdown',
+        },
+      }),
+    });
+    try {
+      await expect(src.getPage('/docs/evil')).rejects.toThrow(/disabled for security reasons/i);
+      expect((globalThis as Record<string, unknown>).__fumasignal_pwned_remote).toBeUndefined();
+    } finally {
+      delete (globalThis as Record<string, unknown>).__fumasignal_pwned_remote;
+    }
+  });
+
+  it('does not match a sibling prefix when filtering listPages', async () => {
+    const siblingSitemap = `<?xml version="1.0"?>
+<urlset>
+  <url><loc>https://example.com/docs/api/auth</loc></url>
+  <url><loc>https://example.com/docs/api2/other</loc></url>
+</urlset>`;
+    const src = new RemoteFumadocsSource({
+      baseUrl,
+      fetchImpl: makeFetch({
+        'https://example.com/sitemap.xml': { body: siblingSitemap, contentType: 'application/xml' },
+      }),
+    });
+    const pages = await src.listPages('/docs/api');
+    expect(pages.map((p) => p.url)).toEqual(['/docs/api/auth']);
   });
 });

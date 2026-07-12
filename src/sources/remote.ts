@@ -2,7 +2,8 @@ import { logger } from '../lib/logger.js';
 import { TtlCache } from '../lib/cache.js';
 import { htmlToMarkdown } from '../lib/html-to-md.js';
 import { extractSection, extractToc } from '../lib/markdown.js';
-import { filterToDocs, parseSitemap } from '../lib/sitemap.js';
+import { parseFrontmatter } from '../lib/frontmatter.js';
+import { filterToDocs, hasPathPrefix, parseSitemap } from '../lib/sitemap.js';
 import {
   type FumadocsSource,
   type PageContent,
@@ -27,6 +28,10 @@ export interface RemoteSourceOptions {
   /** Override fetch (used by tests). */
   fetchImpl?: typeof fetch;
   userAgent?: string;
+  /** Per-request fetch timeout in ms. Default 15s. */
+  fetchTimeoutMs?: number;
+  /** Max same-origin redirects to follow before giving up. Default 5. */
+  maxRedirects?: number;
 }
 
 const DEFAULT_UA = 'fumasignal-mcp/0.1 (+https://github.com/Manaiakalani/fumasignal-mcp)';
@@ -49,6 +54,8 @@ export class RemoteFumadocsSource implements FumadocsSource {
   private authHeader?: string;
   private fetchImpl: typeof fetch;
   private ua: string;
+  private fetchTimeoutMs: number;
+  private maxRedirects: number;
   private pageCache: TtlCache<string, PageContent>;
   private listCache: TtlCache<'all', PageSummary[]>;
   private llmsCache: TtlCache<string, string | null>;
@@ -64,6 +71,8 @@ export class RemoteFumadocsSource implements FumadocsSource {
     this.authHeader = opts.authHeader;
     this.fetchImpl = opts.fetchImpl ?? fetch;
     this.ua = opts.userAgent ?? DEFAULT_UA;
+    this.fetchTimeoutMs = opts.fetchTimeoutMs ?? 15_000;
+    this.maxRedirects = opts.maxRedirects ?? 5;
     const ttl = opts.cacheTtlMs ?? 5 * 60 * 1000;
     this.pageCache = new TtlCache(ttl);
     this.listCache = new TtlCache(ttl);
@@ -81,26 +90,67 @@ export class RemoteFumadocsSource implements FumadocsSource {
     return h;
   }
 
-  private resolveUrl(pathOrUrl: string): URL {
-    if (/^https?:\/\//i.test(pathOrUrl)) return new URL(pathOrUrl);
-    return new URL(pathOrUrl, this.base);
-  }
-
   /** Normalize a "ref" (URL or path or slug) to a same-origin absolute URL. */
   private resolveRef(ref: string): URL {
+    let u: URL;
     if (/^https?:\/\//i.test(ref)) {
-      const u = new URL(ref);
-      if (u.host !== this.base.host) {
-        throw new SourceError(
-          `Refusing to fetch cross-origin URL: ${u.origin} (server is bound to ${this.base.origin})`,
-        );
-      }
-      return u;
+      u = new URL(ref);
+    } else if (ref.startsWith('/')) {
+      // NOTE: this also covers protocol-relative refs like "//evil.com/x" -
+      // new URL('//evil.com/x', base) resolves to a DIFFERENT host, so the
+      // host check below (applied uniformly to every branch) is required
+      // to catch that case; it must not be limited to the absolute-URL arm.
+      u = new URL(ref, this.base);
+    } else {
+      // Treat as slug under docsPrefix.
+      const slugPath = `${this.docsPrefix.replace(/\/+$/, '')}/${ref.replace(/^\/+/, '')}`;
+      u = new URL(slugPath, this.base);
     }
-    if (ref.startsWith('/')) return new URL(ref, this.base);
-    // Treat as slug under docsPrefix.
-    const path = `${this.docsPrefix.replace(/\/+$/, '')}/${ref.replace(/^\/+/, '')}`;
-    return new URL(path, this.base);
+    if (u.host !== this.base.host) {
+      throw new SourceError(
+        `Refusing to fetch cross-origin URL: ${u.origin} (server is bound to ${this.base.origin})`,
+      );
+    }
+    return u;
+  }
+
+  /**
+   * Fetch `url`, enforcing a timeout and manually validating same-origin on
+   * every redirect hop. `fetch` follows redirects by default, which would
+   * otherwise let a same-origin (or attacker-influenced) URL redirect to an
+   * arbitrary host while still attaching our Authorization/UA headers.
+   */
+  private async fetchSameOrigin(
+    url: URL,
+    init: { headers: Record<string, string> },
+  ): Promise<Response> {
+    let current = url;
+    for (let hop = 0; hop <= this.maxRedirects; hop++) {
+      const res = await this.fetchImpl(current.toString(), {
+        headers: init.headers,
+        redirect: 'manual',
+        signal: AbortSignal.timeout(this.fetchTimeoutMs),
+      });
+      if (res.status >= 300 && res.status < 400) {
+        const location = res.headers.get('location');
+        if (!location) return res;
+        let next: URL;
+        try {
+          next = new URL(location, current);
+        } catch {
+          return res;
+        }
+        if (next.host !== this.base.host) {
+          throw new SourceError(
+            `Refusing to follow cross-origin redirect: ${current} -> ${next.origin} (server is bound to ${this.base.origin})`,
+          );
+        }
+        current = next;
+        continue;
+      }
+      return res;
+    }
+    throw new SourceError(`Too many redirects while fetching ${url}`);
   }
 
   async search(opts: SearchOptions): Promise<SearchHit[]> {
@@ -108,7 +158,7 @@ export class RemoteFumadocsSource implements FumadocsSource {
     url.searchParams.set('query', opts.query);
     if (opts.tag) url.searchParams.set('tag', opts.tag);
     if (opts.locale) url.searchParams.set('locale', opts.locale);
-    const res = await this.fetchImpl(url.toString(), { headers: this.headers() });
+    const res = await this.fetchSameOrigin(url, { headers: this.headers() });
     if (!res.ok) {
       throw new SourceError(
         `Search request failed: ${res.status} ${res.statusText} (${url})`,
@@ -124,8 +174,8 @@ export class RemoteFumadocsSource implements FumadocsSource {
     const cached = this.listCache.get('all');
     let all = cached;
     if (!all) {
-      const sitemapUrl = new URL('/sitemap.xml', this.base).toString();
-      const res = await this.fetchImpl(sitemapUrl, { headers: this.headers() });
+      const sitemapUrl = new URL('/sitemap.xml', this.base);
+      const res = await this.fetchSameOrigin(sitemapUrl, { headers: this.headers() });
       if (!res.ok) {
         throw new SourceError(
           `Failed to fetch sitemap.xml: ${res.status} ${res.statusText}`,
@@ -144,7 +194,7 @@ export class RemoteFumadocsSource implements FumadocsSource {
       logger.debug({ count: all.length }, 'remote: built page list from sitemap');
     }
     if (!prefix) return all;
-    return all.filter((p) => p.url.startsWith(prefix));
+    return all.filter((p) => hasPathPrefix(p.url, prefix));
   }
 
   async getPage(ref: string): Promise<PageContent> {
@@ -194,8 +244,8 @@ export class RemoteFumadocsSource implements FumadocsSource {
     const path = full ? '/llms-full.txt' : '/llms.txt';
     const cached = this.llmsCache.get(path);
     if (cached !== undefined) return cached;
-    const url = new URL(path, this.base).toString();
-    const res = await this.fetchImpl(url, { headers: this.headers() });
+    const url = new URL(path, this.base);
+    const res = await this.fetchSameOrigin(url, { headers: this.headers() });
     if (res.status === 404) {
       this.llmsCache.set(path, null);
       return null;
@@ -217,7 +267,7 @@ export class RemoteFumadocsSource implements FumadocsSource {
   ): Promise<{ markdown: string; meta: Record<string, unknown> }> {
     const candidates = buildMarkdownCandidates(target);
     for (const candidate of candidates) {
-      const res = await this.fetchImpl(candidate.toString(), {
+      const res = await this.fetchSameOrigin(candidate, {
         headers: this.headers({ Accept: 'text/markdown, text/plain;q=0.9' }),
       });
       if (res.ok) {
@@ -230,7 +280,7 @@ export class RemoteFumadocsSource implements FumadocsSource {
       }
     }
     // Fallback: HTML scrape
-    const res = await this.fetchImpl(target.toString(), { headers: this.headers() });
+    const res = await this.fetchSameOrigin(target, { headers: this.headers() });
     if (res.status === 404) {
       throw new NotFoundError(`Page not found: ${target.pathname}`);
     }
@@ -274,34 +324,6 @@ function titleFromPath(pathname: string): string {
 function extractTitle(markdown: string): string | undefined {
   const m = /^#\s+(.+?)\s*$/m.exec(markdown);
   return m ? m[1] : undefined;
-}
-
-const FRONTMATTER_RE = /^---\r?\n([\s\S]*?)\r?\n---\r?\n?/;
-
-function parseFrontmatter(src: string): { content: string; data: Record<string, unknown> } {
-  const m = FRONTMATTER_RE.exec(src);
-  if (!m) return { content: src, data: {} };
-  const yaml = m[1] ?? '';
-  const data: Record<string, unknown> = {};
-  for (const line of yaml.split(/\r?\n/)) {
-    const kv = /^([A-Za-z0-9_-]+):\s*(.*)$/.exec(line);
-    if (!kv) continue;
-    let value: unknown = kv[2]!.trim();
-    if (typeof value === 'string') {
-      if (
-        (value.startsWith('"') && value.endsWith('"')) ||
-        (value.startsWith("'") && value.endsWith("'"))
-      ) {
-        value = value.slice(1, -1);
-      } else if (value === 'true' || value === 'false') {
-        value = value === 'true';
-      } else if (value !== '' && !Number.isNaN(Number(value))) {
-        value = Number(value);
-      }
-    }
-    data[kv[1]!] = value;
-  }
-  return { content: src.slice(m[0].length), data };
 }
 
 function extractHtmlMeta(html: string): Record<string, unknown> {
