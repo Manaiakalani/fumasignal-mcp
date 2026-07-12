@@ -22,6 +22,19 @@ export interface LocalSourceOptions {
   contentDir?: string;
   /** URL prefix to use when reporting page URLs. Default: "/docs". */
   urlPrefix?: string;
+  /**
+   * Max size (bytes) of an individual `.md`/`.mdx` file to read into the
+   * index. Files larger than this are skipped (logged, not thrown) rather
+   * than read in full - `contentDir` can point at an untrusted cloned docs
+   * repo (see `readFileWithinRoot()`'s doc comment for the same threat
+   * model applied to symlinks), and every indexed file's body/toc/meta is
+   * held in memory for the process's lifetime with no TTL/eviction, unlike
+   * the remote source's byte-bounded `pageCache`. Without a per-file cap,
+   * one huge file (planted deliberately, or just an oversized file that
+   * doesn't belong in a docs tree) would be read and retained in full.
+   * Default 10MB (matches the remote source's `maxResponseBytes` default).
+   */
+  maxFileBytes?: number;
 }
 
 interface IndexedPage {
@@ -53,6 +66,7 @@ export class LocalFumadocsSource implements FumadocsSource {
    */
   private contentDirIsRelative: boolean;
   private urlPrefix: string;
+  private maxFileBytes: number;
   private indexPromise: Promise<Map<string, IndexedPage>> | null = null;
 
   constructor(opts: LocalSourceOptions) {
@@ -61,6 +75,7 @@ export class LocalFumadocsSource implements FumadocsSource {
     this.contentDirIsRelative = !path.isAbsolute(cd);
     this.contentDir = this.contentDirIsRelative ? path.join(this.rootDir, cd) : cd;
     this.urlPrefix = (opts.urlPrefix ?? '/docs').replace(/\/+$/, '');
+    this.maxFileBytes = opts.maxFileBytes ?? 10_000_000;
     this.label = `local:${this.rootDir}`;
   }
 
@@ -111,6 +126,20 @@ export class LocalFumadocsSource implements FumadocsSource {
       let body: string;
       let meta: Record<string, unknown>;
       try {
+        // Check the file's size *before* reading it in full: contentDir
+        // can point at an untrusted cloned docs repo (see the symlink
+        // comment above), and the index holds every page's body/toc/meta
+        // in memory for the process's lifetime with no eviction, so one
+        // oversized file - deliberately planted or just a mistake - would
+        // otherwise be read and retained in full with no cap at all.
+        const fileStat = await fs.stat(file);
+        if (fileStat.size > this.maxFileBytes) {
+          logger.warn(
+            { file, size: fileStat.size, maxFileBytes: this.maxFileBytes },
+            'local: skipping page that exceeds maxFileBytes',
+          );
+          continue;
+        }
         raw = await fs.readFile(file, 'utf8');
         ({ content: body, data: meta } = parseFrontmatter(raw));
       } catch (err) {
@@ -293,8 +322,23 @@ export class LocalFumadocsSource implements FumadocsSource {
    * (e.g. `llms.txt -> /etc/passwd`) exfiltrate arbitrary host files via a
    * fixed-name read.
    */
+  /**
+   * Read a file, refusing to follow a symlink that resolves outside
+   * `rootDir`. Git supports committing symlinks, so cloning an untrusted
+   * docs repo and pointing `--local` at it could otherwise let a symlink
+   * (e.g. `llms.txt -> /etc/passwd`) exfiltrate arbitrary host files via a
+   * fixed-name read. Also enforces `maxFileBytes` (see its doc comment) -
+   * the same untrusted-repo threat model applies to file *size*, not just
+   * symlink targets.
+   */
   private async readFileWithinRoot(candidate: string): Promise<string> {
     const real = await this.assertRealpathWithinRoot(candidate);
+    const fileStat = await fs.stat(real);
+    if (fileStat.size > this.maxFileBytes) {
+      throw new SourceError(
+        `Refusing to read "${candidate}": ${fileStat.size} bytes exceeds the ${this.maxFileBytes}-byte limit.`,
+      );
+    }
     return fs.readFile(real, 'utf8');
   }
 }

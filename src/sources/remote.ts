@@ -64,6 +64,16 @@ export interface RemoteSourceOptions {
    */
   maxConcurrentFetches?: number;
   /**
+   * Max number of callers allowed to wait for a fetch slot once
+   * `maxConcurrentFetches` is saturated; additional callers are rejected
+   * immediately instead of queueing. Without this, a caller issuing many
+   * concurrent requests for distinct pages/queries (each blocked on the
+   * same `fetchSemaphore`) could queue an unbounded number of pending
+   * closures - each cheap alone, but with nothing bounding how many can
+   * accumulate. Default 1000 (see `Semaphore`'s doc comment).
+   */
+  maxFetchQueueLength?: number;
+  /**
    * Override DNS resolution (used by tests, or to plug in a custom
    * resolver). Must return every address the hostname resolves to, not
    * just the first - see `assertPublicResolution()`'s doc comment.
@@ -208,7 +218,10 @@ export class RemoteFumadocsSource implements FumadocsSource {
     this.maxRedirects = opts.maxRedirects ?? 5;
     this.maxResponseBytes = opts.maxResponseBytes ?? 10_000_000;
     const maxPageCacheBytes = opts.maxPageCacheBytes ?? 50_000_000;
-    this.fetchSemaphore = new Semaphore(opts.maxConcurrentFetches ?? 8);
+    this.fetchSemaphore = new Semaphore(
+      opts.maxConcurrentFetches ?? 8,
+      opts.maxFetchQueueLength ?? 1000,
+    );
     this.dnsLookup = opts.dnsLookup ?? defaultDnsLookup;
     const ttl = opts.cacheTtlMs ?? 5 * 60 * 1000;
     this.pageCache = new TtlCache(ttl, 500, {

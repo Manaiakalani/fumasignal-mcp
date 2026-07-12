@@ -267,4 +267,55 @@ describe('LocalFumadocsSource security fixes', () => {
       await rm(outside, { recursive: true, force: true });
     }
   });
+
+  it('skips indexing a file that exceeds maxFileBytes instead of reading it in full', async () => {
+    // Regression: buildIndex() used to read every .md/.mdx file's full
+    // contents into memory with no size check at all. contentDir can point
+    // at an untrusted cloned docs repo (same threat model as the symlink
+    // checks above), and every indexed page is retained for the process's
+    // lifetime with no eviction - so one oversized file, deliberate or
+    // not, would otherwise be read and held in full unconditionally.
+    const dir = await mkdtemp(path.join(os.tmpdir(), 'fumasignal-local-maxfile-'));
+    try {
+      const docs = path.join(dir, 'content', 'docs');
+      await mkdir(docs, { recursive: true });
+      await writeFile(path.join(docs, 'small.md'), '# Small\n\nfits under the cap');
+      await writeFile(path.join(docs, 'huge.md'), `# Huge\n\n${'x'.repeat(1000)}`);
+      const src = new LocalFumadocsSource({ rootDir: dir, maxFileBytes: 100 });
+      const pages = await src.listPages();
+      expect(pages.map((p) => p.url)).toEqual(['/docs/small']);
+      expect(pages.map((p) => p.url)).not.toContain('/docs/huge');
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('refuses to read an llms.txt that exceeds maxFileBytes', async () => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), 'fumasignal-local-maxfile-llms-'));
+    try {
+      await writeFile(path.join(dir, 'llms.txt'), 'x'.repeat(1000));
+      const src = new LocalFumadocsSource({ rootDir: dir, maxFileBytes: 100 });
+      expect(await src.getLlmsTxt()).toBeNull();
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('still indexes and reads files at or under the default maxFileBytes cap', async () => {
+    // Sanity check that the new cap doesn't affect ordinary, reasonably
+    // sized content using the default (no maxFileBytes passed).
+    const dir = await mkdtemp(path.join(os.tmpdir(), 'fumasignal-local-maxfile-default-'));
+    try {
+      const docs = path.join(dir, 'content', 'docs');
+      await mkdir(docs, { recursive: true });
+      await writeFile(path.join(docs, 'normal.md'), '# Normal\n\nordinary sized page');
+      await writeFile(path.join(dir, 'llms.txt'), 'ordinary llms.txt content');
+      const src = new LocalFumadocsSource({ rootDir: dir });
+      const pages = await src.listPages();
+      expect(pages.map((p) => p.url)).toEqual(['/docs/normal']);
+      expect(await src.getLlmsTxt()).toBe('ordinary llms.txt content');
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
 });

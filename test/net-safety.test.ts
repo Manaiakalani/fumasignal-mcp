@@ -105,8 +105,14 @@ describe('assertPublicResolution', () => {
     await expect(assertPublicResolution('docs.example.com', lookup)).resolves.toBeUndefined();
   });
 
-  it('does not throw when the lookup itself fails (a real fetch error will surface moments later)', async () => {
+  it('fails closed (throws) when the lookup itself fails, rather than letting the request proceed unverified', async () => {
+    // Regression: this used to swallow the error and return, on the
+    // assumption that a lookup failure means fetch()'s own resolution
+    // will also fail moments later - see the catch block's comment in
+    // net-safety.ts for why that assumption isn't safe to rely on.
     const lookup = vi.fn().mockRejectedValue(new Error('ENOTFOUND'));
-    await expect(assertPublicResolution('nonexistent.invalid', lookup)).resolves.toBeUndefined();
+    await expect(assertPublicResolution('nonexistent.invalid', lookup)).rejects.toThrow(
+      /DNS resolution failed/,
+    );
   });
 });

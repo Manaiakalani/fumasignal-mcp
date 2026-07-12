@@ -190,4 +190,54 @@ describe('Semaphore', () => {
     expect(order).toEqual([1, 2, 3]);
     expect(results).toEqual([1, 2, 3]);
   });
+
+  it('rejects a negative or non-integer maxQueueLength at construction time', () => {
+    expect(() => new Semaphore(1, -1)).toThrow(RangeError);
+    expect(() => new Semaphore(1, 1.5)).toThrow(RangeError);
+  });
+
+  it('rejects run() once maxQueueLength waiters are already queued, instead of growing the queue unboundedly', async () => {
+    // Regression: the queue used to have no cap at all - a caller issuing
+    // many concurrent run() calls for distinct keys (nothing for a
+    // Coalescer to de-dupe) could queue an unbounded number of pending
+    // closures once the active-slot cap was saturated. With
+    // maxConcurrent=1 and maxQueueLength=2, at most 1 active + 2 queued =
+    // 3 calls should ever be accepted at once; a 4th must be rejected
+    // immediately rather than becoming a 3rd queued waiter.
+    const sem = new Semaphore(1, 2);
+    let release!: () => void;
+    const blocker = sem.run(
+      () => new Promise<string>((resolve) => (release = () => resolve('blocker'))),
+    );
+    const queued1 = sem.run(async () => 'queued1');
+    const queued2 = sem.run(async () => 'queued2');
+    await expect(sem.run(async () => 'overflow')).rejects.toThrow(/queue limit/i);
+    release();
+    await expect(blocker).resolves.toBe('blocker');
+    await expect(queued1).resolves.toBe('queued1');
+    await expect(queued2).resolves.toBe('queued2');
+  });
+
+  it('allows maxQueueLength=0 (no waiting at all - reject immediately once the active cap is saturated)', async () => {
+    const sem = new Semaphore(1, 0);
+    let release!: () => void;
+    const blocker = sem.run(
+      () => new Promise<string>((resolve) => (release = () => resolve('blocker'))),
+    );
+    await expect(sem.run(async () => 'rejected')).rejects.toThrow(/queue limit/i);
+    release();
+    await expect(blocker).resolves.toBe('blocker');
+  });
+
+  it('defaults maxQueueLength to a generous but finite value when omitted', async () => {
+    // Not exhaustively testing the exact default here (that's an
+    // implementation detail) - just confirming ordinary bounded
+    // concurrency still works with no explicit maxQueueLength, i.e. the
+    // new parameter didn't break the common case.
+    const sem = new Semaphore(2);
+    const results = await Promise.all(
+      Array.from({ length: 20 }, (_, i) => sem.run(async () => i)),
+    );
+    expect(results).toEqual(Array.from({ length: 20 }, (_, i) => i));
+  });
 });

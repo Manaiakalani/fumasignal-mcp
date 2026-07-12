@@ -106,10 +106,25 @@ export async function assertPublicResolution(hostname: string, lookup: DnsLookup
   let resolved: ResolvedAddress[];
   try {
     resolved = await lookup(hostname);
-  } catch {
-    // A lookup failure surfaces naturally as a fetch error moments later;
-    // there's no resolved address here to validate either way.
-    return;
+  } catch (err) {
+    // Fail closed rather than open. The alternative - assuming a lookup
+    // failure here means the subsequent fetch() will also fail to resolve,
+    // so there's nothing to validate - relies on this lookup and fetch()'s
+    // own internal resolution going through the exact same path with the
+    // exact same outcome. That's *usually* true (both typically bottom out
+    // in the OS's getaddrinfo()), but a DNS-controlled adversary could
+    // engineer a resolver response that fails this explicit lookup (e.g. a
+    // malformed/truncated answer this code doesn't know how to parse)
+    // while a differently-shaped query from fetch()'s own resolution path
+    // still succeeds - failing validation first, then resolving internally
+    // for the real request. Treating "we couldn't verify this is safe" as
+    // unsafe removes that gap; the cost is that a transient resolver
+    // hiccup on an otherwise-legitimate host surfaces as a request failure
+    // here instead of from fetch() a moment later, which is an acceptable
+    // trade for a tool whose job is fetching untrusted remote content.
+    throw new Error(
+      `Refusing to connect to "${hostname}": DNS resolution failed (${err instanceof Error ? err.message : String(err)}), so it cannot be verified as a public address.`,
+    );
   }
   const unsafe = resolved.find((r) => isPrivateOrReservedAddress(r.address));
   if (unsafe) {
