@@ -28,7 +28,13 @@ jobs:
       - run: npm ci
       - run: npm run build
       - name: Create release PR or publish
-        uses: changesets/action@v1
+        # Pinned to a commit SHA rather than the "v1" ref: unlike
+        # actions/* (GitHub's own namespace), "v1" here is a mutable
+        # branch (not even a tag) in a third-party repo, and this step
+        # runs with contents/pull-requests write plus GITHUB_TOKEN and
+        # NPM_TOKEN - a compromised "v1" would get arbitrary code
+        # execution with npm-publish and repo-write credentials.
+        uses: changesets/action@a45c4d594aa4e2c509dc14a9f2b3b67ba3780d0d # v1.9.0
         with:
           publish: npx changeset publish
           version: npx changeset version
