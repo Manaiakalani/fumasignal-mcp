@@ -1,6 +1,21 @@
 /** Parse a sitemap.xml (or sitemapindex) and return all URLs as strings. */
 
-const LOC_RE = /<loc>\s*([^<\s][^<]*?)\s*<\/loc>/gi;
+// Deliberately greedy+unambiguous: `[^<]*` has exactly one way to match a
+// given span, so the engine can't backtrack. The previous pattern
+// (`\s*([^<\s][^<]*?)\s*`) had a lazy inner quantifier immediately
+// followed by another quantifier (`\s*`) that matches some of the same
+// characters (whitespace) - a classic ReDoS shape. On adversarial input
+// with a `<loc>` opener, a run of spaces, and no `</loc>` closer, the
+// engine tries every way to split the run between the two quantifiers
+// before giving up, which is quadratic in the run length: empirically
+// confirmed 80KB of such input took ~5.2s (and scales ~4x per doubling),
+// extrapolating to hours for a multi-MB adversarial sitemap response.
+// `m[1]!.trim()` (below) already strips the leading/trailing whitespace
+// the old regex's `\s*` was trying to do inline, so this is a pure
+// ReDoS fix with no behavior change - confirmed via a 5000-case fuzz
+// comparison against the old regex (0 mismatches) plus the 8KB+
+// adversarial timing test (80KB: 5.2s -> 0ms; 10MB: ~14ms).
+const LOC_RE = /<loc>([^<]*)<\/loc>/gi;
 
 export function parseSitemap(xml: string): string[] {
   const urls: string[] = [];
@@ -19,6 +34,124 @@ function decodeXmlEntities(s: string): string {
     .replace(/&gt;/g, '>')
     .replace(/&quot;/g, '"')
     .replace(/&apos;/g, "'");
+}
+
+/**
+ * Percent-decode and normalize a URL pathname so a `hasPathPrefix()`
+ * authorization check can't be bypassed by encoded traversal segments -
+ * or, subtler and more dangerous, by segments that *look* harmless to a
+ * hand-rolled normalizer but that a `URL` object's own pathname parser
+ * resolves completely differently once the value is actually assigned
+ * back to a URL (which is exactly what `resolveRef()` and
+ * `fetchSameOrigin()` do with this function's return value, to build the
+ * URL that's actually fetched).
+ *
+ * This used to decode with `decodeURIComponent()` and normalize with
+ * Node's `path.posix.normalize()`. That mismatched the *real* consumer
+ * (a WHATWG `URL`) in two empirically-confirmed ways, both of which are
+ * full authorization-boundary bypasses (the check passes, but the
+ * pathname that's actually fetched afterward is different and outside
+ * `docsPrefix`):
+ *
+ *  1. Backslash: for "special" schemes (http/https - all this project
+ *     ever deals with), the `URL` path parser treats a literal "\" the
+ *     same as "/" when *parsing/assigning* a pathname, but POSIX path
+ *     semantics don't. `decodeURIComponent('%5c..%5c..%5capi')` produces
+ *     the literal string `\..\..\api`; `path.posix.normalize()` sees
+ *     that (no "/" in it) as one ordinary segment and leaves it alone -
+ *     so it passed `hasPathPrefix(..., '/docs')`. But
+ *     `url.pathname = '/docs/\\..\\..\\api/private'` immediately
+ *     collapses to "/api/private" once the `URL` setter re-parses it.
+ *  2. Double percent-encoding: `decodeURIComponent()` only unwraps one
+ *     encoding layer, so "%252e%252e" (which is "%2e%2e" with its "%"
+ *     itself encoded) decodes to the literal string "%2e%2e" -
+ *     `path.posix.normalize()` doesn't recognize that as a dot-segment
+ *     (it's not literally "." or ".."), so it also passed the check. But
+ *     the WHATWG URL spec *does* special-case a literal "%2e%2e" segment
+ *     as equivalent to ".." when *parsing* a path (precisely to close
+ *     this exact percent-encoding bypass for URL consumers in general)
+ *     - so assigning it to `.pathname` again collapses straight through
+ *     to outside `docsPrefix`, the same as case 1.
+ *
+ * Both were fully reproduced end-to-end against this file's *previous*
+ * implementation: "https://host/docs/%5c..%5c..%5capi/private" and
+ * "https://host/docs/%252e%252e/admin/secrets" each passed the prefix
+ * check yet resolved (after the exact `url.pathname = normalized`
+ * assignment `resolveRef()` performs) to "/api/private" and
+ * "/admin/secrets" respectively - both outside "/docs".
+ *
+ * The fix: stop trying to reimplement what a `URL` object will do with a
+ * pathname, and instead *ask* one. Decoding once with
+ * `decodeURIComponent()` and assigning the result to a scratch `URL`'s
+ * `.pathname` produces exactly the pathname a real fetch would use
+ * (including the WHATWG spec's own backslash- and
+ * percent-encoded-dot-segment handling), so checking `hasPathPrefix()`
+ * against *that* can no longer disagree with what actually gets fetched.
+ * One behavioral side effect (not a security concern): characters like
+ * space or non-ASCII that `decodeURIComponent()` would leave literal are
+ * re-percent-encoded by the `URL` setter, so the returned pathname is a
+ * canonical *encoded* form rather than a decoded one - callers that need
+ * a human-readable path should decode this return value themselves.
+ *
+ * 3. Double-encoded *separator* (as opposed to double-encoded *dot
+ *    segment*, case 2 above): "%252f" is "%2f" with its own "%" encoded.
+ *    `decodeURIComponent()` only unwraps one layer, producing the literal
+ *    three-character text "%2f" - which is exactly what case 1 says the
+ *    WHATWG path parser leaves alone (it never decodes "%2f"/"%5c" into
+ *    an actual "/"/"\\" while parsing, precisely so it doesn't change how
+ *    many segments a path has). So "/docs/..%252fprivate" normalizes to
+ *    "/docs/..%2fprivate" - one harmless-looking segment to *us* - and
+ *    passes `hasPathPrefix()`. It is not harmless to every consumer: many
+ *    real HTTP servers/frameworks *do* decode "%2f"/"%5c" while resolving
+ *    the request path (the same well-documented traversal class as e.g.
+ *    CVE-2021-41773). Once such a server decodes it, "..%2fprivate"
+ *    becomes the real segment "..", escaping `docsPrefix` even though our
+ *    own check passed it and we go on to fetch that exact literal path
+ *    (see the "%2f"/"%5c" check below, after normalization).
+ *
+ * Returns `null` (rather than throwing) if the pathname contains
+ * malformed percent-encoding (`decodeURIComponent` throws), still
+ * contains a literal (once-decoded) encoded separator per case 3 above,
+ * or - belt and suspenders, shouldn't be reachable given the scratch URL
+ * always has a valid base - if the result doesn't start with "/", so
+ * callers can fail closed with their own error type/message.
+ *
+ * Accepted residual limitation (deliberately not chased further): a
+ * *triple*-encoded separator ("%25252f") only unwraps to the literal text
+ * "%252f" after this function's one decode pass, which the check above
+ * doesn't recognize either. Closing that would require guessing how many
+ * *extra* decode passes a downstream consumer might apply, which is
+ * unbounded in principle (quadruple-encoding, etc). In practice this
+ * isn't exploitable against the threat this function defends against: a
+ * real HTTP server would itself need to decode the request path *twice*
+ * (beyond the one layer already unwrapped here) while routing/resolving
+ * it, which is far more unusual than the single extra decode pass the
+ * fixed double-encoding case above defends against. Independently
+ * confirmed by two of three Round 7/8 security-audit models
+ * (gemini-3.1-pro-preview, gpt-5.6-terra) as a non-exploitable, acceptable
+ * gap rather than a must-fix.
+ */
+export function decodeAndNormalizePathname(pathname: string): string | null {
+  let decoded: string;
+  try {
+    decoded = decodeURIComponent(pathname);
+  } catch {
+    return null;
+  }
+  const scratch = new URL('http://placeholder.invalid');
+  try {
+    scratch.pathname = decoded;
+  } catch {
+    return null;
+  }
+  const normalized = scratch.pathname;
+  if (normalized !== '/' && !normalized.startsWith('/')) return null;
+  // A literal "%2f"/"%5c" surviving this far is never a legitimate doc
+  // slug - it's a hidden, still-encoded path separator (see case 3 above).
+  // Fail closed rather than handing a same-looking-to-us-but-not-to-
+  // everyone value to `hasPathPrefix()`.
+  if (/%2f|%5c/i.test(normalized)) return null;
+  return normalized;
 }
 
 /**
@@ -46,7 +179,25 @@ export function isSitemapIndex(xml: string): boolean {
   return /<sitemapindex[\s>]/i.test(xml);
 }
 
-/** Filter URLs to those under a given path prefix on the same host as baseUrl. */
+/**
+ * Filter URLs to those under a given path prefix on the same host as
+ * baseUrl.
+ *
+ * Uses `decodeAndNormalizePathname()` (not the raw `.pathname`) for the
+ * prefix check, for the same reason `RemoteFumadocsSource.resolveRef()`
+ * does: a sitemap entry like
+ * "https://example.com/docs/%2e%2e%2fadmin/secrets" has a raw pathname
+ * of "/docs/%2e%2e%2fadmin/secrets" (starts with "/docs/", so the naive
+ * check would let it through) but decodes+normalizes to
+ * "/admin/secrets" (outside docsPrefix). Without this, `list_pages`
+ * would leak the existence of out-of-scope paths from a
+ * malicious/compromised sitemap - a narrower issue than being able to
+ * *fetch* such a path (which `resolveRef()` already independently
+ * blocks), but still an authorization-boundary leak via the listing
+ * itself. A pathname that fails to decode (malformed percent-encoding)
+ * is dropped rather than listed, matching `resolveRef()`'s fail-closed
+ * behavior.
+ */
 export function filterToDocs(
   urls: string[],
   baseUrl: string,
@@ -62,8 +213,10 @@ export function filterToDocs(
       continue;
     }
     if (parsed.host !== base.host) continue;
-    if (!hasPathPrefix(parsed.pathname, docsPrefix)) continue;
-    out.push({ url: u, path: parsed.pathname });
+    const normalizedPath = decodeAndNormalizePathname(parsed.pathname);
+    if (normalizedPath === null) continue;
+    if (!hasPathPrefix(normalizedPath, docsPrefix)) continue;
+    out.push({ url: u, path: normalizedPath });
   }
   return out;
 }

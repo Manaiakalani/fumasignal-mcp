@@ -217,6 +217,47 @@ describe('RemoteFumadocsSource', () => {
     expect(pages.length).toBeLessThan(subCount);
   });
 
+  it('bounds total accumulated URLs even when each shard is itself huge (cache-OOM regression)', async () => {
+    // Regression: MAX_SITEMAP_FETCHES only bounds the *number* of HTTP
+    // requests. Without an independent cap on the accumulated *URL
+    // count*, a malicious/compromised site could fan out to the
+    // fetch-count budget with each leaf sitemap packed with as many
+    // <loc> entries as fit under maxResponseBytes, producing a
+    // multi-hundred-MB to multi-GB in-memory list held indefinitely in
+    // listCache. Empirically confirmed pre-fix: 20 shards x 50k URLs
+    // (1M URLs) grew the heap by ~608MB, extrapolating to ~6GB at the
+    // real 200-fetch budget. Use a smaller but still generous
+    // per-shard count here so the test stays fast.
+    const subCount = 5;
+    const urlsPerShard = 80_000;
+    const routes: Record<string, { body: string; contentType?: string }> = {
+      'https://example.com/sitemap.xml': {
+        body: `<?xml version="1.0"?>\n<sitemapindex>\n${Array.from(
+          { length: subCount },
+          (_, i) => `  <loc>https://example.com/sitemap-${i}.xml</loc>`,
+        ).join('\n')}\n</sitemapindex>`,
+        contentType: 'application/xml',
+      },
+    };
+    for (let i = 0; i < subCount; i++) {
+      const urls = Array.from(
+        { length: urlsPerShard },
+        (_, j) => `<url><loc>https://example.com/docs/s${i}-p${j}</loc></url>`,
+      ).join('\n');
+      routes[`https://example.com/sitemap-${i}.xml`] = {
+        body: `<?xml version="1.0"?>\n<urlset>\n${urls}\n</urlset>`,
+        contentType: 'application/xml',
+      };
+    }
+    const src = new RemoteFumadocsSource({ baseUrl, fetchImpl: makeFetch(routes) });
+    const pages = await src.listPages();
+    // subCount * urlsPerShard = 400,000 - well beyond MAX_SITEMAP_URLS
+    // (200,000), so the cap must have kicked in rather than returning
+    // everything.
+    expect(pages.length).toBeLessThanOrEqual(200_000);
+    expect(pages.length).toBeLessThan(subCount * urlsPerShard);
+  });
+
   it('evicts least-recently-used pages from pageCache once maxPageCacheBytes is exceeded', async () => {
     // Regression: without a byte budget, up to 500 (default maxEntries)
     // cached pages could each hold up to maxResponseBytes of markdown,
@@ -282,13 +323,23 @@ describe('RemoteFumadocsSource', () => {
   });
 
   it('does not crash when a page has circular-reference frontmatter (YAML anchors/aliases)', async () => {
-    // Regression: pageContentSize() computes metadata size via
-    // JSON.stringify(page.meta).length. YAML anchors/aliases (gray-matter's
-    // underlying js-yaml engine) can produce a genuinely self-referential
-    // object (`a: &x\n  b: *x` parses to `a.b === a`), which
-    // JSON.stringify() throws on ("Converting circular structure to
-    // JSON"). Must fall back to a conservative size estimate instead of
-    // crashing getPage()/the cache on attacker-controlled frontmatter.
+    // Regression (superseded by a more thorough fix - see below): this
+    // originally tested that pageContentSize()'s try/catch around
+    // JSON.stringify(page.meta) kept the cache-accounting path alive
+    // when frontmatter contained a genuine self-reference, while leaving
+    // the circular structure itself intact on page.meta. That approach
+    // only protected pageContentSize() - the get_page/get_meta tool
+    // handlers each call JSON.stringify(page.meta / meta) directly too,
+    // and would independently throw (surfacing as a tool error, not a
+    // crash, but still a failure) on the same input; separately, a YAML
+    // anchor/alias *DAG* (no true cycle, just heavy reference reuse -
+    // "billion laughs") doesn't throw at all and instead amplifies to a
+    // huge string. `parseFrontmatter()` now sanitizes at the source
+    // (see frontmatter.test.ts for that coverage in detail), replacing
+    // both true cycles and oversized DAGs with a small placeholder
+    // before `page.meta` is ever populated - so a genuine self-reference
+    // no longer survives into `page.meta` at all, and every consumer
+    // (not just pageContentSize()) is protected uniformly.
     const src = new RemoteFumadocsSource({
       baseUrl,
       fetchImpl: makeFetch({
@@ -300,9 +351,10 @@ describe('RemoteFumadocsSource', () => {
     });
     const page = await src.getPage('/docs/circular');
     expect(page.title).toBe('Circular');
-    // Confirms the frontmatter is genuinely circular (not silently
-    // stripped by some other code path) and getPage() still succeeded.
-    expect((page.meta.a as Record<string, unknown>).b).toBe(page.meta.a);
+    // The cycle is neutralized to a placeholder rather than preserved -
+    // safe to JSON.stringify anywhere page.meta is consumed.
+    expect((page.meta.a as Record<string, unknown>).b).toBe('[circular reference]');
+    expect(() => JSON.stringify(page.meta)).not.toThrow();
   });
 
   it('parses Orama-style search responses', async () => {
@@ -508,6 +560,26 @@ describe('RemoteFumadocsSource', () => {
       }),
     });
     await expect(src.getPage('/docs/%2e%2e%2fapi/private')).rejects.toThrow(/docs prefix/i);
+  });
+
+  it('rejects a ref hiding a double-encoded separator ("%252f")', async () => {
+    // Regression (CWE-22): decodeURIComponent only unwraps one encoding
+    // layer, so "%252f" (which is "%2f" with its own "%" encoded) decodes
+    // to the literal text "%2f" - which the WHATWG URL parser leaves
+    // alone while parsing (it never decodes "%2f" into a real "/"). That
+    // makes "/docs/..%252fapi/private" normalize to one harmless-looking
+    // segment and pass hasPathPrefix(), yet the exact literal pathname
+    // "/docs/..%2fapi/private" is what actually gets fetched - and many
+    // real HTTP servers decode "%2f" while resolving *their* request
+    // path, which would resolve outside "/docs".
+    const src = new RemoteFumadocsSource({
+      baseUrl,
+      authHeader: '******',
+      fetchImpl: makeFetch({
+        'https://example.com/api/private': { body: 'top secret', contentType: 'text/plain' },
+      }),
+    });
+    await expect(src.getPage('/docs/..%252fapi/private')).rejects.toThrow(/unresolvable path/i);
   });
 
   it('rejects a ref with malformed percent-encoding instead of treating it as a literal path', async () => {
