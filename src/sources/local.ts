@@ -333,8 +333,17 @@ function matchesTag(metaTag: unknown, wanted: string): boolean {
 }
 
 function firstHeading(body: string): string | undefined {
-  const m = /^#\s+(.+?)\s*$/m.exec(body);
-  return m ? m[1] : undefined;
+  // See extractTitle() in src/sources/remote.ts / the comment on
+  // HEADING_PREFIX_RE in src/lib/markdown.ts: the old
+  // `/^#\s+(.+?)\s*$/m` pattern is a catastrophic-backtracking ReDoS.
+  // This per-line greedy-to-end-anchor version is linear instead.
+  for (const line of body.split(/\r?\n/)) {
+    const m = /^#\s+(.*)$/.exec(line);
+    if (!m) continue;
+    const title = m[1]!.trim();
+    if (title) return title;
+  }
+  return undefined;
 }
 
 function countOccurrences(haystack: string, needle: string): number {

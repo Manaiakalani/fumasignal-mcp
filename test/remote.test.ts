@@ -451,6 +451,28 @@ describe('RemoteFumadocsSource', () => {
     expect(page.description).toBeUndefined();
   });
 
+  it('does not hang extracting a title from a large adversarial heading line (ReDoS regression)', async () => {
+    // Regression: extractTitle() used `/^#\s+(.+?)\s*$/m`, a lazy group
+    // immediately before `\s*$` - the same catastrophic-backtracking shape
+    // as HEADING_RE in src/lib/markdown.ts. A line with no valid trailing
+    // match forced the engine to exhaust every split point (empirically
+    // 200KB took ~27s under the old regex).
+    const adversarial = '# a' + ' '.repeat(200 * 1024) + '!';
+    const src = new RemoteFumadocsSource({
+      baseUrl,
+      fetchImpl: makeFetch({
+        'https://example.com/docs/adversarial.md': {
+          body: `${adversarial}\n\nbody text`,
+          contentType: 'text/markdown',
+        },
+      }),
+    });
+    const start = Date.now();
+    const page = await src.getPage('/docs/adversarial');
+    expect(Date.now() - start).toBeLessThan(1000);
+    expect(page.title.endsWith('!')).toBe(true);
+  });
+
   it('falls back to HTML scrape when markdown is unavailable', async () => {
     const html = `<!doctype html><html><head><title>Hello</title>
 <meta name="description" content="hi"></head>
@@ -913,6 +935,39 @@ describe('RemoteFumadocsSource', () => {
       }),
     });
     expect(await src.getLlmsTxt()).toBe('small body');
+  });
+
+  it('bounds concurrent fetches across distinct getPage() refs (maxConcurrentFetches)', async () => {
+    // Regression: Coalescer only de-dupes identical keys, so N concurrent
+    // getPage() calls for N *distinct* pages each independently started a
+    // fetch chain with nothing bounding the aggregate. fetchSemaphore caps
+    // how many of those can be in flight at once, queueing the rest.
+    let active = 0;
+    let maxActive = 0;
+    const fetchImpl = async (input: RequestInfo | URL): Promise<Response> => {
+      const url = (typeof input === 'string' ? input : input.toString()).split('?')[0]!;
+      active++;
+      maxActive = Math.max(maxActive, active);
+      await new Promise((r) => setTimeout(r, 20));
+      active--;
+      const slug = url.split('/').pop()!.replace(/\.md$/, '');
+      if (url.endsWith('.md')) {
+        return new Response(`# Page ${slug}\n\nbody`, {
+          status: 200,
+          headers: { 'content-type': 'text/markdown' },
+        });
+      }
+      return new Response('not found', { status: 404 });
+    };
+    const src = new RemoteFumadocsSource({
+      baseUrl,
+      maxConcurrentFetches: 2,
+      fetchImpl,
+    });
+    const refs = ['/docs/a', '/docs/b', '/docs/c', '/docs/d', '/docs/e', '/docs/f'];
+    const pages = await Promise.all(refs.map((ref) => src.getPage(ref)));
+    expect(maxActive).toBeLessThanOrEqual(2);
+    expect(pages.map((p) => p.title).sort()).toEqual(['Page a', 'Page b', 'Page c', 'Page d', 'Page e', 'Page f']);
   });
 
   it('does not eval() a remote page frontmatter tagged with a javascript engine, and falls back to HTML scraping', async () => {

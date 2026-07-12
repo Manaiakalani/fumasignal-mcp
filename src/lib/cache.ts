@@ -1,4 +1,9 @@
-/** Trivial in-memory TTL cache with a soft entry-count cap and an optional total-size budget. */
+/**
+ * In-memory caching/concurrency helpers: a TTL cache with a soft
+ * entry-count cap and optional total-size budget, plus two small
+ * concurrency primitives (`Coalescer`, `Semaphore`) used to bound how much
+ * outstanding fetch work a source can have in flight at once.
+ */
 
 /**
  * De-duplicates concurrent async work by key: while a `run()` call for a
@@ -24,6 +29,65 @@ export class Coalescer<K, V> {
     });
     this.pending.set(key, promise);
     return promise;
+  }
+}
+
+/**
+ * Bounds how many `run()` callbacks can be executing at once; calls beyond
+ * that limit queue (FIFO) until a slot frees up. Complements `Coalescer`,
+ * which only de-dupes *identical* keys - it does nothing for N concurrent
+ * requests that all have *distinct* keys (e.g. `getPage()` called in
+ * parallel for many different pages, or `search()` with many different
+ * queries), so each of those still starts its own independent fetch. Since
+ * an individual response can buffer up to `maxResponseBytes`, unbounded
+ * concurrent distinct fetches means aggregate buffered memory scales with
+ * however many distinct requests a caller decides to issue at once, with
+ * nothing in this file capping it. A semaphore bounds that directly,
+ * regardless of how many distinct keys are involved.
+ */
+export class Semaphore {
+  private available: number;
+  private queue: Array<() => void> = [];
+
+  constructor(maxConcurrent: number) {
+    if (!Number.isInteger(maxConcurrent) || maxConcurrent < 1) {
+      throw new RangeError(
+        `Semaphore: maxConcurrent must be a positive integer, got ${maxConcurrent}`,
+      );
+    }
+    this.available = maxConcurrent;
+  }
+
+  async run<T>(fn: () => Promise<T>): Promise<T> {
+    await this.acquire();
+    try {
+      return await fn();
+    } finally {
+      this.release();
+    }
+  }
+
+  private acquire(): Promise<void> {
+    if (this.available > 0) {
+      this.available--;
+      return Promise.resolve();
+    }
+    return new Promise((resolve) => {
+      this.queue.push(() => {
+        this.available--;
+        resolve();
+      });
+    });
+  }
+
+  private release(): void {
+    this.available++;
+    // Hand the freed slot straight to the next waiter (if any) rather than
+    // just incrementing the counter and letting them re-check it - avoids a
+    // starvation/fairness gap where a brand-new `acquire()` call racing a
+    // long-queued waiter could grab the slot first.
+    const next = this.queue.shift();
+    if (next) next();
   }
 }
 

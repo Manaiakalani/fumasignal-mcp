@@ -38,6 +38,29 @@ describe('extractToc', () => {
     const md = '# Real\n\n```\n# Not a heading\n```\n\n## Also Real';
     expect(extractToc(md).map((t) => t.title)).toEqual(['Real', 'Also Real']);
   });
+
+  it('strips an optional closing "#" sequence and surrounding whitespace', () => {
+    const md = '## Setup ##\n\n### Trailing Space  \n\n#### Mixed ## \t ';
+    expect(extractToc(md).map((t) => t.title)).toEqual([
+      'Setup',
+      'Trailing Space',
+      'Mixed',
+    ]);
+  });
+
+  it('does not hang on a large adversarial heading line (ReDoS regression)', () => {
+    // Regression: the old HEADING_RE (`/^(#{1,6})\s+(.+?)\s*#*\s*$/`) put a
+    // lazy group directly before three quantifiers that can all match the
+    // same trailing characters, so a line with no valid closing sequence
+    // forced catastrophic backtracking - empirically ~36s for a 5KB line,
+    // >120s for 10KB. A large adversarial line must resolve near-instantly.
+    const adversarial = '# a' + ' '.repeat(200 * 1024) + '!';
+    const start = Date.now();
+    const toc = extractToc(adversarial);
+    expect(Date.now() - start).toBeLessThan(1000);
+    expect(toc).toHaveLength(1);
+    expect(toc[0]!.title.endsWith('!')).toBe(true);
+  });
 });
 
 describe('extractSection', () => {

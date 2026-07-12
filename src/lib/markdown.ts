@@ -18,8 +18,40 @@ export function slugify(text: string): string {
     .replace(ANCHOR_WHITESPACE, '-');
 }
 
-const HEADING_RE = /^(#{1,6})\s+(.+?)\s*#*\s*$/;
+// Only the marker+required-whitespace prefix is matched by regex; the
+// optional ATX closing sequence ("## Title ##") is stripped afterward
+// with plain string operations instead of folding it into one pattern.
+// The previous version, `/^(#{1,6})\s+(.+?)\s*#*\s*$/`, put a lazy
+// group immediately before *three* quantifiers that can all match the
+// same whitespace/"#" characters it can - the same catastrophic-
+// backtracking shape documented (and fixed) for `LOC_RE` in
+// src/lib/sitemap.ts. Empirically confirmed here too: a single 5KB
+// line of "# a" + padding spaces + "!" (no valid closing sequence, so
+// the engine must exhaust every way to split the ambiguous region
+// before failing) took ~36s to reject; 10KB exceeded 120s. See
+// `stripAtxClosingSequence` below for the replacement.
+const HEADING_PREFIX_RE = /^(#{1,6})\s+/;
 const FENCE_RE = /^```/;
+
+/**
+ * Strip an optional ATX heading closing sequence - trailing whitespace,
+ * then trailing "#"s, then more trailing whitespace (e.g. "Title ##" ->
+ * "Title") - matching what `(.+?)\s*#*\s*$` used to capture. Uses
+ * `trimEnd()` and a plain character scan instead of regex `.replace()`:
+ * an *unanchored* `/\s+$/` or `/#+$/` still retries at every position
+ * within a long run before giving up if the string doesn't actually end
+ * in that character (exactly the input this function receives when the
+ * ReDoS attack has no valid closing sequence), reproducing the same
+ * quadratic blowup this function exists to avoid. `trimEnd()` and a
+ * `while` loop bounded by the string's own length can't backtrack, so
+ * both stay linear no matter what `text` contains.
+ */
+function stripAtxClosingSequence(text: string): string {
+  const trimmed = text.trimEnd();
+  let end = trimmed.length;
+  while (end > 0 && trimmed.charCodeAt(end - 1) === 0x23 /* '#' */) end--;
+  return trimmed.slice(0, end).trimEnd();
+}
 
 interface Heading {
   depth: number;
@@ -51,10 +83,11 @@ function collectHeadings(markdown: string): { lines: string[]; headings: Heading
       continue;
     }
     if (inFence) continue;
-    const m = HEADING_RE.exec(line);
+    const m = HEADING_PREFIX_RE.exec(line);
     if (!m) continue;
     const depth = m[1]!.length;
-    const title = m[2]!.trim();
+    const title = stripAtxClosingSequence(line.slice(m[0].length)).trim();
+    if (!title) continue;
     const base = slugify(title);
     if (!base) continue;
     let suffix = nextSuffix.get(base) ?? 0;
