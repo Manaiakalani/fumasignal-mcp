@@ -1,5 +1,60 @@
 import { describe, expect, it } from 'vitest';
-import { redactUrlForLogging } from '../src/lib/logger.js';
+import { errSerializer, redactUrlForLogging } from '../src/lib/logger.js';
+
+describe('errSerializer', () => {
+  it('truncates an Error whose message is huge, instead of writing it in full to the log line', () => {
+    // Regression: errorResult() in server.ts logs a tool's error message
+    // via `logger.warn({ err: message }, ...)` *before*
+    // capToolResultChars() ever truncates it for the returned response -
+    // and the message can be attacker/site-controlled and unbounded (e.g.
+    // a remote docs site's fetch/parse error). Empirically, a single
+    // ~500,000-character log line measured minutes of wall-clock time to
+    // fully write out in one CI environment (pino's stderr destination
+    // defaults to a synchronous write), even though the surrounding test
+    // logic itself took only seconds - so this is a real, demonstrated
+    // resource-exhaustion vector, not just a hypothetical one.
+    const huge = new Error('z'.repeat(500_000));
+    const serialized = errSerializer(huge) as { type: string; message: string; stack?: string };
+    expect(serialized.type).toBe('Error');
+    expect(serialized.message.length).toBeLessThan(2_100);
+    expect(serialized.message).toContain('truncated for log');
+  });
+
+  it('truncates a huge stack trace the same way as the message', () => {
+    const err = new Error('boom');
+    err.stack = `Error: boom\n${'    at fakeFrame\n'.repeat(50_000)}`;
+    const serialized = errSerializer(err) as { stack?: string };
+    expect(serialized.stack).toBeDefined();
+    expect(serialized.stack!.length).toBeLessThan(2_100);
+  });
+
+  it('truncates a huge plain string logged directly under the `err` key', () => {
+    // errorResult() passes a plain string (not an Error instance) under
+    // `err` - pino's own default serializer only special-cases
+    // `instanceof Error` and otherwise passes non-Error values through
+    // completely unchanged, so this path needs its own truncation.
+    const serialized = errSerializer('Source error: ' + 'z'.repeat(500_000));
+    expect(typeof serialized).toBe('string');
+    expect((serialized as string).length).toBeLessThan(2_100);
+  });
+
+  it('leaves an ordinary, reasonably sized Error unchanged in shape and content', () => {
+    const err = new Error('not found');
+    const serialized = errSerializer(err) as { type: string; message: string; stack?: string };
+    expect(serialized.type).toBe('Error');
+    expect(serialized.message).toBe('not found');
+    expect(serialized.stack).toContain('not found');
+  });
+
+  it('leaves an ordinary, reasonably sized plain string unchanged', () => {
+    expect(errSerializer('a short error string')).toBe('a short error string');
+  });
+
+  it('passes through a non-Error, non-string value unchanged (defensive fallback)', () => {
+    const value = { custom: 'shape' };
+    expect(errSerializer(value)).toBe(value);
+  });
+});
 
 describe('redactUrlForLogging', () => {
   it('masks a username+password pair embedded in a URL', () => {
