@@ -402,6 +402,46 @@ describe('RemoteFumadocsSource', () => {
     expect(pages.length).toBe(2);
   });
 
+  it('does not throw/silently drop a leaf sitemap reached through a sitemap index once its URL count passes ~125k (spread-push RangeError regression)', async () => {
+    // Regression: the sitemap-index branch of fetchSitemapUrls() used
+    // `pages.push(...(await this.fetchSitemapUrls(subUrl, depth + 1, state)))`.
+    // Spreading a large array as call arguments hits a JS engine
+    // argument-count ceiling - empirically confirmed (on this runtime) to
+    // throw `RangeError: Maximum call stack size exceeded` somewhere
+    // between 100,000 and 125,000 elements, well within MAX_SITEMAP_URLS's
+    // own 200,000-URL budget. Before the fix, that RangeError was caught
+    // by the surrounding try/catch and logged as "failed to fetch,
+    // skipping" - silently dropping an entire large-but-legitimate leaf
+    // sitemap's pages for a reason unrelated to any configured budget.
+    // 150,000 URLs comfortably exceeds the failure threshold while
+    // staying under MAX_SITEMAP_URLS, so this only passes if the fix
+    // (a plain loop instead of a spread-push) is in place.
+    const urlCount = 150_000;
+    const urls = Array.from(
+      { length: urlCount },
+      (_, i) => `<url><loc>https://example.com/docs/p${i}</loc></url>`,
+    ).join('\n');
+    const routes: Record<string, { body: string; contentType?: string }> = {
+      'https://example.com/sitemap.xml': {
+        body: `<?xml version="1.0"?>\n<sitemapindex>\n  <loc>https://example.com/sitemap-big.xml</loc>\n</sitemapindex>`,
+        contentType: 'application/xml',
+      },
+      'https://example.com/sitemap-big.xml': {
+        body: `<?xml version="1.0"?>\n<urlset>\n${urls}\n</urlset>`,
+        contentType: 'application/xml',
+      },
+    };
+    const src = new RemoteFumadocsSource({
+      baseUrl,
+      maxResponseBytes: 12_000_000, // must fit the ~8MB leaf sitemap document itself
+      fetchImpl: makeFetch(routes),
+    });
+    const pages = await src.listPages();
+    // Must succeed with the full page list, not silently drop it via a
+    // caught RangeError.
+    expect(pages.length).toBe(urlCount);
+  });
+
   it('evicts least-recently-used pages from pageCache once maxPageCacheBytes is exceeded', async () => {
     // Regression: without a byte budget, up to 500 (default maxEntries)
     // cached pages could each hold up to maxResponseBytes of markdown,

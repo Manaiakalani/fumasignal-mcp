@@ -1,5 +1,5 @@
 import { Command, InvalidArgumentError, Option } from 'commander';
-import { logger } from './lib/logger.js';
+import { logger, redactUrlForLogging } from './lib/logger.js';
 import { LocalFumadocsSource } from './sources/local.js';
 import { RemoteFumadocsSource } from './sources/remote.js';
 import type { FumadocsSource } from './sources/types.js';
@@ -114,7 +114,7 @@ export function parseOptions(argv: string[]): ParsedOptions {
 
 export function buildSource(opts: ParsedOptions): FumadocsSource {
   if (opts.url) {
-    logger.info({ url: opts.url }, 'fumasignal-mcp: starting in remote mode');
+    logger.info({ url: redactUrlForLogging(opts.url) }, 'fumasignal-mcp: starting in remote mode');
     return new RemoteFumadocsSource({
       baseUrl: opts.url,
       searchPath: opts.searchPath,

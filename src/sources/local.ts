@@ -35,6 +35,39 @@ export interface LocalSourceOptions {
    * Default 10MB (matches the remote source's `maxResponseBytes` default).
    */
   maxFileBytes?: number;
+  /**
+   * Hard cap on the combined size (bytes) of every `.md`/`.mdx` file's
+   * content actually read into the index across the whole `buildIndex()`
+   * walk. `maxFileBytes` alone is not sufficient: it only bounds a single
+   * file, so an untrusted cloned docs repo (see `maxFileBytes`'s doc
+   * comment) containing many files each just under that per-file cap can
+   * still, in aggregate, retain far more than any one file would - every
+   * indexed page's body/toc/meta lives for the process's lifetime with no
+   * TTL/eviction, unlike the remote source's byte-bounded `pageCache`
+   * (which enforces an aggregate cap independently of any single response's
+   * size - see `maxPageCacheBytes` in remote.ts). Once the running total
+   * would exceed this budget, indexing stops (files already indexed remain
+   * served; the rest of the walk is abandoned, logged once as a warning)
+   * rather than continuing to stat/read further files against an
+   * already-exhausted budget. Default 200MB - generous headroom for any
+   * real docs tree, not a functional restriction.
+   */
+  maxTotalBytes?: number;
+  /**
+   * Hard cap on the number of `.md`/`.mdx` files indexed across the whole
+   * `buildIndex()` walk. `maxTotalBytes` alone is not sufficient: a
+   * directory containing an extremely large number of tiny files (each far
+   * under `maxFileBytes`, and collectively far under `maxTotalBytes`)
+   * still costs a `Map` entry plus a `toc`/`meta` object per file, and that
+   * per-page bookkeeping overhead dominates at a large enough file count
+   * regardless of how small each file's content is. Bounding the count
+   * here, the same way `MAX_SITEMAP_URLS` bounds sitemap URL count
+   * independently of `MAX_SITEMAP_URL_BYTES` (see remote.ts - one budget
+   * alone leaves exactly this kind of gap for the shape it doesn't cover),
+   * closes that gap. Default 50,000 - generous headroom for any real docs
+   * tree, not a functional restriction.
+   */
+  maxFileCount?: number;
 }
 
 interface IndexedPage {
@@ -67,6 +100,8 @@ export class LocalFumadocsSource implements FumadocsSource {
   private contentDirIsRelative: boolean;
   private urlPrefix: string;
   private maxFileBytes: number;
+  private maxTotalBytes: number;
+  private maxFileCount: number;
   private indexPromise: Promise<Map<string, IndexedPage>> | null = null;
 
   constructor(opts: LocalSourceOptions) {
@@ -76,6 +111,8 @@ export class LocalFumadocsSource implements FumadocsSource {
     this.contentDir = this.contentDirIsRelative ? path.join(this.rootDir, cd) : cd;
     this.urlPrefix = (opts.urlPrefix ?? '/docs').replace(/\/+$/, '');
     this.maxFileBytes = opts.maxFileBytes ?? 10_000_000;
+    this.maxTotalBytes = opts.maxTotalBytes ?? 200_000_000;
+    this.maxFileCount = opts.maxFileCount ?? 50_000;
     this.label = `local:${this.rootDir}`;
   }
 
@@ -114,9 +151,25 @@ export class LocalFumadocsSource implements FumadocsSource {
       // content-directory boundary instead of a fixed filename.
       await this.assertRealpathWithinRoot(this.contentDir);
     }
+    // walk() already filters to .md/.mdx during traversal (see its doc
+    // comment), so every entry here is a content file - no extension
+    // re-check needed.
     const files = await walk(this.contentDir);
+    let totalBytes = 0;
+    let indexedCount = 0;
     for (const file of files) {
-      if (!/\.mdx?$/i.test(file)) continue;
+      // Enforce maxFileCount *before* doing any work for this file - once
+      // reached, every remaining file would just be skipped anyway (see
+      // maxFileCount's doc comment), so stop the walk outright instead of
+      // stat-ing the rest of a possibly huge remaining file list for
+      // nothing.
+      if (indexedCount >= this.maxFileCount) {
+        logger.warn(
+          { dir: this.contentDir, maxFileCount: this.maxFileCount },
+          'local: stopping index build - maxFileCount reached; remaining files will not be indexed',
+        );
+        break;
+      }
       const rel = path.relative(this.contentDir, file).replace(/\\/g, '/');
       let slug = rel.replace(/\.mdx?$/i, '');
       if (slug === 'index') slug = '';
@@ -140,8 +193,22 @@ export class LocalFumadocsSource implements FumadocsSource {
           );
           continue;
         }
+        // Aggregate check, independent of the per-file cap above: many
+        // files each under maxFileBytes can still sum to far more than any
+        // one file would (see maxTotalBytes's doc comment). Checked before
+        // reading, the same "test before you commit to the cost" shape as
+        // the per-file check, so a huge remaining file list stops the walk
+        // rather than being read only to be retained anyway.
+        if (totalBytes + fileStat.size > this.maxTotalBytes) {
+          logger.warn(
+            { dir: this.contentDir, totalBytes, maxTotalBytes: this.maxTotalBytes },
+            'local: stopping index build - maxTotalBytes budget exhausted; remaining files will not be indexed',
+          );
+          break;
+        }
         raw = await fs.readFile(file, 'utf8');
         ({ content: body, data: meta } = parseFrontmatter(raw));
+        totalBytes += fileStat.size;
       } catch (err) {
         logger.warn({ err, file }, 'local: skipping page that failed to read/parse');
         continue;
@@ -170,6 +237,7 @@ export class LocalFumadocsSource implements FumadocsSource {
         ...(description ? { description } : {}),
         toc,
       });
+      indexedCount++;
     }
     logger.debug({ count: map.size, dir: this.contentDir }, 'local: built page index');
     return map;
@@ -343,6 +411,15 @@ export class LocalFumadocsSource implements FumadocsSource {
   }
 }
 
+/**
+ * Recursively collect every `.md`/`.mdx` file under `dir`. Filtering to the
+ * two content extensions *here*, during traversal, rather than after
+ * `walk()` returns - matters when `dir` holds many non-content files
+ * (images, generated assets, etc. are common in a docs repo): without it,
+ * the returned array (and the recursive `push(...)` calls that build it -
+ * see below) would momentarily hold every file path in the tree, not just
+ * the ones `buildIndex()` will ever read.
+ */
 async function walk(dir: string): Promise<string[]> {
   const out: string[] = [];
   const entries = await fs.readdir(dir, { withFileTypes: true });
@@ -354,8 +431,15 @@ async function walk(dir: string): Promise<string[]> {
     // rather than traversed/read - this prevents a symlink planted inside
     // contentDir (e.g. from an untrusted cloned docs repo) from escaping it.
     if (entry.isDirectory()) {
-      out.push(...(await walk(full)));
-    } else if (entry.isFile()) {
+      // Not `out.push(...(await walk(full)))`: spreading a large array as
+      // call arguments hits a JS engine argument-count ceiling - empirically
+      // confirmed to throw `RangeError: Maximum call stack size exceeded`
+      // on Node for arrays of roughly 125,000+ elements (varies by engine
+      // build/version, but is well within reach of a docs tree with a
+      // large number of content files, deliberately structured to attack
+      // this or not). A plain loop has no such limit.
+      for (const child of await walk(full)) out.push(child);
+    } else if (entry.isFile() && /\.mdx?$/i.test(entry.name)) {
       out.push(full);
     }
   }

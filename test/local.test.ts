@@ -318,4 +318,72 @@ describe('LocalFumadocsSource security fixes', () => {
       await rm(dir, { recursive: true, force: true });
     }
   });
+
+  it('stops indexing once the aggregate maxTotalBytes budget is exhausted, even though every file is under maxFileBytes', async () => {
+    // Regression: buildIndex() only ever capped a single file's size
+    // (maxFileBytes). An untrusted cloned docs repo with many files each
+    // just under that per-file cap can still, in aggregate, retain far
+    // more in memory than any one file would - every indexed page's
+    // body/toc/meta lives for the process's lifetime with no eviction.
+    // maxTotalBytes closes that gap. Three 100-byte files against a
+    // 150-byte aggregate budget: exactly one must fit regardless of which
+    // file the walk happens to process first (100 fits; a second 100
+    // always overshoots 150 no matter which two of the three are tried).
+    const dir = await mkdtemp(path.join(os.tmpdir(), 'fumasignal-local-maxtotal-'));
+    try {
+      const docs = path.join(dir, 'content', 'docs');
+      await mkdir(docs, { recursive: true });
+      for (const name of ['a', 'b', 'c']) {
+        await writeFile(path.join(docs, `${name}.md`), 'x'.repeat(100));
+      }
+      const src = new LocalFumadocsSource({ rootDir: dir, maxTotalBytes: 150 });
+      const pages = await src.listPages();
+      expect(pages.length).toBe(1);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('does not let maxTotalBytes affect a docs tree that fits comfortably under the default budget', async () => {
+    // Sanity check that the new aggregate cap doesn't affect ordinary,
+    // reasonably sized content using the default (no maxTotalBytes passed).
+    const dir = await mkdtemp(path.join(os.tmpdir(), 'fumasignal-local-maxtotal-default-'));
+    try {
+      const docs = path.join(dir, 'content', 'docs');
+      await mkdir(docs, { recursive: true });
+      for (const name of ['a', 'b', 'c']) {
+        await writeFile(path.join(docs, `${name}.md`), `# ${name}\n\nordinary sized page`);
+      }
+      const src = new LocalFumadocsSource({ rootDir: dir });
+      const pages = await src.listPages();
+      expect(pages.length).toBe(3);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('stops indexing once maxFileCount is reached, even though the aggregate byte budget has room to spare', async () => {
+    // Regression: maxTotalBytes alone doesn't bound the *number* of
+    // indexed pages - a directory with an extremely large number of tiny
+    // files (each far under maxFileBytes, and collectively far under
+    // maxTotalBytes) still costs a Map entry plus a toc/meta object per
+    // file. maxFileCount bounds that independently, the same way
+    // MAX_SITEMAP_URLS bounds sitemap URL count independently of
+    // MAX_SITEMAP_URL_BYTES in remote.ts. Five tiny files against a
+    // maxFileCount of 3 must index exactly 3, regardless of which three
+    // the walk happens to reach first.
+    const dir = await mkdtemp(path.join(os.tmpdir(), 'fumasignal-local-maxcount-'));
+    try {
+      const docs = path.join(dir, 'content', 'docs');
+      await mkdir(docs, { recursive: true });
+      for (let i = 0; i < 5; i++) {
+        await writeFile(path.join(docs, `p${i}.md`), `# Page ${i}`);
+      }
+      const src = new LocalFumadocsSource({ rootDir: dir, maxFileCount: 3 });
+      const pages = await src.listPages();
+      expect(pages.length).toBe(3);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
 });
