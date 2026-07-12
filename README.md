@@ -130,9 +130,13 @@ or a slug under the docs prefix.
 ## CLI flags
 
 ```text
--u, --url <url>           Base URL of a deployed Fumadocs site
+-u, --url <url>           Origin of a deployed Fumadocs site (scheme + host
+                          only, e.g. "https://acme.com" - no path; use
+                          --docs-prefix for sites that mount docs under a
+                          subpath)
 -l, --local <path>        Path to a local Fumadocs project root
-    --search-path <path>  Search API path (default: /api/search)
+    --search-path <path>  Search API path, resolved from the site's origin
+                          root regardless of --docs-prefix (default: /api/search)
     --docs-prefix <path>  URL prefix for doc pages (default: /docs)
     --content-dir <path>  Local content/docs directory (default: content/docs)
     --auth-header <val>   Authorization header (e.g. "Bearer xxx")
@@ -206,7 +210,9 @@ The site may not expose `/sitemap.xml`. You can still use `search_docs` and
 
 **"Search request failed: 404"**
 Pass `--search-path` if the site uses a non-default path
-(e.g. `--search-path /api/v2/search`).
+(e.g. `--search-path /api/v2/search`). Also check that `--url` is the
+site's origin only (no path) — `/sitemap.xml` and `--search-path` are
+always resolved from the origin root, not from a path in `--url`.
 
 **HTML scrape returns junk**
 Some Fumadocs sites already expose markdown via `<url>.md` — that's the

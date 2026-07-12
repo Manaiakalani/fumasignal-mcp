@@ -231,7 +231,15 @@ export class LocalFumadocsSource implements FumadocsSource {
       let slug = rel.replace(/\.mdx?$/i, '');
       if (slug === 'index') slug = '';
       else if (slug.endsWith('/index')) slug = slug.slice(0, -'/index'.length);
-      const url = slug ? `${this.urlPrefix}/${slug}` : this.urlPrefix;
+      // `|| '/'` (not bare `this.urlPrefix`): when --docs-prefix is "/"
+      // (a root-mounted docs site), urlPrefix normalizes to "" (all
+      // trailing slashes stripped - see its assignment above), so the
+      // *root* index page (empty slug) would otherwise get url === "" -
+      // not a valid path, and likely unusable as a `ref` back into
+      // get_page/get_toc/get_section (MCP tool schemas require a
+      // non-empty `ref` string). Slugged pages are unaffected: "" + "/"
+      // + slug already produces the correct "/slug" either way.
+      const url = slug ? `${this.urlPrefix}/${slug}` : this.urlPrefix || '/';
       let raw: string;
       let body: string;
       let meta: Record<string, unknown>;
@@ -325,7 +333,10 @@ export class LocalFumadocsSource implements FumadocsSource {
     }
     if (!r.startsWith('/')) r = `${this.urlPrefix}/${r}`;
     r = r.replace(/\/+$/, '');
-    if (r === '') r = this.urlPrefix;
+    // Mirror the `|| '/'` fallback in buildIndex()'s own `url` computation
+    // above: with --docs-prefix "/", the root page is stored under the
+    // key "/", not "" - this keeps the lookup key in sync with it.
+    if (r === '') r = this.urlPrefix || '/';
     // `idx` is keyed by literal (unencoded) filesystem-derived paths - see
     // buildIndex(): a file "API Reference.mdx" is keyed as
     // "/docs/API Reference" with a real space, never "%20". `.pathname` on
@@ -377,7 +388,7 @@ export class LocalFumadocsSource implements FumadocsSource {
             url: page.url,
             title: page.title,
             ...(page.description ? { description: page.description } : {}),
-            excerpt: snippet(page.body, tokens[0] ?? ''),
+            excerpt: snippet(page.body, tokens),
             score,
             ...(typeof page.meta.tag === 'string' ? { tag: page.meta.tag } : {}),
           },
@@ -646,14 +657,29 @@ function escapeRegExp(s: string): string {
  * interpreted as regex syntax; escaping makes every character literal,
  * so this can't reintroduce a ReDoS shape (no quantifiers/alternation are
  * ever present in the compiled pattern).
+ *
+ * Accepts every query token, not just the first: a page can match a
+ * multi-token query because its *title* or `toc` contains a later
+ * token while its body only contains an earlier one, or none at all
+ * (see search()'s own scoring, which checks title/description/toc
+ * independently of body). Trying only `needles[0]` against `body` in
+ * that case never matches, silently falling back to an arbitrary
+ * `body.slice(0, 200)` excerpt with no relevance to why the page
+ * matched. Joining every token into one alternation and taking whichever
+ * occurs earliest in `body` picks the most relevant excerpt available
+ * while still doing a single linear scan (alternation of literal,
+ * quantifier-free branches is O(tokens x body length) at worst - a
+ * constant-factor slowdown bounded by MAX_SEARCH_TOKENS, not a new
+ * ReDoS shape).
  */
-function snippet(body: string, needle: string, contextChars = 80): string {
-  if (!needle) return body.slice(0, 200);
-  const match = new RegExp(escapeRegExp(needle), 'i').exec(body);
+function snippet(body: string, needles: string[], contextChars = 80): string {
+  const escaped = needles.filter(Boolean).map(escapeRegExp);
+  if (escaped.length === 0) return body.slice(0, 200);
+  const match = new RegExp(escaped.join('|'), 'i').exec(body);
   if (!match) return body.slice(0, 200);
   const idx = match.index;
   const start = safeSliceStart(body, Math.max(0, idx - contextChars));
-  const end = safeTruncateLength(body, Math.min(body.length, idx + needle.length + contextChars));
+  const end = safeTruncateLength(body, Math.min(body.length, idx + match[0].length + contextChars));
   const prefix = start > 0 ? '…' : '';
   const suffix = end < body.length ? '…' : '';
   return `${prefix}${body.slice(start, end).replace(/\s+/g, ' ').trim()}${suffix}`;

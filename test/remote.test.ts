@@ -724,6 +724,47 @@ describe('RemoteFumadocsSource', () => {
     expect(plainPage.markdown).not.toContain('PRIVATE CONTENT');
   });
 
+  it('includes the query string in a query-bearing page id/url, distinct from the plain-path page', async () => {
+    // Regression: PageContent.id/.url were built from `target.pathname`
+    // alone, so a query-bearing ref and its plain-path counterpart -
+    // despite being cached and served as genuinely distinct content (see
+    // the cache-key regression test above) - reported the *same* id/url,
+    // silently colliding two distinct pages' identity in any response
+    // that surfaces id/url (get_page's own return value, get_toc entries,
+    // etc). id/url should each carry pathname+search so callers can tell
+    // them apart, and so an id/url round-trips back through resolveRef()
+    // to the same query-bearing content it came from.
+    const src = new RemoteFumadocsSource({
+      baseUrl,
+      fetchImpl: async (input: RequestInfo | URL) => {
+        const url = typeof input === 'string' ? input : input.toString();
+        if (url.endsWith('.md') || url.endsWith('.mdx') || url.endsWith('/raw') || url.endsWith('/index.md')) {
+          return new Response('not found', { status: 404 });
+        }
+        if (url === 'https://example.com/docs/guide?variant=private') {
+          return new Response('<html><body><article>PRIVATE CONTENT</article></body></html>', {
+            status: 200,
+            headers: { 'content-type': 'text/html' },
+          });
+        }
+        if (url === 'https://example.com/docs/guide') {
+          return new Response('<html><body><article>PUBLIC CONTENT</article></body></html>', {
+            status: 200,
+            headers: { 'content-type': 'text/html' },
+          });
+        }
+        return new Response('not found', { status: 404 });
+      },
+    });
+    const privatePage = await src.getPage('/docs/guide?variant=private');
+    expect(privatePage.id).toBe('/docs/guide?variant=private');
+    expect(privatePage.url).toBe('/docs/guide?variant=private');
+    const plainPage = await src.getPage('/docs/guide');
+    expect(plainPage.id).toBe('/docs/guide');
+    expect(plainPage.url).toBe('/docs/guide');
+    expect(plainPage.id).not.toBe(privatePage.id);
+  });
+
   it('coalesces concurrent getPage() misses for the same ref into one fetch chain', async () => {
     // Regression: concurrent cache-miss callers for the same never-before-
     // fetched ref used to each independently run the full markdown-

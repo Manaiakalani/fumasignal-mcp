@@ -103,6 +103,7 @@ function isPrivateIPv6(ip: string): boolean {
     return isPrivateIPv4(embeddedIPv4); // IPv4-mapped - validate the embedded address
   }
   if (/^fe[89ab]/.test(canonical)) return true; // fe80::/10 link-local
+  if (/^fe[cdef]/.test(canonical)) return true; // fec0::/10 site-local (deprecated by RFC 3879, but still a syntactically valid, potentially-still-configured non-public range - a DNS-rebinding attacker controls the *resolved address*, not whether a target network happens to still use it)
   if (canonical.startsWith('fc') || canonical.startsWith('fd')) return true; // fc00::/7 unique local
   if (canonical.startsWith('ff')) return true; // ff00::/8 multicast
   return false;
