@@ -9,6 +9,7 @@ import {
 import { parseFrontmatter, asNonEmptyString } from '../lib/frontmatter.js';
 import { hasPathPrefix } from '../lib/sitemap.js';
 import { logger } from '../lib/logger.js';
+import { safeSliceStart, safeTruncateLength } from '../lib/text-safety.js';
 import {
   type FumadocsSource,
   type PageContent,
@@ -325,6 +326,25 @@ export class LocalFumadocsSource implements FumadocsSource {
     if (!r.startsWith('/')) r = `${this.urlPrefix}/${r}`;
     r = r.replace(/\/+$/, '');
     if (r === '') r = this.urlPrefix;
+    // `idx` is keyed by literal (unencoded) filesystem-derived paths - see
+    // buildIndex(): a file "API Reference.mdx" is keyed as
+    // "/docs/API Reference" with a real space, never "%20". `.pathname` on
+    // a URL (the branch above) never decodes percent-encoding, and a
+    // caller-supplied path-style ref may be percent-encoded too - without
+    // this, get_page/get_toc/get_section would 404 on any indexed page
+    // whose slug needs URL-encoding. Decoding here has no
+    // traversal/authorization concern (unlike remote.ts, which re-fetches
+    // over the network and must independently re-validate a docsPrefix
+    // boundary): `idx` is a closed map of exactly the pages indexed from
+    // disk, so a decoded ref can only ever look up a key that's already
+    // legitimately in it, or fail to match. A malformed escape is left
+    // as-is (falls through to the NotFoundError below) rather than
+    // thrown, matching this function's existing fail-soft normalization.
+    try {
+      r = decodeURIComponent(r);
+    } catch {
+      // ignore - unmatched (NotFoundError) rather than a thrown error
+    }
     const direct = idx.get(r);
     if (direct) return direct;
     throw new NotFoundError(`Local page not found for ref "${ref}" (looked up "${r}")`);
@@ -603,8 +623,8 @@ function snippet(body: string, needle: string, contextChars = 80): string {
   const lower = body.toLowerCase();
   const idx = lower.indexOf(needle);
   if (idx === -1) return body.slice(0, 200);
-  const start = Math.max(0, idx - contextChars);
-  const end = Math.min(body.length, idx + needle.length + contextChars);
+  const start = safeSliceStart(body, Math.max(0, idx - contextChars));
+  const end = safeTruncateLength(body, Math.min(body.length, idx + needle.length + contextChars));
   const prefix = start > 0 ? '…' : '';
   const suffix = end < body.length ? '…' : '';
   return `${prefix}${body.slice(start, end).replace(/\s+/g, ' ').trim()}${suffix}`;

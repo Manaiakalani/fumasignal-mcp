@@ -6,6 +6,21 @@ import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import { LocalFumadocsSource } from '../src/sources/local.js';
 import { logger } from '../src/lib/logger.js';
 
+/** True if `s` contains a lone (unpaired) UTF-16 surrogate anywhere. */
+function hasLoneSurrogate(s: string): boolean {
+  for (let i = 0; i < s.length; i++) {
+    const c = s.charCodeAt(i);
+    if (c >= 0xd800 && c <= 0xdbff) {
+      const next = s.charCodeAt(i + 1);
+      if (!(next >= 0xdc00 && next <= 0xdfff)) return true;
+      i++;
+    } else if (c >= 0xdc00 && c <= 0xdfff) {
+      return true;
+    }
+  }
+  return false;
+}
+
 let tmpDir: string;
 
 beforeAll(async () => {
@@ -111,6 +126,63 @@ describe('LocalFumadocsSource', () => {
     const src = new LocalFumadocsSource({ rootDir: tmpDir });
     const page = await src.getPage('guides/install');
     expect(page.title).toBe('Install');
+  });
+
+  it('decodes a percent-encoded ref to match an indexed page whose slug needs encoding', async () => {
+    // Regression: buildIndex() keys pages by literal (unencoded)
+    // filesystem-derived paths - a file "API Reference.mdx" is keyed as
+    // "/docs/guides/API Reference" with a real space, never "%20". A
+    // percent-encoded ref (an absolute URL's `.pathname` is always
+    // percent-encoded by the URL parser, and a hand-constructed path ref
+    // may be too) used to never match, 404-ing get_page for any file
+    // whose slug needs URL-encoding.
+    const dir = await mkdtemp(path.join(os.tmpdir(), 'fumasignal-local-encoded-'));
+    try {
+      const docs = path.join(dir, 'content', 'docs');
+      await mkdir(path.join(docs, 'guides'), { recursive: true });
+      await writeFile(
+        path.join(docs, 'guides', 'API Reference.mdx'),
+        '---\ntitle: API Reference\n---\n\n# API Reference\n\nbody text',
+      );
+      const src = new LocalFumadocsSource({ rootDir: dir });
+      const byPath = await src.getPage('/docs/guides/API%20Reference');
+      expect(byPath.title).toBe('API Reference');
+      const byAbsoluteUrl = await src.getPage('https://example.com/docs/guides/API%20Reference');
+      expect(byAbsoluteUrl.title).toBe('API Reference');
+      // The literal (unencoded) form - what listPages() itself returns -
+      // must keep working too.
+      const byLiteral = await src.getPage('/docs/guides/API Reference');
+      expect(byLiteral.title).toBe('API Reference');
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('never returns a search excerpt with a dangling UTF-16 surrogate, even when the context window lands mid-emoji', async () => {
+    // Regression: snippet() sliced `body` at `idx - contextChars` /
+    // `idx + needle.length + contextChars` with no awareness of UTF-16
+    // surrogate pairs - a supplementary-plane character (e.g. an emoji)
+    // straddling either boundary gets split, leaving a lone high/low
+    // surrogate in the returned excerpt (not well-formed Unicode). With
+    // 45 emoji (90 UTF-16 units) padding each side of "target" and the
+    // real default contextChars=80, both the start and end boundaries
+    // land mid-pair - empirically confirmed against the pre-fix logic.
+    const dir = await mkdtemp(path.join(os.tmpdir(), 'fumasignal-local-surrogate-'));
+    try {
+      const docs = path.join(dir, 'content', 'docs');
+      await mkdir(docs, { recursive: true });
+      const emoji = '😀'.repeat(45);
+      await writeFile(path.join(docs, 'emoji.md'), `# Emoji\n\n${emoji} target ${emoji}`);
+      const src = new LocalFumadocsSource({ rootDir: dir });
+      const hits = await src.search({ query: 'target' });
+      expect(hits).toHaveLength(1);
+      const excerpt = hits[0]!.excerpt;
+      expect(excerpt).toBeDefined();
+      expect(excerpt).toContain('target');
+      expect(hasLoneSurrogate(excerpt!)).toBe(false);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
   });
 
   it('extracts a section by anchor', async () => {

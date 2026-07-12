@@ -186,6 +186,18 @@ describe('filterToDocs', () => {
     const filtered = filterToDocs(urls, 'https://example.com/', '/docs');
     expect(filtered.map((f) => f.path)).toEqual(['/docs/legit']);
   });
+
+  it('excludes a same-host entry on a different scheme (origin, not just host, must match)', () => {
+    // Regression: filterToDocs() used to compare `.host` (hostname+port)
+    // only, so "http://example.com/docs/x" was treated as in-scope for a
+    // "https://example.com/" base even though they're different origins -
+    // inconsistent with RemoteFumadocsSource.resolveRef()/
+    // fetchSameOrigin(), which both compare `.origin` specifically because
+    // scheme matters (see their doc comments).
+    const urls = ['http://example.com/docs/x', 'https://example.com/docs/y'];
+    const filtered = filterToDocs(urls, 'https://example.com/', '/docs');
+    expect(filtered.map((f) => f.path)).toEqual(['/docs/y']);
+  });
 });
 
 describe('hasPathPrefix', () => {

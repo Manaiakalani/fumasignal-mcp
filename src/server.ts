@@ -1,6 +1,7 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
 import { logger } from './lib/logger.js';
+import { safeTruncateLength } from './lib/text-safety.js';
 import {
   type FumadocsSource,
   NotFoundError,
@@ -313,23 +314,6 @@ function errorResult(
 function truncate(s: string, max: number): string {
   if (s.length <= max) return s;
   return `${s.slice(0, safeTruncateLength(s, max))}…`;
-}
-
-/**
- * Return a cut length `<= max` such that `text.slice(0, cut)` never splits
- * a UTF-16 surrogate pair. Strings are sequences of UTF-16 code units, not
- * code points: an emoji or other supplementary-plane character is stored
- * as a high surrogate (0xD800-0xDBFF) followed by a low surrogate, and
- * naively cutting at an arbitrary offset can land between the two. That
- * leaves a dangling lone high surrogate at the end of the truncated
- * string, which is not well-formed Unicode and can render as U+FFFD or
- * confuse a downstream JSON/UTF-8 encoder. Used by every truncation site
- * in this file so none of them can reintroduce this.
- */
-function safeTruncateLength(text: string, max: number): number {
-  if (max <= 0 || max >= text.length) return Math.max(0, Math.min(max, text.length));
-  const before = text.charCodeAt(max - 1);
-  return before >= 0xd800 && before <= 0xdbff ? max - 1 : max;
 }
 
 /**
