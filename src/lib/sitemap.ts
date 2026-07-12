@@ -212,8 +212,19 @@ export function isSitemapIndex(xml: string): boolean {
 }
 
 /**
- * Filter URLs to those under a given path prefix on the same host as
+ * Filter URLs to those under a given path prefix on the same origin as
  * baseUrl.
+ *
+ * Compares `.origin` (scheme + host + port), not just `.host`, mirroring
+ * `RemoteFumadocsSource.resolveRef()`/`fetchSameOrigin()` (see their doc
+ * comments) - `.host` alone would treat "http://example.com/docs/x" as
+ * in-scope for a "https://example.com/docs" base, even though that's a
+ * different origin. `listPages()` currently only keeps `path` from this
+ * function's output (so today's actual page fetches always go through
+ * the base's own scheme via `resolveRef()`, regardless of this check),
+ * but the listing itself should still reflect the same origin boundary
+ * used everywhere else, and any future caller that starts using the
+ * `url` field directly must not inherit a scheme-confusable check.
  *
  * Uses `decodeAndNormalizePathname()` (not the raw `.pathname`) for the
  * prefix check, for the same reason `RemoteFumadocsSource.resolveRef()`
@@ -244,7 +255,7 @@ export function filterToDocs(
     } catch {
       continue;
     }
-    if (parsed.host !== base.host) continue;
+    if (parsed.origin !== base.origin) continue;
     const normalizedPath = decodeAndNormalizePathname(parsed.pathname);
     if (normalizedPath === null) continue;
     if (!hasPathPrefix(normalizedPath, docsPrefix)) continue;

@@ -816,6 +816,27 @@ describe('RemoteFumadocsSource', () => {
     expect(page.markdown).toContain('content that should appear');
   });
 
+  it('extracts a <title> containing a literal "<" (HTML5 RCDATA semantics)', async () => {
+    // Regression: extractTagText() used to reject the title if any "<"
+    // appeared before the real "</title>" closer, to bug-for-bug match
+    // the old regex's `[^<]*` capture. But HTML5 defines <title> as an
+    // RCDATA element - "<" has no special meaning inside it and is parsed
+    // as literal text until the first "</title>" - so a perfectly valid
+    // title like "Age < 18" was silently dropped in favor of a worse
+    // fallback (og:title / an arbitrary heading).
+    const html = `<!doctype html><html><head><title>Age < 18</title>
+<meta property="og:title" content="Wrong Fallback Title"></head>
+<body><article><h1>Real</h1><p>content that should appear in the markdown output</p></article></body></html>`;
+    const src = new RemoteFumadocsSource({
+      baseUrl,
+      fetchImpl: makeFetch({
+        'https://example.com/docs/age-check': { body: html, contentType: 'text/html' },
+      }),
+    });
+    const page = await src.getPage('/docs/age-check');
+    expect(page.title).toBe('Age < 18');
+  });
+
   it('returns null for missing llms.txt', async () => {
     const src = new RemoteFumadocsSource({
       baseUrl,

@@ -948,9 +948,24 @@ function extractHtmlMeta(html: string): Record<string, unknown> {
  * Uses a *bounded* regex (`<tag\b`, no unbounded quantifier) to find the
  * opening tag, then `String.indexOf` (never backtracks) to find first
  * the opening tag's closing `>`, then the `</tag>` closer. Returns
- * `null` (no title) if there's no opening tag, no closing `>` for it, no
- * `</tag>` after that, or - matching the original `[^<]*` capture's
- * semantics - if a stray `<` appears before the real closer.
+ * `null` (no title) if there's no opening tag, no closing `>` for it, or
+ * no `</tag>` after that.
+ *
+ * Deliberately does NOT reject on a stray `<` appearing before the
+ * closer (an earlier version did, to bug-for-bug match the old regex's
+ * `[^<]*` capture). This function is only ever called for `<title>`
+ * (see `extractHtmlMeta()`), which HTML5 defines as an RCDATA element:
+ * `<` has no special meaning inside it and is parsed as literal text
+ * until the first case-insensitive `</title>` - exactly what `closeRe`
+ * finds. Rejecting on an embedded `<` (e.g. `<title>Age < 18</title>`,
+ * perfectly valid HTML) silently dropped a real title in favor of a
+ * worse fallback (`og:title` or an arbitrary heading) for no security
+ * benefit: the extracted text already flows through `decodeHtml()`
+ * (entity-decoding only, no tag-stripping), so literal `<`/`>` in a
+ * title were already possible via encoded entities even before this
+ * change - this fix doesn't introduce any new "titles can contain angle
+ * brackets" exposure, it just also allows the literal (unencoded) form
+ * HTML5 actually permits here.
  */
 function extractTagText(html: string, tag: string): string | null {
   const openMatch = new RegExp(`<${tag}\\b`, 'i').exec(html);
@@ -962,8 +977,6 @@ function extractTagText(html: string, tag: string): string | null {
   closeRe.lastIndex = contentStart;
   const closeMatch = closeRe.exec(html);
   if (!closeMatch) return null;
-  const strayAngle = html.indexOf('<', contentStart);
-  if (strayAngle !== -1 && strayAngle < closeMatch.index) return null;
   return html.slice(contentStart, closeMatch.index);
 }
 
