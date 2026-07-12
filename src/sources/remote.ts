@@ -1,5 +1,5 @@
 import { logger } from '../lib/logger.js';
-import { TtlCache, Coalescer } from '../lib/cache.js';
+import { TtlCache, Coalescer, Semaphore } from '../lib/cache.js';
 import { htmlToMarkdown } from '../lib/html-to-md.js';
 import { extractSection, extractToc } from '../lib/markdown.js';
 import { parseFrontmatter, asNonEmptyString } from '../lib/frontmatter.js';
@@ -52,6 +52,15 @@ export interface RemoteSourceOptions {
    * maxResponseBytes` (~5GB at the defaults). Default 50MB.
    */
   maxPageCacheBytes?: number;
+  /**
+   * Max number of outbound fetches (across search, sitemap, llms.txt, and
+   * page requests) allowed to be in flight at once; additional calls queue
+   * FIFO until a slot frees up. `Coalescer` only de-dupes *identical* keys,
+   * so without this, concurrent requests for many *distinct* pages/queries
+   * would each independently buffer up to `maxResponseBytes`, with nothing
+   * bounding the aggregate. Default 8.
+   */
+  maxConcurrentFetches?: number;
 }
 
 const DEFAULT_UA = 'fumasignal-mcp/0.1 (+https://github.com/Manaiakalani/fumasignal-mcp)';
@@ -125,6 +134,10 @@ export class RemoteFumadocsSource implements FumadocsSource {
   private pagePending = new Coalescer<string, PageContent>();
   private listPending = new Coalescer<'all', PageSummary[]>();
   private llmsPending = new Coalescer<string, string | null>();
+  // Bounds aggregate in-flight fetches across distinct keys (see
+  // `Semaphore`'s doc comment) - `pagePending`/etc. above only collapse
+  // duplicate requests for the *same* key.
+  private fetchSemaphore: Semaphore;
 
   constructor(opts: RemoteSourceOptions) {
     this.base = new URL(opts.baseUrl);
@@ -141,6 +154,7 @@ export class RemoteFumadocsSource implements FumadocsSource {
     this.maxRedirects = opts.maxRedirects ?? 5;
     this.maxResponseBytes = opts.maxResponseBytes ?? 10_000_000;
     const maxPageCacheBytes = opts.maxPageCacheBytes ?? 50_000_000;
+    this.fetchSemaphore = new Semaphore(opts.maxConcurrentFetches ?? 8);
     const ttl = opts.cacheTtlMs ?? 5 * 60 * 1000;
     this.pageCache = new TtlCache(ttl, 500, {
       maxTotalSize: maxPageCacheBytes,
@@ -319,21 +333,23 @@ export class RemoteFumadocsSource implements FumadocsSource {
   }
 
   async search(opts: SearchOptions): Promise<SearchHit[]> {
-    const url = new URL(this.searchPath, this.base);
-    url.searchParams.set('query', opts.query);
-    if (opts.tag) url.searchParams.set('tag', opts.tag);
-    if (opts.locale) url.searchParams.set('locale', opts.locale);
-    const res = await this.fetchSameOrigin(url, { headers: this.headers() });
-    if (!res.ok) {
-      await discardBody(res);
-      throw new SourceError(
-        `Search request failed: ${res.status} ${res.statusText} (${url})`,
-      );
-    }
-    const data = JSON.parse(await this.readCappedText(res)) as unknown;
-    const hits = parseSearchResponse(data);
-    const limit = opts.limit ?? 10;
-    return hits.slice(0, limit);
+    return this.fetchSemaphore.run(async () => {
+      const url = new URL(this.searchPath, this.base);
+      url.searchParams.set('query', opts.query);
+      if (opts.tag) url.searchParams.set('tag', opts.tag);
+      if (opts.locale) url.searchParams.set('locale', opts.locale);
+      const res = await this.fetchSameOrigin(url, { headers: this.headers() });
+      if (!res.ok) {
+        await discardBody(res);
+        throw new SourceError(
+          `Search request failed: ${res.status} ${res.statusText} (${url})`,
+        );
+      }
+      const data = JSON.parse(await this.readCappedText(res)) as unknown;
+      const hits = parseSearchResponse(data);
+      const limit = opts.limit ?? 10;
+      return hits.slice(0, limit);
+    });
   }
 
   async listPages(prefix?: string): Promise<PageSummary[]> {
@@ -347,11 +363,13 @@ export class RemoteFumadocsSource implements FumadocsSource {
       (await this.listPending.run('all', async () => {
         const raced = this.listCache.get('all');
         if (raced) return raced;
-        const urls = await this.fetchSitemapUrls(new URL('/sitemap.xml', this.base), 0, {
-          fetches: 0,
-          visited: new Set(),
-          totalUrls: 0,
-        });
+        const urls = await this.fetchSemaphore.run(() =>
+          this.fetchSitemapUrls(new URL('/sitemap.xml', this.base), 0, {
+            fetches: 0,
+            visited: new Set(),
+            totalUrls: 0,
+          }),
+        );
         const filtered = filterToDocs(urls, this.base.toString(), this.docsPrefix);
         // Dedup by path: a repeated <loc> (within one sitemap, or the same
         // page legitimately listed in more than one) would otherwise
@@ -483,7 +501,7 @@ export class RemoteFumadocsSource implements FumadocsSource {
       const raced = this.pageCache.get(cacheKey);
       if (raced) return raced;
 
-      const { markdown, meta } = await this.fetchPageBody(target);
+      const { markdown, meta } = await this.fetchSemaphore.run(() => this.fetchPageBody(target));
       const toc = extractToc(markdown);
       // meta.title/description are untrusted frontmatter values (see
       // asNonEmptyString's doc comment) - guard both instead of an `as
@@ -534,20 +552,22 @@ export class RemoteFumadocsSource implements FumadocsSource {
     return this.llmsPending.run(path, async () => {
       const raced = this.llmsCache.get(path);
       if (raced !== undefined) return raced;
-      const url = new URL(path, this.base);
-      const res = await this.fetchSameOrigin(url, { headers: this.headers() });
-      if (res.status === 404) {
-        await discardBody(res);
-        this.llmsCache.set(path, null);
-        return null;
-      }
-      if (!res.ok) {
-        await discardBody(res);
-        throw new SourceError(`Failed to fetch ${path}: ${res.status} ${res.statusText}`);
-      }
-      const text = await this.readCappedText(res);
-      this.llmsCache.set(path, text);
-      return text;
+      return this.fetchSemaphore.run(async () => {
+        const url = new URL(path, this.base);
+        const res = await this.fetchSameOrigin(url, { headers: this.headers() });
+        if (res.status === 404) {
+          await discardBody(res);
+          this.llmsCache.set(path, null);
+          return null;
+        }
+        if (!res.ok) {
+          await discardBody(res);
+          throw new SourceError(`Failed to fetch ${path}: ${res.status} ${res.statusText}`);
+        }
+        const text = await this.readCappedText(res);
+        this.llmsCache.set(path, text);
+        return text;
+      });
     });
   }
 
@@ -691,8 +711,20 @@ function pageContentSize(page: PageContent, maxResponseBytes: number): number {
 }
 
 function extractTitle(markdown: string): string | undefined {
-  const m = /^#\s+(.+?)\s*$/m.exec(markdown);
-  return m ? m[1] : undefined;
+  // Per-line, greedy-to-end-anchor match instead of the old
+  // `/^#\s+(.+?)\s*$/m` - a lazy group immediately followed by `\s*$`
+  // is the same catastrophic-backtracking shape fixed in
+  // src/lib/markdown.ts (see its comment for the empirical timings).
+  // `(.*)$` has nothing after it to backtrack against, so it's linear
+  // regardless of line length; the loop preserves the original's
+  // "skip a bare '#' line with no real content, keep scanning" behavior.
+  for (const line of markdown.split(/\r?\n/)) {
+    const m = /^#\s+(.*)$/.exec(line);
+    if (!m) continue;
+    const title = m[1]!.trim();
+    if (title) return title;
+  }
+  return undefined;
 }
 
 function extractHtmlMeta(html: string): Record<string, unknown> {

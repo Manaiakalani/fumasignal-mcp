@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, afterEach } from 'vitest';
-import { TtlCache } from '../src/lib/cache.js';
+import { TtlCache, Semaphore } from '../src/lib/cache.js';
 
 describe('TtlCache', () => {
   afterEach(() => {
@@ -125,5 +125,69 @@ describe('TtlCache', () => {
     cache.set('a', 1);
     cache.clear();
     expect(cache.get('a')).toBeUndefined();
+  });
+});
+
+describe('Semaphore', () => {
+  it('rejects a non-positive or non-integer maxConcurrent at construction time', () => {
+    expect(() => new Semaphore(0)).toThrow(RangeError);
+    expect(() => new Semaphore(-1)).toThrow(RangeError);
+    expect(() => new Semaphore(1.5)).toThrow(RangeError);
+  });
+
+  it('never lets more than maxConcurrent callbacks run at once', async () => {
+    // Regression target: without this, N concurrent calls with N distinct
+    // keys (nothing for a Coalescer to de-dupe) would all run unbounded.
+    const sem = new Semaphore(2);
+    let active = 0;
+    let maxActive = 0;
+    const track = async () => {
+      active++;
+      maxActive = Math.max(maxActive, active);
+      await new Promise((r) => setTimeout(r, 10));
+      active--;
+      return 'done';
+    };
+    const results = await Promise.all([
+      sem.run(track),
+      sem.run(track),
+      sem.run(track),
+      sem.run(track),
+      sem.run(track),
+    ]);
+    expect(maxActive).toBeLessThanOrEqual(2);
+    expect(results).toEqual(['done', 'done', 'done', 'done', 'done']);
+  });
+
+  it('releases the slot even when the callback throws, so later callers are not starved', async () => {
+    const sem = new Semaphore(1);
+    await expect(
+      sem.run(async () => {
+        throw new Error('boom');
+      }),
+    ).rejects.toThrow('boom');
+    // If the slot leaked, this would hang forever - vitest's default
+    // per-test timeout turns that into a failure rather than a false pass.
+    await expect(sem.run(async () => 'ok')).resolves.toBe('ok');
+  });
+
+  it('queues excess callers and lets them proceed one at a time as slots free up', async () => {
+    const sem = new Semaphore(1);
+    const order: number[] = [];
+    const makeTask = (id: number) => async () => {
+      order.push(id);
+      await new Promise((r) => setTimeout(r, 5));
+      return id;
+    };
+    const results = await Promise.all([
+      sem.run(makeTask(1)),
+      sem.run(makeTask(2)),
+      sem.run(makeTask(3)),
+    ]);
+    // With maxConcurrent=1, callbacks must start in the same order they
+    // called run() - if the semaphore let a later caller "jump ahead", the
+    // push order (recorded when each callback actually *starts*) would differ.
+    expect(order).toEqual([1, 2, 3]);
+    expect(results).toEqual([1, 2, 3]);
   });
 });

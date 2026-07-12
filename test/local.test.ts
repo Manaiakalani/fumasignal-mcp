@@ -154,6 +154,27 @@ describe('LocalFumadocsSource security fixes', () => {
     }
   });
 
+  it('does not hang extracting a title from a large adversarial heading line (ReDoS regression)', async () => {
+    // Regression: firstHeading() used `/^#\s+(.+?)\s*$/m` - the same
+    // catastrophic-backtracking shape as HEADING_RE in src/lib/markdown.ts
+    // and extractTitle() in src/sources/remote.ts. A line with no valid
+    // trailing match forces the old regex to exhaust every split point.
+    const dir = await mkdtemp(path.join(os.tmpdir(), 'fumasignal-local-redos-'));
+    try {
+      const docs = path.join(dir, 'content', 'docs');
+      await mkdir(docs, { recursive: true });
+      const adversarial = '# a' + ' '.repeat(200 * 1024) + '!';
+      await writeFile(path.join(docs, 'adversarial.mdx'), `${adversarial}\n\nbody text`);
+      const src = new LocalFumadocsSource({ rootDir: dir });
+      const start = Date.now();
+      const page = await src.getPage('/docs/adversarial');
+      expect(Date.now() - start).toBeLessThan(1000);
+      expect(page.title.endsWith('!')).toBe(true);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
   it('filters search results by tag and locale', async () => {
     const dir = await mkdtemp(path.join(os.tmpdir(), 'fumasignal-local-tags-'));
     try {
