@@ -51,7 +51,28 @@ export function redactUrlForLogging(url: string): string {
     // resolving against a synthetic base, which would fabricate a scheme
     // that was never actually present and risk producing a misleading
     // logged value.
-    return url.replace(/^\/\/([^/?#@]*)@/, '//***@');
+    //
+    // Two things the pattern has to get right that a naive "up to the
+    // first @" match doesn't: (1) WHATWG userinfo parsing treats the
+    // *last* "@" before the next "/", "?", or "#" as the delimiter, not
+    // the first - a password can itself contain "@" (e.g.
+    // "//alice:very@secret@host/x" has password "very@secret", not
+    // username "alice", password "very", followed by a bare "secret@host"
+    // authority) - so excluding "@" from the captured span, as a
+    // first-match-wins character class would, leaks whatever comes after
+    // the first "@" verbatim. Allowing "@" *into* the captured span and
+    // relying on the regex engine's standard greedy-then-backtrack
+    // behavior reproduces that "last @ wins" semantics for free: `*` first
+    // consumes as much as possible, then backtracks one character at a
+    // time until the character immediately after the captured span is
+    // "@", which is necessarily the *last* "@" in the run. (2) a leading
+    // "//" isn't guaranteed to be the very first character - operator
+    // config values aren't guaranteed to be trimmed - so anchoring only at
+    // "^\/\/" would fail to match (and thus leave a value *completely*
+    // unredacted) if there's leading whitespace before it. Capturing
+    // optional leading whitespace alongside the "//" marker and preserving
+    // it in the replacement handles that without weakening the match.
+    return url.replace(/^(\s*\/\/)([^/?#]*)@/, '$1***@');
   }
   if (!parsed.username && !parsed.password) return url;
   parsed.username = '***';

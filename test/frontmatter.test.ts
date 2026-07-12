@@ -94,4 +94,31 @@ describe('sanitizeParsedYaml', () => {
     const input = { a: 1, b: 'x', c: [1, 2, 3], d: { e: 'f' } };
     expect(sanitizeParsedYaml(input)).toEqual(input);
   });
+
+  it("charges a long object key's own length against the budget, not just its value", () => {
+    // Regression: the sanitization loop only ever charged the budget via
+    // the recursive call on each entry's *value* - the key string itself
+    // was used directly (via defineOwn) and never subtracted from
+    // budget.remaining anywhere. A single mapping entry with an extremely
+    // long key and a short value would consume almost none of the
+    // 200,000-unit budget while still contributing its full length to the
+    // eventual JSON-serialized size, defeating the budget's purpose for
+    // that shape of input. A 250,000-character key alone now exceeds the
+    // entire budget, so the entry is truncated just like any other
+    // budget-exhausting content.
+    const longKey = 'k'.repeat(250_000);
+    const input = { [longKey]: 'short value', other: 'ok' };
+    const sanitized = sanitizeParsedYaml(input);
+    expect(JSON.stringify(sanitized).length).toBeLessThan(1000);
+    expect(Object.keys(sanitized)).not.toContain(longKey);
+  });
+
+  it('still allows many ordinary, reasonably-sized keys through untouched', () => {
+    // Sanity check that the new per-key charge doesn't affect normal
+    // front matter - a realistic tag list or metadata object with dozens
+    // of short keys shouldn't come remotely close to the budget.
+    const input: Record<string, string> = {};
+    for (let i = 0; i < 50; i++) input[`field_${i}`] = `value ${i}`;
+    expect(sanitizeParsedYaml(input)).toEqual(input);
+  });
 });

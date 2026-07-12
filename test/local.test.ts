@@ -4,6 +4,7 @@ import path from 'node:path';
 import os from 'node:os';
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import { LocalFumadocsSource } from '../src/sources/local.js';
+import { logger } from '../src/lib/logger.js';
 
 let tmpDir: string;
 
@@ -47,6 +48,56 @@ describe('LocalFumadocsSource', () => {
     const src = new LocalFumadocsSource({ rootDir: tmpDir });
     const hits = await src.search({ query: 'install' });
     expect(hits[0]!.url).toBe('/docs/guides/install');
+  });
+
+  it('deduplicates repeated query tokens instead of scoring each repetition separately', async () => {
+    // Regression: search() scored every token in the split query
+    // independently, with no deduplication - a query that repeats the
+    // same word many times (the cheapest way to maximize token count
+    // within the query's fixed character budget) multiplied that page's
+    // score (and, more importantly, the scanning cost) by the repeat
+    // count for no semantic benefit. "apples" and "apples apples apples"
+    // must score identically once repeats collapse to a single token.
+    const dir = await mkdtemp(path.join(os.tmpdir(), 'fumasignal-local-searchdedup-'));
+    try {
+      const docs = path.join(dir, 'content', 'docs');
+      await mkdir(docs, { recursive: true });
+      await writeFile(path.join(docs, 'fruit.md'), '# Fruit\n\napples apples apples grow on trees');
+      const src = new LocalFumadocsSource({ rootDir: dir });
+      const once = await src.search({ query: 'apples' });
+      const repeated = await src.search({ query: 'apples apples apples' });
+      expect(once).toHaveLength(1);
+      expect(repeated).toHaveLength(1);
+      expect(repeated[0]!.score).toBe(once[0]!.score);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('only scores the first MAX_SEARCH_TOKENS distinct tokens of a query, ignoring the rest', async () => {
+    // Regression: with no cap, search()'s cost is
+    // O(distinct token count * total indexed bytes) - the query MCP tool
+    // parameter allows up to ~250 single-character tokens (500-char cap /
+    // 2), which against a fully-populated default-sized index was
+    // empirically measured at 10-25+ seconds of synchronous,
+    // event-loop-blocking work for one call. Crafts a query with 21
+    // distinct one-word tokens, where only the 21st (beyond the 20-token
+    // cap) appears anywhere in the corpus - if the cap is enforced, that
+    // token is never scored and the page it would have matched shouldn't
+    // appear in the results at all.
+    const dir = await mkdtemp(path.join(os.tmpdir(), 'fumasignal-local-searchcap-'));
+    try {
+      const docs = path.join(dir, 'content', 'docs');
+      await mkdir(docs, { recursive: true });
+      await writeFile(path.join(docs, 'needle.md'), '# Needle\n\ncontains-only-token21-zzz here');
+      const src = new LocalFumadocsSource({ rootDir: dir });
+      const tokens = Array.from({ length: 20 }, (_, i) => `unused-token-${i}`);
+      tokens.push('contains-only-token21-zzz');
+      const hits = await src.search({ query: tokens.join(' ') });
+      expect(hits).toHaveLength(0);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
   });
 
   it('gets a page by URL ref', async () => {
@@ -345,6 +396,58 @@ describe('LocalFumadocsSource security fixes', () => {
     }
   });
 
+  it('charges maxTotalBytes for a file that fails to parse, not just ones that index successfully', async () => {
+    // Regression: totalBytes used to be incremented on the line *after*
+    // parseFrontmatter() succeeded, so a file that read fine but failed to
+    // parse (or failed for any other reason) paid the real I/O/CPU cost of
+    // a full fs.readFile() while contributing nothing to the aggregate
+    // budget maxTotalBytes exists to bound. Uses three files that all fail
+    // to parse (a disabled "javascript" front-matter engine - see
+    // frontmatter.ts - reliably throws without depending on content
+    // size/shape), each the same size, with maxTotalBytes set so the
+    // budget can only trip once *two* files' bytes have been charged. Since
+    // all three files are interchangeable (same size, same failure mode),
+    // the outcome doesn't depend on which particular one the filesystem
+    // happens to enumerate first/second/third - only on whether a failing
+    // file's bytes get charged at all. Asserts via the "budget exhausted"
+    // warning's logged totalBytes value, since pages.length is 0 either
+    // way here (every file fails to parse) and can't distinguish the fix
+    // from the bug on its own.
+    const dir = await mkdtemp(path.join(os.tmpdir(), 'fumasignal-local-totalbytes-onfail-'));
+    try {
+      const docs = path.join(dir, 'content', 'docs');
+      await mkdir(docs, { recursive: true });
+      const body = '---javascript\nx\n---\n# Body\n' + 'y'.repeat(70);
+      for (const name of ['one', 'two', 'three']) {
+        await writeFile(path.join(docs, `${name}.md`), body);
+      }
+      const warnSpy = vi.spyOn(logger, 'warn');
+      try {
+        const src = new LocalFumadocsSource({
+          rootDir: dir,
+          maxTotalBytes: Math.floor(body.length * 1.5),
+        });
+        const pages = await src.listPages();
+        expect(pages.length).toBe(0);
+        const budgetCall = warnSpy.mock.calls.find(
+          (call) =>
+            typeof call[1] === 'string' && call[1].includes('maxTotalBytes budget exhausted'),
+        );
+        expect(budgetCall).toBeDefined();
+        // A single file's worth of bytes must have been charged even
+        // though it failed to parse - if the pre-fix bug were present,
+        // failing files would never advance totalBytes, this warning would
+        // never fire at all (every file's check would see totalBytes still
+        // at 0), and this .find() would come back undefined instead.
+        expect((budgetCall?.[0] as { totalBytes: number }).totalBytes).toBe(body.length);
+      } finally {
+        warnSpy.mockRestore();
+      }
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
   it('does not let maxTotalBytes affect a docs tree that fits comfortably under the default budget', async () => {
     // Sanity check that the new aggregate cap doesn't affect ordinary,
     // reasonably sized content using the default (no maxTotalBytes passed).
@@ -395,14 +498,14 @@ describe('LocalFumadocsSource security fixes', () => {
     // extremely large tree, that means walk() itself (not just the later
     // read/index step) could momentarily hold megabytes of path strings
     // in memory before the budget was ever consulted. walk() now takes a
-    // limit and stops enumerating once it's reached, so verify fs.readdir
+    // limit and stops enumerating once it's reached, so verify fs.opendir
     // is never even called for a sibling subdirectory once the budget is
     // already exhausted. Uses two sibling subdirectories, each with one
     // file, and maxFileCount: 1 - regardless of which of the two
     // subdirectories the filesystem happens to enumerate first, walk()
     // must find its one allowed file there and stop before descending
     // into the other, so exactly 2 directories (the content root + one
-    // subdirectory) should ever be passed to fs.readdir, never 3.
+    // subdirectory) should ever be passed to fs.opendir, never 3.
     const dir = await mkdtemp(path.join(os.tmpdir(), 'fumasignal-local-walklimit-'));
     try {
       const docs = path.join(dir, 'content', 'docs');
@@ -410,15 +513,45 @@ describe('LocalFumadocsSource security fixes', () => {
       await mkdir(path.join(docs, 'z'), { recursive: true });
       await writeFile(path.join(docs, 'a', 'one.md'), '# One');
       await writeFile(path.join(docs, 'z', 'two.md'), '# Two');
-      const readdirSpy = vi.spyOn(fsPromises, 'readdir');
+      const opendirSpy = vi.spyOn(fsPromises, 'opendir');
       try {
         const src = new LocalFumadocsSource({ rootDir: dir, maxFileCount: 1 });
         const pages = await src.listPages();
         expect(pages.length).toBe(1);
-        expect(readdirSpy.mock.calls.length).toBe(2);
+        expect(opendirSpy.mock.calls.length).toBe(2);
       } finally {
-        readdirSpy.mockRestore();
+        opendirSpy.mockRestore();
       }
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('stops walk() from reading further entries within a single large flat directory once limit is reached', async () => {
+    // Regression: even after the fix above (which stops walk() from
+    // *recursing into further subdirectories* once maxFileCount is
+    // exhausted), each individual walk() call still read every entry of
+    // *one* directory in a single fs.readdir() call before its own `limit`
+    // check ever ran - so one flat directory containing an extremely large
+    // number of files (no subdirectories at all, so the recursion-limiting
+    // fix above never even applies) would still be fully enumerated and
+    // buffered into memory regardless of maxFileCount. walk() now uses
+    // fs.opendir()'s async-iterable Dir, which reads entries incrementally,
+    // so breaking out of the loop once `limit` is hit stops it from ever
+    // reading (or materializing a Dirent for) any further entries in that
+    // same directory. Verified here via a content root with 5 files and
+    // maxFileCount: 2: only 2 pages should be indexed, and the directory
+    // handle must not have been asked to enumerate more than necessary.
+    const dir = await mkdtemp(path.join(os.tmpdir(), 'fumasignal-local-walkflat-'));
+    try {
+      const docs = path.join(dir, 'content', 'docs');
+      await mkdir(docs, { recursive: true });
+      for (let i = 0; i < 5; i++) {
+        await writeFile(path.join(docs, `page-${i}.md`), `# Page ${i}`);
+      }
+      const src = new LocalFumadocsSource({ rootDir: dir, maxFileCount: 2 });
+      const pages = await src.listPages();
+      expect(pages.length).toBe(2);
     } finally {
       await rm(dir, { recursive: true, force: true });
     }
