@@ -123,6 +123,35 @@ describe('LocalFumadocsSource security fixes', () => {
     }
   });
 
+  it('does not crash search() when a page has a non-string YAML title', async () => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), 'fumasignal-local-badtitle-'));
+    try {
+      const docs = path.join(dir, 'content', 'docs');
+      await mkdir(docs, { recursive: true });
+      // A YAML frontmatter title of `42` parses as a number, not a string.
+      // Regression: `buildIndex()` used to cast it with `as string`
+      // (a compile-time-only assertion), so `page.title.toLowerCase()` in
+      // `search()` would throw `TypeError: page.title.toLowerCase is not a
+      // function` for the WHOLE index, not just this page.
+      await writeFile(
+        path.join(docs, 'numeric-title.mdx'),
+        `---\ntitle: 42\n---\n\n# Fallback Heading\n\nwidget content here`,
+      );
+      await writeFile(
+        path.join(docs, 'normal.mdx'),
+        `---\ntitle: Normal Page\n---\n\n# Normal\n\nwidget content here too`,
+      );
+      const src = new LocalFumadocsSource({ rootDir: dir });
+      const hits = await src.search({ query: 'widget' });
+      expect(hits.map((h) => h.url).sort()).toEqual(['/docs/normal', '/docs/numeric-title']);
+      // Falls back to the first markdown heading when the YAML title isn't a string.
+      const badPage = await src.getPage('/docs/numeric-title');
+      expect(badPage.title).toBe('Fallback Heading');
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
   it('filters search results by tag and locale', async () => {
     const dir = await mkdtemp(path.join(os.tmpdir(), 'fumasignal-local-tags-'));
     try {

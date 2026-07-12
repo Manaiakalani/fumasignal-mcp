@@ -25,10 +25,16 @@ function decodeXmlEntities(s: string): string {
  * Returns true if `pathname` is exactly `prefix`, or a descendant of it
  * (`prefix` followed by "/"). Plain `startsWith` is not enough: "/docs2"
  * and "/docs-archive/x" both start with "/docs" but are not under it.
+ *
+ * `prefix` is normalized by stripping any trailing slash(es) first, so a
+ * caller-supplied prefix like "/docs/" (e.g. via the `list_pages` tool's
+ * `prefix` argument, which isn't run through the CLI's own normalization)
+ * still matches descendants instead of matching nothing.
  */
 export function hasPathPrefix(pathname: string, prefix: string): boolean {
-  if (prefix === '' || prefix === '/') return true;
-  return pathname === prefix || pathname.startsWith(`${prefix}/`);
+  const p = prefix.replace(/\/+$/, '');
+  if (p === '') return true;
+  return pathname === p || pathname.startsWith(`${p}/`);
 }
 
 /** Filter URLs to those under a given path prefix on the same host as baseUrl. */

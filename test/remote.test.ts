@@ -184,7 +184,57 @@ describe('RemoteFumadocsSource', () => {
     await expect(src.getLlmsTxt()).rejects.toThrow(/cross-origin/i);
   });
 
-  it('does not eval() a remote page frontmatter tagged with a javascript engine', async () => {
+  it('refuses a same-host redirect that downgrades from https to http', async () => {
+    // Regression: comparing `.host` (hostname[:port], no protocol) instead
+    // of `.origin` would let an https base redirect to the identical
+    // hostname over plain http, silently leaking the Authorization header
+    // in cleartext. `.host` treats these as equal; `.origin` does not.
+    const src = new RemoteFumadocsSource({
+      baseUrl,
+      fetchImpl: makeFetch({
+        'https://example.com/llms.txt': {
+          status: 302,
+          body: '',
+          headers: { location: 'http://example.com/llms.txt' },
+        },
+      }),
+    });
+    await expect(src.getLlmsTxt()).rejects.toThrow(/cross-origin/i);
+  });
+
+  it('enforces maxResponseBytes and rejects an oversized response body', async () => {
+    // Regression: an unbounded/lied-about Content-Length (or chunked body)
+    // from a compromised or malicious upstream could exhaust memory.
+    // readCappedText() streams the body and aborts once the configured
+    // cap is exceeded, regardless of what Content-Length claims.
+    const bigBody = 'x'.repeat(1000);
+    const src = new RemoteFumadocsSource({
+      baseUrl,
+      maxResponseBytes: 100,
+      fetchImpl: makeFetch({
+        'https://example.com/llms.txt': { body: bigBody, contentType: 'text/plain' },
+      }),
+    });
+    await expect(src.getLlmsTxt()).rejects.toThrow(/exceeded/i);
+  });
+
+  it('allows a response body under the maxResponseBytes cap', async () => {
+    const src = new RemoteFumadocsSource({
+      baseUrl,
+      maxResponseBytes: 100,
+      fetchImpl: makeFetch({
+        'https://example.com/llms.txt': { body: 'small body', contentType: 'text/plain' },
+      }),
+    });
+    expect(await src.getLlmsTxt()).toBe('small body');
+  });
+
+  it('does not eval() a remote page frontmatter tagged with a javascript engine, and falls back to HTML scraping', async () => {
+    // Malformed/dangerous frontmatter on the markdown-flavored URL must not
+    // crash the whole page fetch - it should fall through to the next
+    // candidate (or the HTML scrape below), the same way a plain YAML
+    // syntax error would. The critical property is that the eval never
+    // runs, not that the call rejects.
     const src = new RemoteFumadocsSource({
       baseUrl,
       fetchImpl: makeFetch({
@@ -192,10 +242,15 @@ describe('RemoteFumadocsSource', () => {
           body: `---javascript\nglobalThis.__fumasignal_pwned_remote = true;\n---\n\nbody`,
           contentType: 'text/markdown',
         },
+        'https://example.com/docs/evil': {
+          body: '<html><body><article><h1>Evil</h1><p>safe html fallback</p></article></body></html>',
+          contentType: 'text/html',
+        },
       }),
     });
     try {
-      await expect(src.getPage('/docs/evil')).rejects.toThrow(/disabled for security reasons/i);
+      const page = await src.getPage('/docs/evil');
+      expect(page.markdown).toContain('safe html fallback');
       expect((globalThis as Record<string, unknown>).__fumasignal_pwned_remote).toBeUndefined();
     } finally {
       delete (globalThis as Record<string, unknown>).__fumasignal_pwned_remote;

@@ -32,6 +32,12 @@ export interface RemoteSourceOptions {
   fetchTimeoutMs?: number;
   /** Max same-origin redirects to follow before giving up. Default 5. */
   maxRedirects?: number;
+  /**
+   * Max bytes to read from any single response body before aborting.
+   * Protects against OOM from a huge/malicious/misbehaving response (a lied
+   * Content-Length or an unbounded chunked body). Default 10MB.
+   */
+  maxResponseBytes?: number;
 }
 
 const DEFAULT_UA = 'fumasignal-mcp/0.1 (+https://github.com/Manaiakalani/fumasignal-mcp)';
@@ -56,6 +62,7 @@ export class RemoteFumadocsSource implements FumadocsSource {
   private ua: string;
   private fetchTimeoutMs: number;
   private maxRedirects: number;
+  private maxResponseBytes: number;
   private pageCache: TtlCache<string, PageContent>;
   private listCache: TtlCache<'all', PageSummary[]>;
   private llmsCache: TtlCache<string, string | null>;
@@ -73,6 +80,7 @@ export class RemoteFumadocsSource implements FumadocsSource {
     this.ua = opts.userAgent ?? DEFAULT_UA;
     this.fetchTimeoutMs = opts.fetchTimeoutMs ?? 15_000;
     this.maxRedirects = opts.maxRedirects ?? 5;
+    this.maxResponseBytes = opts.maxResponseBytes ?? 10_000_000;
     const ttl = opts.cacheTtlMs ?? 5 * 60 * 1000;
     this.pageCache = new TtlCache(ttl);
     this.listCache = new TtlCache(ttl);
@@ -98,7 +106,7 @@ export class RemoteFumadocsSource implements FumadocsSource {
     } else if (ref.startsWith('/')) {
       // NOTE: this also covers protocol-relative refs like "//evil.com/x" -
       // new URL('//evil.com/x', base) resolves to a DIFFERENT host, so the
-      // host check below (applied uniformly to every branch) is required
+      // origin check below (applied uniformly to every branch) is required
       // to catch that case; it must not be limited to the absolute-URL arm.
       u = new URL(ref, this.base);
     } else {
@@ -106,7 +114,7 @@ export class RemoteFumadocsSource implements FumadocsSource {
       const slugPath = `${this.docsPrefix.replace(/\/+$/, '')}/${ref.replace(/^\/+/, '')}`;
       u = new URL(slugPath, this.base);
     }
-    if (u.host !== this.base.host) {
+    if (u.origin !== this.base.origin) {
       throw new SourceError(
         `Refusing to fetch cross-origin URL: ${u.origin} (server is bound to ${this.base.origin})`,
       );
@@ -116,9 +124,14 @@ export class RemoteFumadocsSource implements FumadocsSource {
 
   /**
    * Fetch `url`, enforcing a timeout and manually validating same-origin on
-   * every redirect hop. `fetch` follows redirects by default, which would
-   * otherwise let a same-origin (or attacker-influenced) URL redirect to an
-   * arbitrary host while still attaching our Authorization/UA headers.
+   * the initial URL *and* on every redirect hop. `fetch` follows redirects
+   * by default, which would otherwise let a same-origin (or
+   * attacker-influenced) URL redirect to an arbitrary host - or downgrade
+   * from https to http on the *same* host - while still attaching our
+   * Authorization/UA headers. Comparing `.origin` (not `.host`) is
+   * important: two URLs can share a host but differ in protocol, and a
+   * host-only check would let an https->http redirect through, leaking the
+   * Authorization header in plaintext.
    */
   private async fetchSameOrigin(
     url: URL,
@@ -126,6 +139,11 @@ export class RemoteFumadocsSource implements FumadocsSource {
   ): Promise<Response> {
     let current = url;
     for (let hop = 0; hop <= this.maxRedirects; hop++) {
+      if (current.origin !== this.base.origin) {
+        throw new SourceError(
+          `Refusing to fetch cross-origin URL: ${current.origin} (server is bound to ${this.base.origin})`,
+        );
+      }
       const res = await this.fetchImpl(current.toString(), {
         headers: init.headers,
         redirect: 'manual',
@@ -140,17 +158,45 @@ export class RemoteFumadocsSource implements FumadocsSource {
         } catch {
           return res;
         }
-        if (next.host !== this.base.host) {
-          throw new SourceError(
-            `Refusing to follow cross-origin redirect: ${current} -> ${next.origin} (server is bound to ${this.base.origin})`,
-          );
-        }
         current = next;
         continue;
       }
       return res;
     }
     throw new SourceError(`Too many redirects while fetching ${url}`);
+  }
+
+  /**
+   * Read a response body as text, aborting once it exceeds
+   * `this.maxResponseBytes`. `res.text()` buffers the *entire* body
+   * regardless of `Content-Length` (which a server can lie about, or omit
+   * entirely for chunked responses), so a huge or malicious response would
+   * otherwise be read fully into memory before we get a chance to reject
+   * it. Reading the stream incrementally lets us bail out early instead.
+   */
+  private async readCappedText(res: Response): Promise<string> {
+    const body = res.body;
+    if (!body) return '';
+    const reader = body.getReader();
+    const chunks: Uint8Array[] = [];
+    let total = 0;
+    try {
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        if (!value) continue;
+        total += value.byteLength;
+        if (total > this.maxResponseBytes) {
+          throw new SourceError(
+            `Response body exceeded the ${this.maxResponseBytes}-byte limit while fetching ${res.url}`,
+          );
+        }
+        chunks.push(value);
+      }
+    } finally {
+      await reader.cancel().catch(() => {});
+    }
+    return Buffer.concat(chunks).toString('utf8');
   }
 
   async search(opts: SearchOptions): Promise<SearchHit[]> {
@@ -164,7 +210,7 @@ export class RemoteFumadocsSource implements FumadocsSource {
         `Search request failed: ${res.status} ${res.statusText} (${url})`,
       );
     }
-    const data = (await res.json()) as unknown;
+    const data = JSON.parse(await this.readCappedText(res)) as unknown;
     const hits = parseSearchResponse(data);
     const limit = opts.limit ?? 10;
     return hits.slice(0, limit);
@@ -181,7 +227,7 @@ export class RemoteFumadocsSource implements FumadocsSource {
           `Failed to fetch sitemap.xml: ${res.status} ${res.statusText}`,
         );
       }
-      const xml = await res.text();
+      const xml = await this.readCappedText(res);
       const urls = parseSitemap(xml);
       const filtered = filterToDocs(urls, this.base.toString(), this.docsPrefix);
       all = filtered.map<PageSummary>(({ url: _url, path }) => ({
@@ -253,7 +299,7 @@ export class RemoteFumadocsSource implements FumadocsSource {
     if (!res.ok) {
       throw new SourceError(`Failed to fetch ${path}: ${res.status} ${res.statusText}`);
     }
-    const text = await res.text();
+    const text = await this.readCappedText(res);
     this.llmsCache.set(path, text);
     return text;
   }
@@ -273,9 +319,16 @@ export class RemoteFumadocsSource implements FumadocsSource {
       if (res.ok) {
         const ct = res.headers.get('content-type') ?? '';
         if (ct.includes('markdown') || ct.includes('text/plain')) {
-          const text = await res.text();
-          const { content, data } = parseFrontmatter(text);
-          return { markdown: content, meta: data };
+          const text = await this.readCappedText(res);
+          try {
+            const { content, data } = parseFrontmatter(text);
+            return { markdown: content, meta: data };
+          } catch (err) {
+            // Malformed frontmatter on the markdown-flavored URL shouldn't
+            // fail the whole page - fall through to the next candidate (or
+            // the HTML scrape below) instead of throwing.
+            logger.warn({ err, url: candidate.toString() }, 'remote: failed to parse frontmatter, falling back');
+          }
         }
       }
     }
@@ -289,7 +342,7 @@ export class RemoteFumadocsSource implements FumadocsSource {
         `Failed to fetch ${target.pathname}: ${res.status} ${res.statusText}`,
       );
     }
-    const html = await res.text();
+    const html = await this.readCappedText(res);
     const meta = extractHtmlMeta(html);
     const markdown = htmlToMarkdown(html);
     return { markdown, meta };
