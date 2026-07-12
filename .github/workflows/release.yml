@@ -17,10 +17,14 @@ jobs:
   release:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      # SHA-pinned rather than the "v4" tag - see ci.yml for the rationale
+      # shared by both workflows, and the changesets/action step below for
+      # why this release job in particular (write + publish credentials)
+      # is especially sensitive to a re-tagged action.
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
           fetch-depth: 0
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: 22
           cache: npm
@@ -29,7 +33,7 @@ jobs:
       - run: npm run build
       - name: Create release PR or publish
         # Pinned to a commit SHA rather than the "v1" ref: unlike
-        # actions/* (GitHub's own namespace), "v1" here is a mutable
+        # actions/* above (GitHub's own namespace), "v1" here is a mutable
         # branch (not even a tag) in a third-party repo, and this step
         # runs with contents/pull-requests write plus GITHUB_TOKEN and
         # NPM_TOKEN - a compromised "v1" would get arbitrary code

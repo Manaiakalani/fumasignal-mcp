@@ -10,6 +10,8 @@ import {
   isSitemapIndex,
   parseSitemap,
 } from '../lib/sitemap.js';
+import { assertPublicResolution, type DnsLookupFn } from '../lib/net-safety.js';
+import { lookup as dnsLookupPromise } from 'node:dns/promises';
 import {
   type FumadocsSource,
   type PageContent,
@@ -61,9 +63,29 @@ export interface RemoteSourceOptions {
    * bounding the aggregate. Default 8.
    */
   maxConcurrentFetches?: number;
+  /**
+   * Override DNS resolution (used by tests, or to plug in a custom
+   * resolver). Must return every address the hostname resolves to, not
+   * just the first - see `assertPublicResolution()`'s doc comment.
+   * Defaults to `dns.promises.lookup(hostname, { all: true })`.
+   */
+  dnsLookup?: DnsLookupFn;
 }
 
 const DEFAULT_UA = 'fumasignal-mcp/0.1 (+https://github.com/Manaiakalani/fumasignal-mcp)';
+
+/**
+ * Real DNS resolution backing `assertPublicResolution()` by default (see
+ * `net-safety.ts`). `{ all: true }` returns every address the hostname
+ * resolves to (a name can have multiple A/AAAA records) - checking only
+ * the first would miss a private address hiding among otherwise-public
+ * ones. `verbatim: true` returns them in the order the resolver gave them
+ * rather than Node's default address-family reordering, though this
+ * check doesn't depend on ordering either way.
+ */
+function defaultDnsLookup(hostname: string): Promise<{ address: string }[]> {
+  return dnsLookupPromise(hostname, { all: true, verbatim: true });
+}
 
 /**
  * Bounds for recursive sitemap-index traversal (see `fetchSitemapUrls()`).
@@ -94,6 +116,37 @@ const MAX_SITEMAP_FETCHES = 200;
  * headroom, not a functional restriction.
  */
 const MAX_SITEMAP_URLS = 200_000;
+
+/**
+ * Hard cap on the total *bytes* of `<loc>` URL text accumulated across
+ * every sitemap fetched while resolving a (possibly multi-level) sitemap
+ * index - independent of, and in addition to, `MAX_SITEMAP_URLS`'s cap on
+ * URL *count*.
+ *
+ * `MAX_SITEMAP_URLS` alone is not sufficient: `<loc>([^<]*)</loc>` (see
+ * `parseSitemap()`) has no per-URL length limit, so a single leaf sitemap
+ * response, packed with abnormally long URLs instead of many short ones,
+ * can still exhaust most of its `maxResponseBytes` (10MB by default) as
+ * just a handful of entries. Empirically confirmed: packing every leaf
+ * sitemap with ~11KB URLs (instead of realistic ~30-150 byte paths) lets
+ * the crawl exhaust the entire `MAX_SITEMAP_FETCHES` (200) budget while
+ * only accumulating ~181k of the 200k URL-count budget - i.e. the count
+ * cap never engages - yet retains ~2GB of URL text, enough to crash a
+ * memory-constrained process. Bounding accumulated bytes here, the same
+ * way `MAX_SITEMAP_URLS` bounds accumulated count, closes that gap
+ * regardless of how the fan-out is shaped between "many short URLs" and
+ * "fewer long URLs". No real documentation site remotely approaches this
+ * limit (200k URLs at this budget still allows an average of 100 bytes
+ * each), so it's generous headroom, not a functional restriction.
+ *
+ * Measured via `.length` (UTF-16 code units), not actual UTF-8 byte
+ * count. Sitemap `<loc>` values are URLs, which per the URL spec are
+ * restricted to ASCII (non-ASCII characters must be percent-encoded),
+ * so `.length` and UTF-8 byte length coincide for well-formed input;
+ * this is a defense-in-depth memory cap, not a cryptographic guarantee,
+ * so the rare non-conformant input isn't worth a UTF-8-exact encode.
+ */
+const MAX_SITEMAP_URL_BYTES = 20_000_000;
 
 /**
  * Cancel a response body we're intentionally not reading, so the
@@ -138,6 +191,7 @@ export class RemoteFumadocsSource implements FumadocsSource {
   // `Semaphore`'s doc comment) - `pagePending`/etc. above only collapse
   // duplicate requests for the *same* key.
   private fetchSemaphore: Semaphore;
+  private dnsLookup: DnsLookupFn;
 
   constructor(opts: RemoteSourceOptions) {
     this.base = new URL(opts.baseUrl);
@@ -155,6 +209,7 @@ export class RemoteFumadocsSource implements FumadocsSource {
     this.maxResponseBytes = opts.maxResponseBytes ?? 10_000_000;
     const maxPageCacheBytes = opts.maxPageCacheBytes ?? 50_000_000;
     this.fetchSemaphore = new Semaphore(opts.maxConcurrentFetches ?? 8);
+    this.dnsLookup = opts.dnsLookup ?? defaultDnsLookup;
     const ttl = opts.cacheTtlMs ?? 5 * 60 * 1000;
     this.pageCache = new TtlCache(ttl, 500, {
       maxTotalSize: maxPageCacheBytes,
@@ -264,6 +319,11 @@ export class RemoteFumadocsSource implements FumadocsSource {
           `Refusing to fetch cross-origin URL: ${current.origin} (server is bound to ${this.base.origin})`,
         );
       }
+      try {
+        await assertPublicResolution(current.hostname, this.dnsLookup);
+      } catch (err) {
+        throw new SourceError(err instanceof Error ? err.message : String(err));
+      }
       if (hop > 0 && init.pathPrefix !== undefined) {
         // Same decode-then-normalize treatment as `resolveRef()` - a
         // redirect Location header is just as capable of carrying an
@@ -368,6 +428,7 @@ export class RemoteFumadocsSource implements FumadocsSource {
             fetches: 0,
             visited: new Set(),
             totalUrls: 0,
+            totalUrlBytes: 0,
           }),
         );
         const filtered = filterToDocs(urls, this.base.toString(), this.docsPrefix);
@@ -414,20 +475,42 @@ export class RemoteFumadocsSource implements FumadocsSource {
    * budget's limit - could transiently balloon memory well beyond what
    * the *distinct* URL count would ever justify.
    *
-   * `state.totalUrls` enforces `MAX_SITEMAP_URLS`: applied where `locs`
-   * is actually produced (both the leaf-sitemap return and the
-   * fetch-count-exhausted early return below) so the cap holds no matter
-   * how the fan-out is shaped - one huge leaf sitemap, or many smaller
-   * ones spread across the fetch budget.
+   * `state.totalUrls` enforces `MAX_SITEMAP_URLS`, and `state.totalUrlBytes`
+   * independently enforces `MAX_SITEMAP_URL_BYTES`, against *every* sitemap
+   * URL this function ever remembers in `state.visited` - not just the
+   * page URLs a leaf sitemap ultimately returns. Without charging the
+   * *index* `<loc>` pointers too, `state.visited` itself becomes an
+   * unbounded-bytes accumulator: it's bounded to roughly
+   * `MAX_SITEMAP_FETCHES` (200) *entries*, but nothing capped how long
+   * each entry's URL string could be (only `maxResponseBytes`, 10MB by
+   * default, per response), so a sitemap index whose own `<loc>` pointers
+   * are themselves abnormally long could retain ~2GB in `visited` alone,
+   * independent of `takeWithinUrlBudget()`'s page-URL accounting below.
+   * Charging here - before `state.visited.add()`, keyed off the same
+   * string that gets stored - means the byte/count caps hold no matter
+   * how the fan-out is shaped: one huge leaf sitemap, many smaller ones,
+   * an index with abnormally long pointer URLs, or any mix, and
+   * regardless of whether that shape favors many short URLs or fewer
+   * abnormally long ones.
    */
   private async fetchSitemapUrls(
     url: URL,
     depth: number,
-    state: { fetches: number; visited: Set<string>; totalUrls: number },
+    state: { fetches: number; visited: Set<string>; totalUrls: number; totalUrlBytes: number },
   ): Promise<string[]> {
     const key = url.toString();
     if (state.visited.has(key)) return [];
+    // Check `+ key.length >` (not `>=` against the pre-add total) for the
+    // same reason as `takeWithinUrlBudget()` below: otherwise a single
+    // abnormally long sitemap URL could push the total past the budget by
+    // up to that URL's own length instead of the budget being a true
+    // ceiling.
+    if (state.totalUrls >= MAX_SITEMAP_URLS || state.totalUrlBytes + key.length > MAX_SITEMAP_URL_BYTES) {
+      return [];
+    }
     state.visited.add(key);
+    state.totalUrls++;
+    state.totalUrlBytes += key.length;
     if (state.fetches >= MAX_SITEMAP_FETCHES) return [];
     state.fetches++;
     const res = await this.fetchSameOrigin(url, { headers: this.headers() });
@@ -442,7 +525,12 @@ export class RemoteFumadocsSource implements FumadocsSource {
     }
     const pages: string[] = [];
     for (const loc of locs) {
-      if (state.fetches >= MAX_SITEMAP_FETCHES || state.totalUrls >= MAX_SITEMAP_URLS) break;
+      if (
+        state.fetches >= MAX_SITEMAP_FETCHES ||
+        state.totalUrls >= MAX_SITEMAP_URLS ||
+        state.totalUrlBytes >= MAX_SITEMAP_URL_BYTES
+      )
+        break;
       let subUrl: URL;
       try {
         subUrl = new URL(loc);
@@ -461,17 +549,35 @@ export class RemoteFumadocsSource implements FumadocsSource {
 
   /**
    * Truncate `locs` (URLs from a single leaf sitemap) to whatever remains
-   * of the shared `MAX_SITEMAP_URLS` budget, advancing `state.totalUrls`
-   * accordingly. See `MAX_SITEMAP_URLS`'s doc comment for why this needs
-   * to be enforced here rather than (or in addition to) at the cache
-   * layer.
+   * of the shared `MAX_SITEMAP_URLS` *and* `MAX_SITEMAP_URL_BYTES` budgets,
+   * advancing `state.totalUrls`/`state.totalUrlBytes` accordingly. Walks
+   * one URL at a time (rather than a single count-based `.slice()`) so an
+   * abnormally long URL is caught by the byte budget even while the count
+   * budget still has headroom. See `MAX_SITEMAP_URLS`'s and
+   * `MAX_SITEMAP_URL_BYTES`'s doc comments for why this needs to be
+   * enforced here rather than (or in addition to) at the cache layer.
+   *
+   * Checks `totalUrlBytes + loc.length` against the budget *before*
+   * adding (rather than checking the running total alone, then adding) -
+   * otherwise a single abnormally long URL could push the total past the
+   * budget by up to that URL's own length instead of the budget being a
+   * true ceiling. The count budget doesn't need the equivalent check
+   * since it only ever advances by exactly 1 per URL, so it can't
+   * overshoot past its cap in the first place.
    */
-  private takeWithinUrlBudget(locs: string[], state: { totalUrls: number }): string[] {
-    const remaining = MAX_SITEMAP_URLS - state.totalUrls;
-    if (remaining <= 0) return [];
-    const slice = locs.length > remaining ? locs.slice(0, remaining) : locs;
-    state.totalUrls += slice.length;
-    return slice;
+  private takeWithinUrlBudget(
+    locs: string[],
+    state: { totalUrls: number; totalUrlBytes: number },
+  ): string[] {
+    const out: string[] = [];
+    for (const loc of locs) {
+      if (state.totalUrls >= MAX_SITEMAP_URLS) break;
+      if (state.totalUrlBytes + loc.length > MAX_SITEMAP_URL_BYTES) break;
+      out.push(loc);
+      state.totalUrls++;
+      state.totalUrlBytes += loc.length;
+    }
+    return out;
   }
 
   async getPage(ref: string): Promise<PageContent> {
