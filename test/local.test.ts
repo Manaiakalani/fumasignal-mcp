@@ -199,4 +199,51 @@ describe('LocalFumadocsSource security fixes', () => {
       }
     },
   );
+
+  it.skipIf(process.platform === 'win32')(
+    'refuses to index a contentDir that is itself a symlink escaping the project root',
+    async () => {
+      // Regression: fs.stat() (used to validate contentDir before walking)
+      // follows symlinks, and fs.readdir() on a symlinked directory
+      // transparently follows it too. walk()'s own symlink guard only
+      // protects entries found *during* the walk, not the starting
+      // directory - so a malicious cloned docs repo that replaces
+      // content/docs with a symlink to an arbitrary host directory could
+      // otherwise get that directory's .md/.mdx files indexed and served.
+      const dir = await mkdtemp(path.join(os.tmpdir(), 'fumasignal-local-escape-'));
+      const outside = await mkdtemp(path.join(os.tmpdir(), 'fumasignal-outside-'));
+      try {
+        await writeFile(
+          path.join(outside, 'leaked.md'),
+          '# Leaked\n\nThis file lives outside the intended project root.',
+        );
+        await mkdir(path.join(dir, 'content'), { recursive: true });
+        await symlink(outside, path.join(dir, 'content', 'docs'), 'dir');
+        const src = new LocalFumadocsSource({ rootDir: dir });
+        await expect(src.listPages()).rejects.toThrow(/outside the project root/i);
+      } finally {
+        await rm(dir, { recursive: true, force: true });
+        await rm(outside, { recursive: true, force: true });
+      }
+    },
+  );
+
+  it('allows an explicit absolute --content-dir outside rootDir (not an escape - operator-configured)', async () => {
+    // The symlink-escape guard above only applies when contentDir is
+    // derived by joining rootDir with a relative path (the default). An
+    // explicit absolute --content-dir is intentionally allowed to point
+    // anywhere, since it's supplied directly by whoever runs the server,
+    // not discovered by walking an untrusted repo.
+    const outside = await mkdtemp(path.join(os.tmpdir(), 'fumasignal-explicit-'));
+    const dir = await mkdtemp(path.join(os.tmpdir(), 'fumasignal-root-'));
+    try {
+      await writeFile(path.join(outside, 'page.md'), '# Explicit\n\nallowed by explicit config');
+      const src = new LocalFumadocsSource({ rootDir: dir, contentDir: outside });
+      const pages = await src.listPages();
+      expect(pages.map((p) => p.url)).toEqual(['/docs/page']);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+      await rm(outside, { recursive: true, force: true });
+    }
+  });
 });

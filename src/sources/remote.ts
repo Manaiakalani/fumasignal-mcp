@@ -3,7 +3,7 @@ import { TtlCache } from '../lib/cache.js';
 import { htmlToMarkdown } from '../lib/html-to-md.js';
 import { extractSection, extractToc } from '../lib/markdown.js';
 import { parseFrontmatter, asNonEmptyString } from '../lib/frontmatter.js';
-import { filterToDocs, hasPathPrefix, parseSitemap } from '../lib/sitemap.js';
+import { filterToDocs, hasPathPrefix, isSitemapIndex, parseSitemap } from '../lib/sitemap.js';
 import {
   type FumadocsSource,
   type PageContent,
@@ -38,9 +38,35 @@ export interface RemoteSourceOptions {
    * Content-Length or an unbounded chunked body). Default 10MB.
    */
   maxResponseBytes?: number;
+  /**
+   * Soft cap on the *combined* size (approximated by markdown length) of
+   * all pages held in the page cache at once. `maxResponseBytes` alone
+   * only bounds a single response; without this, the cache's `maxEntries`
+   * (500) distinct large pages could still accumulate to `maxEntries *
+   * maxResponseBytes` (~5GB at the defaults). Default 50MB.
+   */
+  maxPageCacheBytes?: number;
 }
 
 const DEFAULT_UA = 'fumasignal-mcp/0.1 (+https://github.com/Manaiakalani/fumasignal-mcp)';
+
+/**
+ * Bounds for recursive sitemap-index traversal (see `fetchSitemapUrls()`).
+ * A sitemap index's <loc> entries point to other sitemaps rather than
+ * pages; a malicious or misconfigured site could otherwise cause
+ * unbounded fetching via deep nesting or wide fan-out.
+ */
+const MAX_SITEMAP_INDEX_DEPTH = 5;
+const MAX_SITEMAP_FETCHES = 200;
+
+/**
+ * Cancel a response body we're intentionally not reading, so the
+ * underlying connection can be released promptly instead of idling until
+ * it times out.
+ */
+async function discardBody(res: Response): Promise<void> {
+  await res.body?.cancel().catch(() => {});
+}
 
 /**
  * A FumadocsSource that talks to a deployed Fumadocs site over HTTP.
@@ -81,8 +107,12 @@ export class RemoteFumadocsSource implements FumadocsSource {
     this.fetchTimeoutMs = opts.fetchTimeoutMs ?? 15_000;
     this.maxRedirects = opts.maxRedirects ?? 5;
     this.maxResponseBytes = opts.maxResponseBytes ?? 10_000_000;
+    const maxPageCacheBytes = opts.maxPageCacheBytes ?? 50_000_000;
     const ttl = opts.cacheTtlMs ?? 5 * 60 * 1000;
-    this.pageCache = new TtlCache(ttl);
+    this.pageCache = new TtlCache(ttl, 500, {
+      maxTotalSize: maxPageCacheBytes,
+      sizeOf: (page) => page.markdown.length,
+    });
     this.listCache = new TtlCache(ttl);
     this.llmsCache = new TtlCache(ttl);
     this.label = `remote:${this.base.origin}`;
@@ -119,6 +149,19 @@ export class RemoteFumadocsSource implements FumadocsSource {
         `Refusing to fetch cross-origin URL: ${u.origin} (server is bound to ${this.base.origin})`,
       );
     }
+    // Same-origin is necessary but not sufficient as an authorization
+    // boundary: `ref` is ultimately caller-supplied (an MCP tool argument,
+    // not just a value sourced from our own listPages()/search()), and the
+    // configured origin may host more than docs (an internal API, admin
+    // routes, etc). If an Authorization header is configured, it would be
+    // attached to ANY same-origin fetch - so without this check,
+    // getPage("/api/private") would happily fetch and return whatever
+    // lives at that same-origin path. Restrict refs to docsPrefix.
+    if (!hasPathPrefix(u.pathname, this.docsPrefix)) {
+      throw new SourceError(
+        `Refusing to fetch a page outside the configured docs prefix "${this.docsPrefix}": ${u.pathname}`,
+      );
+    }
     return u;
   }
 
@@ -132,16 +175,34 @@ export class RemoteFumadocsSource implements FumadocsSource {
    * important: two URLs can share a host but differ in protocol, and a
    * host-only check would let an https->http redirect through, leaking the
    * Authorization header in plaintext.
+   *
+   * `init.pathPrefix`, when given, additionally re-checks every *redirect*
+   * hop (not the initial URL - that's the caller's own already-validated
+   * `target`, possibly with a fixed suffix like ".md" appended by
+   * `buildMarkdownCandidates()`, which `hasPathPrefix()` would incorrectly
+   * reject for a target exactly at the prefix root e.g. "/docs" + ".md" =
+   * "/docs.md") against that path prefix via `hasPathPrefix()`.
+   * Page-fetching call sites pass `docsPrefix` here: same-origin alone
+   * isn't a sufficient authorization boundary for page content (see
+   * `resolveRef()`), and without this, a same-origin redirect could still
+   * carry a page-fetch outside docsPrefix even though the original ref was
+   * validated. Sitemap/search/llms.txt call sites omit it, since those
+   * legitimately live outside docsPrefix.
    */
   private async fetchSameOrigin(
     url: URL,
-    init: { headers: Record<string, string> },
+    init: { headers: Record<string, string>; pathPrefix?: string },
   ): Promise<Response> {
     let current = url;
     for (let hop = 0; hop <= this.maxRedirects; hop++) {
       if (current.origin !== this.base.origin) {
         throw new SourceError(
           `Refusing to fetch cross-origin URL: ${current.origin} (server is bound to ${this.base.origin})`,
+        );
+      }
+      if (hop > 0 && init.pathPrefix !== undefined && !hasPathPrefix(current.pathname, init.pathPrefix)) {
+        throw new SourceError(
+          `Refusing to follow a redirect outside the configured docs prefix "${init.pathPrefix}": ${current.pathname}`,
         );
       }
       const res = await this.fetchImpl(current.toString(), {
@@ -158,6 +219,7 @@ export class RemoteFumadocsSource implements FumadocsSource {
         } catch {
           return res;
         }
+        await discardBody(res);
         current = next;
         continue;
       }
@@ -206,6 +268,7 @@ export class RemoteFumadocsSource implements FumadocsSource {
     if (opts.locale) url.searchParams.set('locale', opts.locale);
     const res = await this.fetchSameOrigin(url, { headers: this.headers() });
     if (!res.ok) {
+      await discardBody(res);
       throw new SourceError(
         `Search request failed: ${res.status} ${res.statusText} (${url})`,
       );
@@ -220,15 +283,9 @@ export class RemoteFumadocsSource implements FumadocsSource {
     const cached = this.listCache.get('all');
     let all = cached;
     if (!all) {
-      const sitemapUrl = new URL('/sitemap.xml', this.base);
-      const res = await this.fetchSameOrigin(sitemapUrl, { headers: this.headers() });
-      if (!res.ok) {
-        throw new SourceError(
-          `Failed to fetch sitemap.xml: ${res.status} ${res.statusText}`,
-        );
-      }
-      const xml = await this.readCappedText(res);
-      const urls = parseSitemap(xml);
+      const urls = await this.fetchSitemapUrls(new URL('/sitemap.xml', this.base), 0, {
+        fetches: 0,
+      });
       const filtered = filterToDocs(urls, this.base.toString(), this.docsPrefix);
       all = filtered.map<PageSummary>(({ url: _url, path }) => ({
         id: path,
@@ -241,6 +298,53 @@ export class RemoteFumadocsSource implements FumadocsSource {
     }
     if (!prefix) return all;
     return all.filter((p) => hasPathPrefix(p.url, prefix));
+  }
+
+  /**
+   * Fetch a sitemap and return the page URLs it contains. A sitemap is
+   * either a page-level `<urlset>` (the common case) or a `<sitemapindex>`
+   * whose `<loc>` entries point to OTHER sitemaps rather than pages -
+   * common for large/sharded sites, and previously unhandled (an index
+   * would filter down to zero pages since its <loc> entries don't match
+   * docsPrefix). Recurse into index entries, bounded by both a depth
+   * limit and a shared total-fetch budget (via `state`) so a malicious or
+   * misconfigured site can't trigger unbounded fetching through deep
+   * nesting or wide fan-out.
+   */
+  private async fetchSitemapUrls(
+    url: URL,
+    depth: number,
+    state: { fetches: number },
+  ): Promise<string[]> {
+    if (state.fetches >= MAX_SITEMAP_FETCHES) return [];
+    state.fetches++;
+    const res = await this.fetchSameOrigin(url, { headers: this.headers() });
+    if (!res.ok) {
+      await discardBody(res);
+      throw new SourceError(`Failed to fetch ${url.pathname}: ${res.status} ${res.statusText}`);
+    }
+    const xml = await this.readCappedText(res);
+    const locs = parseSitemap(xml);
+    if (!isSitemapIndex(xml) || depth >= MAX_SITEMAP_INDEX_DEPTH) {
+      return locs;
+    }
+    const pages: string[] = [];
+    for (const loc of locs) {
+      if (state.fetches >= MAX_SITEMAP_FETCHES) break;
+      let subUrl: URL;
+      try {
+        subUrl = new URL(loc);
+      } catch {
+        continue;
+      }
+      if (subUrl.origin !== this.base.origin) continue;
+      try {
+        pages.push(...(await this.fetchSitemapUrls(subUrl, depth + 1, state)));
+      } catch (err) {
+        logger.warn({ err, url: loc }, 'remote: failed to fetch nested sitemap, skipping');
+      }
+    }
+    return pages;
   }
 
   async getPage(ref: string): Promise<PageContent> {
@@ -298,10 +402,12 @@ export class RemoteFumadocsSource implements FumadocsSource {
     const url = new URL(path, this.base);
     const res = await this.fetchSameOrigin(url, { headers: this.headers() });
     if (res.status === 404) {
+      await discardBody(res);
       this.llmsCache.set(path, null);
       return null;
     }
     if (!res.ok) {
+      await discardBody(res);
       throw new SourceError(`Failed to fetch ${path}: ${res.status} ${res.statusText}`);
     }
     const text = await this.readCappedText(res);
@@ -320,6 +426,7 @@ export class RemoteFumadocsSource implements FumadocsSource {
     for (const candidate of candidates) {
       const res = await this.fetchSameOrigin(candidate, {
         headers: this.headers({ Accept: 'text/markdown, text/plain;q=0.9' }),
+        pathPrefix: this.docsPrefix,
       });
       if (res.ok) {
         const ct = res.headers.get('content-type') ?? '';
@@ -334,15 +441,26 @@ export class RemoteFumadocsSource implements FumadocsSource {
             // the HTML scrape below) instead of throwing.
             logger.warn({ err, url: candidate.toString() }, 'remote: failed to parse frontmatter, falling back');
           }
+          continue;
         }
       }
+      // Body intentionally unread (wrong content-type, or a non-2xx
+      // candidate - very common, since usually only one of the several
+      // markdown-flavored URLs actually exists per page) - cancel it so
+      // the underlying connection is released promptly instead of idling.
+      await discardBody(res);
     }
     // Fallback: HTML scrape
-    const res = await this.fetchSameOrigin(target, { headers: this.headers() });
+    const res = await this.fetchSameOrigin(target, {
+      headers: this.headers(),
+      pathPrefix: this.docsPrefix,
+    });
     if (res.status === 404) {
+      await discardBody(res);
       throw new NotFoundError(`Page not found: ${target.pathname}`);
     }
     if (!res.ok) {
+      await discardBody(res);
       throw new SourceError(
         `Failed to fetch ${target.pathname}: ${res.status} ${res.statusText}`,
       );

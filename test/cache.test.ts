@@ -66,6 +66,60 @@ describe('TtlCache', () => {
     expect(() => new TtlCache(0)).not.toThrow();
   });
 
+  it('a ttlMs of 0 actually expires immediately, not just on construction', () => {
+    // Regression: `hit.expiresAt < Date.now()` (strict less-than) meant a
+    // ttlMs=0 entry read back in the *same* millisecond as it was set was
+    // still treated as fresh, contradicting "immediate expiry". Fake
+    // timers pin Date.now() so get() runs at the exact same instant as
+    // set() deterministically, exercising the boundary without relying on
+    // real-clock timing luck.
+    vi.useFakeTimers();
+    const cache = new TtlCache<string, number>(0);
+    cache.set('a', 1);
+    expect(cache.get('a')).toBeUndefined();
+  });
+
+  it('supports a total-size budget that evicts LRU entries regardless of entry count', () => {
+    // Regression: maxEntries alone still allows maxEntries * (per-entry
+    // size) to accumulate. A byte-budget-aware cache (used for
+    // RemoteFumadocsSource's pageCache) must evict once the *combined*
+    // size of cached values would exceed the budget, even with room left
+    // under maxEntries.
+    const cache = new TtlCache<string, string>(100_000, 500, {
+      maxTotalSize: 25,
+      sizeOf: (v) => v.length,
+    });
+    cache.set('a', 'x'.repeat(10)); // total 10
+    cache.set('b', 'x'.repeat(10)); // total 20
+    cache.set('c', 'x'.repeat(10)); // would be 30 > 25 -> evicts 'a'
+    expect(cache.get('a')).toBeUndefined();
+    expect(cache.get('b')).toBe('x'.repeat(10));
+    expect(cache.get('c')).toBe('x'.repeat(10));
+  });
+
+  it('lets a single oversized entry through without rejecting it, but does not let it accumulate', () => {
+    const cache = new TtlCache<string, string>(100_000, 500, {
+      maxTotalSize: 10,
+      sizeOf: (v) => v.length,
+    });
+    cache.set('a', 'x'.repeat(50)); // over budget alone, but store was empty
+    expect(cache.get('a')).toBe('x'.repeat(50));
+    cache.set('b', 'x'.repeat(50)); // 'a' must be evicted to make room
+    expect(cache.get('a')).toBeUndefined();
+    expect(cache.get('b')).toBe('x'.repeat(50));
+  });
+
+  it('clear() resets the total-size accounting too', () => {
+    const cache = new TtlCache<string, string>(100_000, 500, {
+      maxTotalSize: 10,
+      sizeOf: (v) => v.length,
+    });
+    cache.set('a', 'x'.repeat(10));
+    cache.clear();
+    cache.set('b', 'x'.repeat(10)); // would wrongly evict immediately if totalSize wasn't reset
+    expect(cache.get('b')).toBe('x'.repeat(10));
+  });
+
   it('clear() empties the cache', () => {
     const cache = new TtlCache<string, number>(1000);
     cache.set('a', 1);
