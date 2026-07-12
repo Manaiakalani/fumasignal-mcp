@@ -115,6 +115,21 @@ function decodeXmlEntities(s: string): string {
  * or - belt and suspenders, shouldn't be reachable given the scratch URL
  * always has a valid base - if the result doesn't start with "/", so
  * callers can fail closed with their own error type/message.
+ *
+ * Accepted residual limitation (deliberately not chased further): a
+ * *triple*-encoded separator ("%25252f") only unwraps to the literal text
+ * "%252f" after this function's one decode pass, which the check above
+ * doesn't recognize either. Closing that would require guessing how many
+ * *extra* decode passes a downstream consumer might apply, which is
+ * unbounded in principle (quadruple-encoding, etc). In practice this
+ * isn't exploitable against the threat this function defends against: a
+ * real HTTP server would itself need to decode the request path *twice*
+ * (beyond the one layer already unwrapped here) while routing/resolving
+ * it, which is far more unusual than the single extra decode pass the
+ * fixed double-encoding case above defends against. Independently
+ * confirmed by two of three Round 7/8 security-audit models
+ * (gemini-3.1-pro-preview, gpt-5.6-terra) as a non-exploitable, acceptable
+ * gap rather than a must-fix.
  */
 export function decodeAndNormalizePathname(pathname: string): string | null {
   let decoded: string;
