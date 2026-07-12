@@ -52,6 +52,25 @@ describe('pickArticle', () => {
     const elapsed = performance.now() - start;
     expect(elapsed).toBeLessThan(1000);
   });
+
+  it('does not exhibit quadratic blowup on adversarial input with no ">" anywhere (opening-tag-regex bug)', () => {
+    // Regression: distinct from the test above, which uses openers like
+    // '<article class="...">' that already contain their own closing '>'
+    // and so only exercise the *closing*-tag-search fix. This uses
+    // openers with NO '>' character anywhere in the whole string, which
+    // the old `<tag\b[^>]*>` *opening*-tag regex had its own independent
+    // O(n^2) blowup on (~5.5s for just 200KB) - the opening-tag search
+    // itself was never fixed until this rewrite.
+    const opener = '<article';
+    const html = opener.repeat(Math.ceil(500_000 / opener.length));
+    const start = performance.now();
+    const result = pickArticle(html);
+    const elapsed = performance.now() - start;
+    expect(elapsed).toBeLessThan(1000);
+    // No '>' anywhere means no opening tag ever completes, so it falls
+    // through unmatched - same contract as the "unclosed tag" test above.
+    expect(result).toBe(html);
+  });
 });
 
 describe('stripChrome', () => {
@@ -80,6 +99,22 @@ describe('stripChrome', () => {
     stripChrome(html);
     const elapsed = performance.now() - start;
     expect(elapsed).toBeLessThan(1000);
+  });
+
+  it('does not exhibit quadratic blowup on adversarial input with no ">" anywhere (opening-tag-regex bug)', () => {
+    // Regression: distinct from the test above (whose opener already
+    // contains its own '>'), this exercises the *opening*-tag search's
+    // independent O(n^2) blowup on input with no '>' character reachable
+    // anywhere - see the matching pickArticle test for the full mechanism.
+    const opener = '<nav';
+    const html = opener.repeat(Math.ceil(500_000 / opener.length));
+    const start = performance.now();
+    const result = stripChrome(html);
+    const elapsed = performance.now() - start;
+    expect(elapsed).toBeLessThan(1000);
+    // No '>' anywhere means no opening tag ever completes, so nothing is
+    // removed - same contract as the "unclosed chrome tag" test above.
+    expect(result).toBe(html);
   });
 });
 
