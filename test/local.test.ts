@@ -132,10 +132,11 @@ describe('LocalFumadocsSource security fixes', () => {
       // Regression: `buildIndex()` used to cast it with `as string`
       // (a compile-time-only assertion), so `page.title.toLowerCase()` in
       // `search()` would throw `TypeError: page.title.toLowerCase is not a
-      // function` for the WHOLE index, not just this page.
+      // function` for the WHOLE index, not just this page. `description: true`
+      // exercises the same guard (asNonEmptyString) on the description field.
       await writeFile(
         path.join(docs, 'numeric-title.mdx'),
-        `---\ntitle: 42\n---\n\n# Fallback Heading\n\nwidget content here`,
+        `---\ntitle: 42\ndescription: true\n---\n\n# Fallback Heading\n\nwidget content here`,
       );
       await writeFile(
         path.join(docs, 'normal.mdx'),
@@ -147,6 +148,7 @@ describe('LocalFumadocsSource security fixes', () => {
       // Falls back to the first markdown heading when the YAML title isn't a string.
       const badPage = await src.getPage('/docs/numeric-title');
       expect(badPage.title).toBe('Fallback Heading');
+      expect(badPage.description).toBeUndefined();
     } finally {
       await rm(dir, { recursive: true, force: true });
     }

@@ -81,6 +81,28 @@ describe('RemoteFumadocsSource', () => {
     expect(hits[0]!.score).toBe(0.9);
   });
 
+  it('drops a search hit with a non-string title, and omits a non-string description rather than crashing', async () => {
+    // Regression: collectFumadocsHit() used bare `as string | undefined`
+    // casts on an external search API's JSON. A numeric title/description
+    // wouldn't crash (template literals coerce), but would silently render
+    // as e.g. "42" instead of being treated as missing.
+    const src = new RemoteFumadocsSource({
+      baseUrl,
+      fetchImpl: makeFetch({
+        'https://example.com/api/search?query=x': {
+          body: JSON.stringify([
+            { url: '/docs/bad-title', title: 42, content: 'has a numeric title' },
+            { url: '/docs/good', title: 'Good', description: 42, content: 'has a numeric description' },
+          ]),
+          contentType: 'application/json',
+        },
+      }),
+    });
+    const hits = await src.search({ query: 'x' });
+    expect(hits.map((h) => h.url)).toEqual(['/docs/good']);
+    expect(hits[0]!.description).toBeUndefined();
+  });
+
   it('fetches markdown via .md endpoint when available', async () => {
     const src = new RemoteFumadocsSource({
       baseUrl,
@@ -95,6 +117,25 @@ describe('RemoteFumadocsSource', () => {
     expect(page.title).toBe('Intro');
     expect(page.markdown).toContain('body');
     expect(page.toc.find((t) => t.anchor === 'intro')).toBeDefined();
+  });
+
+  it('falls back to the markdown heading when frontmatter title is a non-string YAML value', async () => {
+    // Regression: getPage() used `(meta.title as string | undefined)`,
+    // unlike the equivalent guard already added to local.ts's buildIndex().
+    // A YAML title of `42` parses as a number; it must not silently become
+    // the page's displayed title, and description must not either.
+    const src = new RemoteFumadocsSource({
+      baseUrl,
+      fetchImpl: makeFetch({
+        'https://example.com/docs/numeric.md': {
+          body: `---\ntitle: 42\ndescription: true\n---\n\n# Real Heading\n\nbody text`,
+          contentType: 'text/markdown',
+        },
+      }),
+    });
+    const page = await src.getPage('/docs/numeric');
+    expect(page.title).toBe('Real Heading');
+    expect(page.description).toBeUndefined();
   });
 
   it('falls back to HTML scrape when markdown is unavailable', async () => {

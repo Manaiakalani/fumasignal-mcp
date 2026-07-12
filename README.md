@@ -28,7 +28,7 @@ exactly what this server does for your docs.
   `get_toc`, `get_meta`, `get_llms_txt`.
 - 📦 **Single binary**: `npx -y fumasignal-mcp --url https://your-docs.com`.
 - 🔒 **Read-only** — never mutates your docs.
-- 🧪 **Well-tested** — 28+ unit tests, fixtures for the search/sitemap/HTML paths.
+- 🧪 **Well-tested** — 75+ unit tests, fixtures for the search/sitemap/HTML paths.
 
 ---
 

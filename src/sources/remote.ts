@@ -2,7 +2,7 @@ import { logger } from '../lib/logger.js';
 import { TtlCache } from '../lib/cache.js';
 import { htmlToMarkdown } from '../lib/html-to-md.js';
 import { extractSection, extractToc } from '../lib/markdown.js';
-import { parseFrontmatter } from '../lib/frontmatter.js';
+import { parseFrontmatter, asNonEmptyString } from '../lib/frontmatter.js';
 import { filterToDocs, hasPathPrefix, parseSitemap } from '../lib/sitemap.js';
 import {
   type FumadocsSource,
@@ -251,8 +251,13 @@ export class RemoteFumadocsSource implements FumadocsSource {
 
     const { markdown, meta } = await this.fetchPageBody(target);
     const toc = extractToc(markdown);
-    const title = (meta.title as string | undefined) ?? extractTitle(markdown) ?? titleFromPath(target.pathname);
-    const description = meta.description as string | undefined;
+    // meta.title/description are untrusted frontmatter values (see
+    // asNonEmptyString's doc comment) - guard both instead of an `as
+    // string` cast so a wrong-typed value (e.g. `title: 42`) falls
+    // through to the markdown/path-derived fallbacks instead of
+    // silently propagating a non-string into a `string`-typed field.
+    const title = asNonEmptyString(meta.title) ?? extractTitle(markdown) ?? titleFromPath(target.pathname);
+    const description = asNonEmptyString(meta.description);
     const content: PageContent = {
       id: target.pathname,
       url: target.pathname,
@@ -444,19 +449,17 @@ function collectFumadocsHit(
   const it = item as Record<string, unknown>;
   // Orama wraps hits as { document, score }
   const doc = (it.document as Record<string, unknown> | undefined) ?? it;
-  const url = (doc.url as string | undefined) ?? (doc.id as string | undefined);
-  const title =
-    (doc.title as string | undefined) ?? (doc.heading as string | undefined);
+  // These are untrusted values from an external search API response - see
+  // asNonEmptyString's doc comment for why we don't use an `as string` cast.
+  const url = asNonEmptyString(doc.url) ?? asNonEmptyString(doc.id);
+  const title = asNonEmptyString(doc.title) ?? asNonEmptyString(doc.heading);
   if (!url || !title) return;
   push({
     url,
     title,
-    description: (doc.description as string | undefined) ?? undefined,
-    excerpt:
-      (doc.content as string | undefined) ??
-      (doc.excerpt as string | undefined) ??
-      undefined,
+    description: asNonEmptyString(doc.description),
+    excerpt: asNonEmptyString(doc.content) ?? asNonEmptyString(doc.excerpt),
     score: (it.score as number | undefined) ?? (doc.score as number | undefined),
-    tag: doc.tag as string | undefined,
+    tag: asNonEmptyString(doc.tag),
   });
 }
