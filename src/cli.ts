@@ -17,7 +17,20 @@ export interface ParsedOptions {
 const DEFAULT_CACHE_TTL_MS = 300_000;
 
 function parseCacheTtl(value: string): number {
-  const n = Number.parseInt(value, 10);
+  // Number.parseInt() parses only a *leading* numeric prefix and silently
+  // ignores the rest of the string, so malformed operator input like
+  // "1.5" (silently truncated to 1) or "60s" (silently truncated to 60, as
+  // if the intended unit suffix didn't exist) would previously be accepted
+  // as-is instead of rejected - a silent, wrong-by-orders-of-magnitude
+  // cache TTL is exactly the kind of misconfiguration this parser exists
+  // to catch. Requiring the *entire* (trimmed) string to be one or more
+  // ASCII digits before converting closes that gap; Number.isFinite()
+  // below still guards the remaining edge case of an absurdly long digit
+  // string overflowing to Infinity.
+  if (!/^\s*\d+\s*$/.test(value)) {
+    throw new InvalidArgumentError('must be a non-negative integer (milliseconds).');
+  }
+  const n = Number(value);
   if (!Number.isFinite(n) || n < 0) {
     throw new InvalidArgumentError('must be a non-negative integer (milliseconds).');
   }

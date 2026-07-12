@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { parseOptions } from '../src/cli.js';
 
 const ENV_KEYS = [
@@ -76,5 +76,51 @@ describe('parseOptions', () => {
   it('normalizes docsPrefix to a leading slash with no trailing slash', () => {
     const opts = parseOptions(['node', 'cli', '--local', '.', '--docs-prefix', 'guide/']);
     expect(opts.docsPrefix).toBe('/guide');
+  });
+
+  describe('--cache-ttl validation', () => {
+    // Commander's default behavior for an argParser validation failure is
+    // to print an error and call process.exit(1) (buildProgram() never
+    // calls exitOverride()) - stub both so an invalid value fails this
+    // test via a thrown error instead of actually terminating the worker.
+    let exitSpy: ReturnType<typeof vi.spyOn>;
+    let errorSpy: ReturnType<typeof vi.spyOn>;
+
+    beforeEach(() => {
+      exitSpy = vi.spyOn(process, 'exit').mockImplementation(() => {
+        throw new Error('process.exit called');
+      });
+      errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    });
+
+    afterEach(() => {
+      exitSpy.mockRestore();
+      errorSpy.mockRestore();
+    });
+
+    it.each(['1.5', '60s', '1e10', '-5', '', '  ', 'abc'])(
+      // Regression: Number.parseInt() only reads a *leading* numeric
+      // prefix and silently discards the rest of the string, so "1.5" and
+      // "60s" used to be silently truncated to 1 and 60 respectively
+      // instead of being rejected - a silent, wrong-by-orders-of-magnitude
+      // cache TTL is exactly the kind of misconfiguration this validator
+      // exists to catch.
+      'rejects malformed --cache-ttl value %j instead of silently truncating it',
+      (value) => {
+        expect(() =>
+          parseOptions(['node', 'cli', '--local', '.', '--cache-ttl', value]),
+        ).toThrow();
+      },
+    );
+
+    it('still accepts an ordinary value with incidental surrounding whitespace', () => {
+      const opts = parseOptions(['node', 'cli', '--local', '.', '--cache-ttl', ' 5000 ']);
+      expect(opts.cacheTtlMs).toBe(5000);
+    });
+
+    it('accepts 0 as a valid (caching-disabled) TTL', () => {
+      const opts = parseOptions(['node', 'cli', '--local', '.', '--cache-ttl', '0']);
+      expect(opts.cacheTtlMs).toBe(0);
+    });
   });
 });
