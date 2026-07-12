@@ -556,4 +556,91 @@ describe('LocalFumadocsSource security fixes', () => {
       await rm(dir, { recursive: true, force: true });
     }
   });
+
+  it('skips an unreadable subdirectory during the index walk instead of aborting the whole build', async () => {
+    // Regression: walk() had no try/catch around its recursive descent
+    // into subdirectories, so a single unreadable one (permission denied,
+    // removed mid-walk, etc.) rejected the *entire* walk() call - and with
+    // it, the entire buildIndex() build - even though every *other* file
+    // in the tree was perfectly readable. Simulated here by making
+    // fs.opendir reject specifically for one subdirectory while behaving
+    // normally for every other path (including the content root itself);
+    // the sibling directory's page must still be indexed, and a warning
+    // must be logged identifying the skipped subdirectory.
+    const dir = await mkdtemp(path.join(os.tmpdir(), 'fumasignal-local-badsubdir-'));
+    try {
+      const docs = path.join(dir, 'content', 'docs');
+      await mkdir(path.join(docs, 'good'), { recursive: true });
+      await mkdir(path.join(docs, 'bad'), { recursive: true });
+      await writeFile(path.join(docs, 'good', 'ok.md'), '# OK\n\nreadable page');
+      await writeFile(path.join(docs, 'bad', 'unreachable.md'), '# Unreachable');
+      const badDir = path.resolve(path.join(docs, 'bad'));
+      const realOpendir = fsPromises.opendir;
+      const opendirSpy = vi
+        .spyOn(fsPromises, 'opendir')
+        .mockImplementation(((p: string) => {
+          if (path.resolve(String(p)) === badDir) {
+            return Promise.reject(Object.assign(new Error('permission denied'), { code: 'EACCES' }));
+          }
+          return realOpendir(p);
+        }) as typeof fsPromises.opendir);
+      const warnSpy = vi.spyOn(logger, 'warn');
+      try {
+        const src = new LocalFumadocsSource({ rootDir: dir });
+        const pages = await src.listPages();
+        expect(pages.map((p) => p.url)).toEqual(['/docs/good/ok']);
+        const skipCall = warnSpy.mock.calls.find(
+          (call) =>
+            typeof call[1] === 'string' && call[1].includes('skipping unreadable subdirectory'),
+        );
+        expect(skipCall).toBeDefined();
+      } finally {
+        opendirSpy.mockRestore();
+        warnSpy.mockRestore();
+      }
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('retries indexing on the next call instead of caching a build failure forever', async () => {
+    // Regression: index() memoized buildIndex()'s promise unconditionally
+    // ("if (!this.indexPromise) this.indexPromise = this.buildIndex()"),
+    // including when it rejected - so a single transient failure (e.g. a
+    // network-mounted contentDir that hiccups on the very first request)
+    // poisoned the source forever: every subsequent listPages()/search()/
+    // getPage() call replayed that same rejected promise instead of ever
+    // trying again, even long after whatever caused the failure was gone.
+    // Simulated here by making fs.opendir reject exactly once (on the
+    // first call only) and behave normally afterwards: the first
+    // listPages() call must reject, but a second call right after must
+    // succeed with the real content instead of replaying the same error.
+    const dir = await mkdtemp(path.join(os.tmpdir(), 'fumasignal-local-retry-'));
+    try {
+      const docs = path.join(dir, 'content', 'docs');
+      await mkdir(docs, { recursive: true });
+      await writeFile(path.join(docs, 'ok.md'), '# OK\n\nreadable page');
+      const realOpendir = fsPromises.opendir;
+      let calls = 0;
+      const opendirSpy = vi
+        .spyOn(fsPromises, 'opendir')
+        .mockImplementation(((p: string) => {
+          calls += 1;
+          if (calls === 1) {
+            return Promise.reject(Object.assign(new Error('transient failure'), { code: 'EIO' }));
+          }
+          return realOpendir(p);
+        }) as typeof fsPromises.opendir);
+      try {
+        const src = new LocalFumadocsSource({ rootDir: dir });
+        await expect(src.listPages()).rejects.toThrow();
+        const pages = await src.listPages();
+        expect(pages.map((p) => p.url)).toEqual(['/docs/ok']);
+      } finally {
+        opendirSpy.mockRestore();
+      }
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
 });

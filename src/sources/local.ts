@@ -149,7 +149,20 @@ export class LocalFumadocsSource implements FumadocsSource {
 
   private async index(): Promise<Map<string, IndexedPage>> {
     if (!this.indexPromise) {
-      this.indexPromise = this.buildIndex();
+      // buildIndex() can fail for reasons that are transient or
+      // environment-specific rather than a fixed, permanent
+      // misconfiguration - e.g. a network-mounted contentDir that hiccups
+      // on the very first request, or a TOCTOU race between the fs.stat()
+      // and fs.opendir() calls inside buildIndex(). If the rejected promise
+      // stayed cached in this.indexPromise, every future call would keep
+      // replaying that one failure forever - even long after whatever
+      // caused it has resolved - until the process is restarted. Resetting
+      // indexPromise to null on rejection (before letting the caller see
+      // it) makes the *next* call retry buildIndex() from scratch instead.
+      this.indexPromise = this.buildIndex().catch((err: unknown) => {
+        this.indexPromise = null;
+        throw err;
+      });
     }
     return this.indexPromise;
   }
@@ -500,14 +513,32 @@ async function walk(dir: string, limit: number): Promise<string[]> {
     // rather than traversed/read - this prevents a symlink planted inside
     // contentDir (e.g. from an untrusted cloned docs repo) from escaping it.
     if (entry.isDirectory()) {
-      // Not `out.push(...(await walk(full, ...)))`: spreading a large array
-      // as call arguments hits a JS engine argument-count ceiling -
-      // empirically confirmed to throw `RangeError: Maximum call stack size
-      // exceeded` on Node for arrays of roughly 125,000+ elements (varies by
-      // engine build/version, but is well within reach of a docs tree with
-      // a large number of content files, deliberately structured to attack
-      // this or not). A plain loop has no such limit.
-      for (const child of await walk(full, limit - out.length)) out.push(child);
+      // A single unreadable/unwalkable subdirectory (permission denied,
+      // removed/renamed mid-walk, etc.) must not abort indexing of every
+      // *other* file in the tree - consistent with how buildIndex() already
+      // skips+logs a single bad *file* rather than aborting the whole build
+      // (see its per-file catch). Without this, one bad subtree would
+      // reject this entire walk() call all the way up through the
+      // recursion to buildIndex(), which has no try/catch around its call
+      // to walk() - and since index() used to cache that rejection forever
+      // (see its doc comment), a single transient EACCES on one
+      // subdirectory could take the whole local source down for every
+      // caller until process restart.
+      let children: string[];
+      try {
+        // Not `out.push(...(await walk(full, ...)))`: spreading a large array
+        // as call arguments hits a JS engine argument-count ceiling -
+        // empirically confirmed to throw `RangeError: Maximum call stack size
+        // exceeded` on Node for arrays of roughly 125,000+ elements (varies by
+        // engine build/version, but is well within reach of a docs tree with
+        // a large number of content files, deliberately structured to attack
+        // this or not). A plain loop has no such limit.
+        children = await walk(full, limit - out.length);
+      } catch (err) {
+        logger.warn({ err, dir: full }, 'local: skipping unreadable subdirectory during index walk');
+        continue;
+      }
+      for (const child of children) out.push(child);
     } else if (entry.isFile() && /\.mdx?$/i.test(entry.name)) {
       out.push(full);
     }
