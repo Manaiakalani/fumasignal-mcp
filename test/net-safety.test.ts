@@ -44,6 +44,33 @@ describe('isPrivateOrReservedAddress', () => {
     expect(isPrivateOrReservedAddress('::ffff:8.8.8.8')).toBe(false); // IPv4-mapped public
   });
 
+  it('flags IPv4-mapped private addresses regardless of which equivalent IPv6 spelling is used', () => {
+    // Regression: the mapped-address check used to be a regex matching
+    // only the mixed dotted-quad spelling ("::ffff:a.b.c.d"). The exact
+    // same address can also be spelled with the embedded IPv4 bits in
+    // hex, compressed or fully expanded, or with the leading zero groups
+    // written out - all of these must resolve to the same verdict as
+    // "::ffff:127.0.0.1".
+    expect(isPrivateOrReservedAddress('::ffff:7f00:1')).toBe(true); // hex form of ::ffff:127.0.0.1
+    expect(isPrivateOrReservedAddress('0:0:0:0:0:ffff:127.0.0.1')).toBe(true); // fully expanded, dotted-quad
+    expect(isPrivateOrReservedAddress('0000:0000:0000:0000:0000:ffff:7f00:0001')).toBe(true); // fully expanded, hex, zero-padded
+    expect(isPrivateOrReservedAddress('::ffff:a00:1')).toBe(true); // hex form of ::ffff:10.0.0.1
+  });
+
+  it('allows public IPv4-mapped addresses spelled in hex form', () => {
+    expect(isPrivateOrReservedAddress('::ffff:808:808')).toBe(false); // hex form of ::ffff:8.8.8.8
+  });
+
+  it('flags loopback/unspecified regardless of which equivalent IPv6 spelling is used', () => {
+    expect(isPrivateOrReservedAddress('0:0:0:0:0:0:0:1')).toBe(true); // fully expanded ::1
+    expect(isPrivateOrReservedAddress('0:0:0:0:0:0:0:0')).toBe(true); // fully expanded ::
+  });
+
+  it('ignores a zone id when classifying a link-local address', () => {
+    expect(isPrivateOrReservedAddress('fe80::1%eth0')).toBe(true);
+    expect(isPrivateOrReservedAddress('fe80::1%25eth0')).toBe(true); // percent-encoded zone id delimiter
+  });
+
   it('fails closed (treats as unsafe) for anything that is not a recognizable literal IP', () => {
     expect(isPrivateOrReservedAddress('not-an-ip')).toBe(true);
     expect(isPrivateOrReservedAddress('example.com')).toBe(true);

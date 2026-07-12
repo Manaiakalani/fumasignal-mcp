@@ -70,12 +70,39 @@ function isPrivateIPv4(ip: string): boolean {
 }
 
 function isPrivateIPv6(ip: string): boolean {
-  const normalized = ip.toLowerCase();
-  if (normalized === '::1' || normalized === '::') return true; // loopback / unspecified
-  const mapped = /^::ffff:(\d+\.\d+\.\d+\.\d+)$/.exec(normalized);
-  if (mapped) return isPrivateIPv4(mapped[1]!); // IPv4-mapped - validate the embedded address
-  if (/^fe[89ab]/.test(normalized)) return true; // fe80::/10 link-local
-  if (normalized.startsWith('fc') || normalized.startsWith('fd')) return true; // fc00::/7 unique local
+  // IPv6 has many equivalent textual spellings of the same address
+  // (fully-expanded vs. "::"-compressed, zero-padded groups, and - for
+  // IPv4-mapped addresses specifically - dotted-quad vs. hex for the
+  // embedded IPv4 bits, e.g. "::ffff:127.0.0.1" vs "::ffff:7f00:1" vs
+  // "0:0:0:0:0:ffff:127.0.0.1" all name the same address). Matching a
+  // regex against the raw input would only ever catch whichever single
+  // spelling it was written against, letting an equivalent spelling slip
+  // through unrecognized. Canonicalize via the WHATWG URL host parser
+  // first - Node normalizes every IPv6 literal it accepts into one
+  // consistent serialization (compressed, hex groups, never dotted-quad)
+  // - so every check below only has to handle one shape. A zone ID (e.g.
+  // "fe80::1%eth0") is stripped first since the URL parser doesn't accept
+  // a raw "%" in a bracketed host and the zone id itself doesn't change
+  // which address range the literal falls in.
+  const zoneIdx = ip.indexOf('%');
+  const withoutZone = zoneIdx >= 0 ? ip.slice(0, zoneIdx) : ip;
+  let canonical: string;
+  try {
+    canonical = new URL(`http://[${withoutZone}]/`).hostname.slice(1, -1).toLowerCase();
+  } catch {
+    return true; // not a literal this parser recognizes - treat as unsafe rather than guess
+  }
+  if (canonical === '::1' || canonical === '::') return true; // loopback / unspecified
+  const mapped = /^::ffff:([0-9a-f]{1,4}):([0-9a-f]{1,4})$/.exec(canonical);
+  if (mapped) {
+    const hi = parseInt(mapped[1]!, 16);
+    const lo = parseInt(mapped[2]!, 16);
+    // Each 16-bit hex group holds 2 bytes of the embedded IPv4 address.
+    const embeddedIPv4 = `${(hi >> 8) & 0xff}.${hi & 0xff}.${(lo >> 8) & 0xff}.${lo & 0xff}`;
+    return isPrivateIPv4(embeddedIPv4); // IPv4-mapped - validate the embedded address
+  }
+  if (/^fe[89ab]/.test(canonical)) return true; // fe80::/10 link-local
+  if (canonical.startsWith('fc') || canonical.startsWith('fd')) return true; // fc00::/7 unique local
   return false;
 }
 
