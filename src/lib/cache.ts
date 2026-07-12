@@ -1,5 +1,32 @@
 /** Trivial in-memory TTL cache with a soft entry-count cap and an optional total-size budget. */
 
+/**
+ * De-duplicates concurrent async work by key: while a `run()` call for a
+ * given key is in flight, any other `run()` call for that *same* key
+ * shares the same promise instead of independently repeating the work.
+ *
+ * Without this, N concurrent cache-miss requests for the same not-yet-cached
+ * key (e.g. `getPage()` called twice in parallel for a page nobody has
+ * fetched yet) each start their own independent fetch chain - multiplying
+ * network requests and buffered-response memory by N, and defeating a
+ * per-response byte cap's purpose as an aggregate resource bound. Coalescing
+ * collapses that to exactly one fetch chain regardless of how many
+ * concurrent callers are waiting on it.
+ */
+export class Coalescer<K, V> {
+  private pending = new Map<K, Promise<V>>();
+
+  async run(key: K, fn: () => Promise<V>): Promise<V> {
+    const existing = this.pending.get(key);
+    if (existing) return existing;
+    const promise = fn().finally(() => {
+      this.pending.delete(key);
+    });
+    this.pending.set(key, promise);
+    return promise;
+  }
+}
+
 interface Entry<V> {
   value: V;
   expiresAt: number;

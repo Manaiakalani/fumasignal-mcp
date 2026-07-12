@@ -94,6 +94,44 @@ describe('decodeAndNormalizePathname', () => {
     expect(decodeAndNormalizePathname('/docs/..%255c..%255cadmin')).toBeNull();
   });
 
+  it('rejects a *triple*-encoded slash ("%25252f"), not just double', () => {
+    // Regression: this function used to decode only once, documenting
+    // triple-encoding as an "accepted residual" on the theory that
+    // exploiting it would require a real server to apply two *extra*
+    // decode passes beyond the one already unwrapped here - much less
+    // likely than the single extra pass the double-encoded case defends
+    // against, but not impossible. A follow-up audit reproduced exactly
+    // that against a simulated double-decoding upstream, so decoding now
+    // continues to a fixed point (checking every intermediate pass, not
+    // just the first) instead of stopping after one - closing the class
+    // at any depth. "%25252f" -> (pass 1) "%252f" (still safe-looking) ->
+    // (pass 2) the literal text "%2f" (caught).
+    expect(decodeAndNormalizePathname('/docs/..%25252fprivate')).toBeNull();
+  });
+
+  it('rejects arbitrarily deeper encoding of a slash/backslash (quadruple+)', () => {
+    // Generalizes beyond N=3: however many "%25" wrappers are stacked on
+    // top, unwrapping them one at a time always passes through the
+    // literal "%2f"/"%5c" text at exactly one intermediate pass.
+    expect(decodeAndNormalizePathname('/docs/..%2525252fprivate')).toBeNull();
+    expect(decodeAndNormalizePathname('/docs/..%252525252fprivate')).toBeNull();
+    expect(decodeAndNormalizePathname('/docs/..%25252525255cadmin')).toBeNull();
+  });
+
+  it('fails closed when a separator is wrapped deeper than MAX_DECODE_PASSES can unwind', () => {
+    // A 10-times-encoded slash only exposes the literal "%2f" text on its
+    // 9th decode pass, one past the MAX_DECODE_PASSES=8 budget - so the
+    // loop exhausts without ever reaching a fixed point *or* seeing the
+    // %2f/%5c text, and must fail closed (return null) rather than fall
+    // through and use a value that, for all we know, is still encoded.
+    // ('%25'.repeat(k-1) + '2f' is a slash encoded k times; verified by
+    // tracing decodeURIComponent pass-by-pass: the literal "%2f" text
+    // only appears at pass index (k-2), so k=10 -> pass 8, outside the
+    // i<8 loop bound.)
+    const tenTimesEncodedSlash = '%' + '25'.repeat(9) + '2f';
+    expect(decodeAndNormalizePathname('/docs/..' + tenTimesEncodedSlash + 'private')).toBeNull();
+  });
+
   it('does not false-positive on ordinary encoded characters (space, unicode, literal %)', () => {
     expect(decodeAndNormalizePathname('/docs/my%20page')).toBe('/docs/my%20page');
     expect(decodeAndNormalizePathname('/docs/caf%C3%A9')).toBe('/docs/caf%C3%A9');

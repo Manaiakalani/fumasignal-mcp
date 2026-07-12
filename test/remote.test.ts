@@ -468,6 +468,111 @@ describe('RemoteFumadocsSource', () => {
     expect(page.markdown).not.toContain('nav junk');
   });
 
+  it('does not let a query-bearing ref poison the plain-path cache entry (cache-key regression)', async () => {
+    // Regression: getPage() used to cache solely on `target.pathname`, but
+    // fetchPageBody()'s HTML-scrape fallback fetches `target` *with* its
+    // query string intact - so a response that legitimately varies by
+    // query (e.g. a preview/variant flag) got cached under the same key
+    // as the plain path, and a later plain-path request incorrectly
+    // received the query-specific response instead of fetching its own.
+    const src = new RemoteFumadocsSource({
+      baseUrl,
+      fetchImpl: async (input: RequestInfo | URL) => {
+        const url = typeof input === 'string' ? input : input.toString();
+        if (url.endsWith('.md') || url.endsWith('.mdx') || url.endsWith('/raw') || url.endsWith('/index.md')) {
+          return new Response('not found', { status: 404 });
+        }
+        if (url === 'https://example.com/docs/guide?variant=private') {
+          return new Response('<html><body><article>PRIVATE CONTENT</article></body></html>', {
+            status: 200,
+            headers: { 'content-type': 'text/html' },
+          });
+        }
+        if (url === 'https://example.com/docs/guide') {
+          return new Response('<html><body><article>PUBLIC CONTENT</article></body></html>', {
+            status: 200,
+            headers: { 'content-type': 'text/html' },
+          });
+        }
+        return new Response('not found', { status: 404 });
+      },
+    });
+    const privatePage = await src.getPage('/docs/guide?variant=private');
+    expect(privatePage.markdown).toContain('PRIVATE CONTENT');
+    const plainPage = await src.getPage('/docs/guide');
+    expect(plainPage.markdown).toContain('PUBLIC CONTENT');
+    expect(plainPage.markdown).not.toContain('PRIVATE CONTENT');
+  });
+
+  it('coalesces concurrent getPage() misses for the same ref into one fetch chain', async () => {
+    // Regression: concurrent cache-miss callers for the same never-before-
+    // fetched ref used to each independently run the full markdown-
+    // candidate-then-HTML fetch chain, multiplying upstream requests (and
+    // buffered response memory) by the number of concurrent callers.
+    let fetchCount = 0;
+    const src = new RemoteFumadocsSource({
+      baseUrl,
+      fetchImpl: async (input: RequestInfo | URL) => {
+        fetchCount++;
+        const url = typeof input === 'string' ? input : input.toString();
+        if (url === 'https://example.com/docs/guide.md') {
+          return new Response('# Guide\n\nbody', {
+            status: 200,
+            headers: { 'content-type': 'text/markdown' },
+          });
+        }
+        return new Response('not found', { status: 404 });
+      },
+    });
+    const [a, b, c] = await Promise.all([
+      src.getPage('/docs/guide'),
+      src.getPage('/docs/guide'),
+      src.getPage('/docs/guide'),
+    ]);
+    expect(a.title).toBe('Guide');
+    expect(b.title).toBe('Guide');
+    expect(c.title).toBe('Guide');
+    expect(fetchCount).toBe(1);
+  });
+
+  it('coalesces concurrent listPages() misses into one sitemap traversal', async () => {
+    let fetchCount = 0;
+    const src = new RemoteFumadocsSource({
+      baseUrl,
+      fetchImpl: async (input: RequestInfo | URL) => {
+        fetchCount++;
+        const url = typeof input === 'string' ? input : input.toString();
+        if (url === 'https://example.com/sitemap.xml') {
+          return new Response(sitemap, { status: 200, headers: { 'content-type': 'application/xml' } });
+        }
+        return new Response('not found', { status: 404 });
+      },
+    });
+    const [a, b] = await Promise.all([src.listPages(), src.listPages()]);
+    expect(a.length).toBeGreaterThan(0);
+    expect(b).toEqual(a);
+    expect(fetchCount).toBe(1);
+  });
+
+  it('coalesces concurrent getLlmsTxt() misses into one fetch', async () => {
+    let fetchCount = 0;
+    const src = new RemoteFumadocsSource({
+      baseUrl,
+      fetchImpl: async (input: RequestInfo | URL) => {
+        fetchCount++;
+        const url = typeof input === 'string' ? input : input.toString();
+        if (url === 'https://example.com/llms.txt') {
+          return new Response('llms content', { status: 200, headers: { 'content-type': 'text/plain' } });
+        }
+        return new Response('not found', { status: 404 });
+      },
+    });
+    const [a, b] = await Promise.all([src.getLlmsTxt(), src.getLlmsTxt()]);
+    expect(a).toBe('llms content');
+    expect(b).toBe('llms content');
+    expect(fetchCount).toBe(1);
+  });
+
   it('extracts the title from HTML in bounded time despite adversarial "<title" input with no ">" anywhere', async () => {
     // Regression: the original title regex (`<title[^>]*>([^<]*)<\/title>`)
     // had an independent, unbounded backtracking blowup - on input with
@@ -582,6 +687,26 @@ describe('RemoteFumadocsSource', () => {
     await expect(src.getPage('/docs/..%252fapi/private')).rejects.toThrow(/unresolvable path/i);
   });
 
+  it('rejects a ref hiding a *triple*-encoded separator ("%25252f"), not just double', async () => {
+    // Regression: an earlier fix only decoded once and so only caught a
+    // *double*-encoded separator, documenting triple-encoding as an
+    // "accepted residual" on the theory that a real server would need two
+    // *extra* decode passes (beyond the one already unwrapped) to exploit
+    // it. A follow-up audit reproduced exactly that against a simulated
+    // double-decoding upstream, so this now decodes to a fixed point and
+    // checks every intermediate pass instead of stopping after one -
+    // closing the class at any depth, not just N=2.
+    const src = new RemoteFumadocsSource({
+      baseUrl,
+      authHeader: '******',
+      fetchImpl: makeFetch({
+        'https://example.com/api/private': { body: 'top secret', contentType: 'text/plain' },
+      }),
+    });
+    await expect(src.getPage('/docs/..%25252fapi/private')).rejects.toThrow(/unresolvable path/i);
+    await expect(src.getPage('/docs/..%2525252fapi/private')).rejects.toThrow(/unresolvable path/i);
+  });
+
   it('rejects a ref with malformed percent-encoding instead of treating it as a literal path', async () => {
     // Regression: decodeURIComponent throws on malformed percent-encoding
     // (including "overlong" UTF-8 encodings sometimes used to smuggle
@@ -617,6 +742,53 @@ describe('RemoteFumadocsSource', () => {
       baseUrl,
       fetchImpl: makeFetch({
         'https://example.com/docs.md': { body: '# Docs Root\n\nbody', contentType: 'text/markdown' },
+      }),
+    });
+    const page = await src.getPage('/docs');
+    expect(page.title).toBe('Docs Root');
+  });
+
+  it('does not send the Authorization header to the root-sibling ".md"/".mdx" candidates when authHeader is configured', async () => {
+    // Regression: buildMarkdownCandidates() deliberately produces
+    // "/docs.md"/"/docs.mdx" for a target exactly at the docs prefix root
+    // - siblings of the docs directory, not descendants of it - and
+    // fetchSameOrigin() skips the prefix re-check on the initial (hop-0)
+    // fetch to let that convention work. Without also gating those
+    // specific candidates on authHeader, a configured Authorization
+    // header would be attached to a request outside the authorized
+    // docsPrefix boundary, defeating the whole point of that boundary.
+    let sawAuthOnSibling = false;
+    const src = new RemoteFumadocsSource({
+      baseUrl,
+      authHeader: 'Bearer secret-token',
+      fetchImpl: async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = typeof input === 'string' ? input : input.toString();
+        const headers = new Headers(init?.headers);
+        if (url === 'https://example.com/docs.md') {
+          if (headers.get('authorization')) sawAuthOnSibling = true;
+          return new Response('# Docs Root\n\nSECRET-IF-LEAKED', {
+            status: 200,
+            headers: { 'content-type': 'text/markdown' },
+          });
+        }
+        return new Response('not found', { status: 404 });
+      },
+    });
+    // The sibling candidate is filtered out entirely (not just fetched
+    // without credentials), so with nothing else registered the whole
+    // call 404s rather than ever touching "/docs.md".
+    await expect(src.getPage('/docs')).rejects.toThrow(/page not found/i);
+    expect(sawAuthOnSibling).toBe(false);
+  });
+
+  it('still fetches an in-prefix candidate (e.g. "/docs/index.md") when authHeader is configured', async () => {
+    // The authHeader-gated filter in fetchPageBody() must only remove the
+    // two candidates that escape docsPrefix, not every candidate.
+    const src = new RemoteFumadocsSource({
+      baseUrl,
+      authHeader: 'Bearer secret-token',
+      fetchImpl: makeFetch({
+        'https://example.com/docs/index.md': { body: '# Docs Root\n\nbody', contentType: 'text/markdown' },
       }),
     });
     const page = await src.getPage('/docs');

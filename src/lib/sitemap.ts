@@ -109,35 +109,67 @@ function decodeXmlEntities(s: string): string {
  *    own check passed it and we go on to fetch that exact literal path
  *    (see the "%2f"/"%5c" check below, after normalization).
  *
- * Returns `null` (rather than throwing) if the pathname contains
- * malformed percent-encoding (`decodeURIComponent` throws), still
- * contains a literal (once-decoded) encoded separator per case 3 above,
- * or - belt and suspenders, shouldn't be reachable given the scratch URL
- * always has a valid base - if the result doesn't start with "/", so
- * callers can fail closed with their own error type/message.
+ * Decoding repeats to a fixed point (bounded by `MAX_DECODE_PASSES`)
+ * rather than stopping after one pass, and the "%2f"/"%5c" check runs
+ * after *every* pass, not just the last - this is what closes case 3 for
+ * *any* depth of layered encoding, not only the double-encoded case above.
+ * An N-times-encoded separator always reads as the literal text
+ * "%2f"/"%5c" at exactly the pass that strips it down to one remaining
+ * layer, on its way to becoming a real "/"/"\\" - e.g. a *triple*-encoded
+ * "%25252f" unwraps to "%252f" (pass 1, still safe-looking) then to the
+ * literal text "%2f" (pass 2, caught) - so checking every intermediate
+ * pass catches it regardless of how many extra "%25" wrappers a caller
+ * stacks on top. (An earlier version of this function only decoded once
+ * and documented triple-encoding as an accepted residual gap; a
+ * follow-up audit pointed out that "less likely" isn't "not exploitable",
+ * so this closes it properly instead of continuing to defer it.)
  *
- * Accepted residual limitation (deliberately not chased further): a
- * *triple*-encoded separator ("%25252f") only unwraps to the literal text
- * "%252f" after this function's one decode pass, which the check above
- * doesn't recognize either. Closing that would require guessing how many
- * *extra* decode passes a downstream consumer might apply, which is
- * unbounded in principle (quadruple-encoding, etc). In practice this
- * isn't exploitable against the threat this function defends against: a
- * real HTTP server would itself need to decode the request path *twice*
- * (beyond the one layer already unwrapped here) while routing/resolving
- * it, which is far more unusual than the single extra decode pass the
- * fixed double-encoding case above defends against. Independently
- * confirmed by two of three Round 7/8 security-audit models
- * (gemini-3.1-pro-preview, gpt-5.6-terra) as a non-exploitable, acceptable
- * gap rather than a must-fix.
+ * A malformed escape on the *first* pass is treated as invalid input
+ * (fail closed, matching this function's long-standing behavior). A
+ * malformed escape on a *later* pass just means decoding has bottomed
+ * out - e.g. a legitimately-doubly-encoded literal "%" character (like
+ * "50%2525-off", meaning the literal text "50%25-off") decodes fine on
+ * pass 1 but would throw on a pass 2 attempt, because a lone "%" not
+ * followed by two hex digits isn't valid `decodeURIComponent` input. That
+ * throw is treated as reaching a fixed point using the previous pass's
+ * (already `%2f`/`%5c`-checked) value, rather than rejected outright -
+ * otherwise this would reject ordinary doubly-encoded literal percent
+ * signs, which is exactly the kind of legitimate encoded content this
+ * function must not have false positives against.
+ *
+ * Returns `null` (rather than throwing) if the pathname contains
+ * malformed percent-encoding on the first pass, still contains a literal
+ * (at any decode depth) encoded separator per case 3 above, needs more
+ * than `MAX_DECODE_PASSES` passes to reach a fixed point (unreasonably
+ * deep layered encoding for any legitimate doc slug - fail closed rather
+ * than trust a possibly-still-encoded value), or - belt and suspenders,
+ * shouldn't be reachable given the scratch URL always has a valid base -
+ * if the result doesn't start with "/", so callers can fail closed with
+ * their own error type/message.
  */
+const MAX_DECODE_PASSES = 8;
+
 export function decodeAndNormalizePathname(pathname: string): string | null {
-  let decoded: string;
-  try {
-    decoded = decodeURIComponent(pathname);
-  } catch {
-    return null;
+  let decoded = pathname;
+  let stable = false;
+  for (let i = 0; i < MAX_DECODE_PASSES; i++) {
+    let next: string;
+    try {
+      next = decodeURIComponent(decoded);
+    } catch {
+      if (i === 0) return null;
+      stable = true;
+      break;
+    }
+    if (/%2f|%5c/i.test(next)) return null;
+    if (next === decoded) {
+      stable = true;
+      break;
+    }
+    decoded = next;
   }
+  if (!stable) return null;
+
   const scratch = new URL('http://placeholder.invalid');
   try {
     scratch.pathname = decoded;
@@ -146,10 +178,10 @@ export function decodeAndNormalizePathname(pathname: string): string | null {
   }
   const normalized = scratch.pathname;
   if (normalized !== '/' && !normalized.startsWith('/')) return null;
-  // A literal "%2f"/"%5c" surviving this far is never a legitimate doc
-  // slug - it's a hidden, still-encoded path separator (see case 3 above).
-  // Fail closed rather than handing a same-looking-to-us-but-not-to-
-  // everyone value to `hasPathPrefix()`.
+  // Belt and suspenders: the per-pass check above should already catch
+  // every layered-encoding case before it ever reaches the URL setter,
+  // but re-check the post-normalization result too in case some exotic
+  // path segment reintroduces the literal text.
   if (/%2f|%5c/i.test(normalized)) return null;
   return normalized;
 }
