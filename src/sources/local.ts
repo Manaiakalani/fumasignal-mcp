@@ -15,6 +15,25 @@ import {
   SourceError,
 } from './types.js';
 
+/**
+ * Upper bound on how many distinct query tokens `search()` will actually
+ * score per call. Without this, `search()`'s cost is
+ * O(query.split(/\s+/).length * total indexed bytes): the `query` MCP tool
+ * parameter is capped at 500 characters (see server.ts), which still
+ * allows up to ~250 single-character tokens, each scored via a full linear
+ * scan (`countOccurrences()`) over *every* indexed page's body - against a
+ * fully-populated default-sized (`maxTotalBytes`) index, empirically
+ * measured at 10-25+ seconds of synchronous, event-loop-blocking work for
+ * a *single* search call, stalling every other concurrent request/tool
+ * call this (single-threaded) server is handling for that entire time.
+ * Deduplicating first (below) closes off the cheapest version of this - a
+ * query that repeats one token as many times as fits in 500 characters -
+ * almost for free; this cap bounds the remaining "many genuinely distinct
+ * short tokens" variant that deduplication alone can't help with. Far more
+ * generous than any real multi-word search query needs.
+ */
+const MAX_SEARCH_TOKENS = 20;
+
 export interface LocalSourceOptions {
   /** Path to the Fumadocs project root. */
   rootDir: string;
@@ -219,9 +238,19 @@ export class LocalFumadocsSource implements FumadocsSource {
           );
           break;
         }
+        // Charge the aggregate byte budget *before* attempting to read/parse
+        // the file, not after a successful parse: if this were charged only
+        // on success (as it was before), a file that reads fine but whose
+        // frontmatter parseFrontmatter() rejects (or that fails for any
+        // other reason after the read) would pay for a full fs.readFile()
+        // - the actual I/O/CPU cost maxTotalBytes exists to bound - while
+        // leaving totalBytes at 0. A tree of many large-but-invalid files
+        // (each individually under maxFileBytes) could then be read in full
+        // repeatedly without ever tripping the aggregate budget, since it
+        // only advances for files that happen to parse successfully.
+        totalBytes += fileStat.size;
         raw = await fs.readFile(file, 'utf8');
         ({ content: body, data: meta } = parseFrontmatter(raw));
-        totalBytes += fileStat.size;
       } catch (err) {
         logger.warn({ err, file }, 'local: skipping page that failed to read/parse');
         continue;
@@ -279,7 +308,7 @@ export class LocalFumadocsSource implements FumadocsSource {
     const idx = await this.index();
     const query = opts.query.trim().toLowerCase();
     if (!query) return [];
-    const tokens = query.split(/\s+/).filter(Boolean);
+    const tokens = [...new Set(query.split(/\s+/).filter(Boolean))].slice(0, MAX_SEARCH_TOKENS);
     const scored: Array<{ hit: SearchHit; score: number }> = [];
     for (const page of idx.values()) {
       if (opts.tag && !matchesTag(page.meta.tag, opts.tag)) continue;
@@ -442,12 +471,27 @@ export class LocalFumadocsSource implements FumadocsSource {
  * a chance to apply its budget. Threaded through the recursion as "however
  * much budget remains" rather than a shared mutable counter, since each
  * call only needs to know how many more entries it may still contribute.
+ *
+ * Uses `fs.opendir()` rather than `fs.readdir()` for the same reason:
+ * `readdir()` always reads and materializes *every* entry of a directory
+ * into one array before returning, regardless of how many the caller
+ * actually wants - so a single directory (not even a deeply nested tree,
+ * just one flat directory) containing an extremely large number of entries
+ * would still be read and buffered in full before the `limit` check below
+ * ever runs, the same class of gap `limit` was threaded through the
+ * recursion to close, just one level lower (within a single directory
+ * rather than across sibling/nested ones). `opendir()`'s `Dir` is an async
+ * iterable that reads entries incrementally - breaking out of the loop
+ * (which `for await...of` does automatically once the iterable itself is
+ * abandoned) stops it from reading any further entries at all, so entries
+ * beyond `limit` are never read from disk nor turned into `Dirent` objects
+ * in the first place, not just excluded from the returned array.
  */
 async function walk(dir: string, limit: number): Promise<string[]> {
   const out: string[] = [];
   if (limit <= 0) return out;
-  const entries = await fs.readdir(dir, { withFileTypes: true });
-  for (const entry of entries) {
+  const dirHandle = await fs.opendir(dir);
+  for await (const entry of dirHandle) {
     if (out.length >= limit) break;
     const full = path.join(dir, entry.name);
     // entry.isDirectory()/isFile() reflect the dirent's own type and do NOT

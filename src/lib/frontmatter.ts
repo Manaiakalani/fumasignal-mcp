@@ -151,6 +151,21 @@ function sanitizeNode(value: unknown, ancestors: Set<object>, budget: { remainin
         defineOwn('\u2026', TRUNCATED_MARKER);
         break;
       }
+      // The key string itself must also be charged against the budget,
+      // not just the value it maps to: the loop below only ever passed
+      // `v` through the recursive sanitizeNode() call that does the
+      // charging, leaving `k` - used directly, uncounted - free. A single
+      // mapping entry with an extremely long key (tens/hundreds of
+      // thousands of characters) and a short value would consume almost
+      // none of the budget while still contributing its full length to
+      // the eventual JSON-serialized size, defeating the budget's purpose
+      // for that shape of input just as surely as the amplification this
+      // function otherwise defends against.
+      budget.remaining -= k.length;
+      if (budget.remaining <= 0) {
+        defineOwn('\u2026', TRUNCATED_MARKER);
+        break;
+      }
       defineOwn(k, sanitizeNode(v, ancestors, budget));
     }
     return out;

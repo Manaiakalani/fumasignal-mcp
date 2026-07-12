@@ -61,6 +61,22 @@ describe('extractToc', () => {
     expect(toc).toHaveLength(1);
     expect(toc[0]!.title.endsWith('!')).toBe(true);
   });
+
+  it('caps the number of headings collected from a single document', () => {
+    // Regression: collectHeadings() had no cap at all - a file of many
+    // one-line "# x" headings (4 bytes each; well within any per-file
+    // byte limit) could produce headings/anchors/TOC entries numbering in
+    // the millions, each retained in memory indefinitely once indexed
+    // (local.ts/remote.ts hold every page's toc for the process's
+    // lifetime). 10,000 tiny headings - comfortably beyond any real
+    // documentation page - must be bounded to a small, fixed cap rather
+    // than producing 10,000 TOC entries.
+    const md = Array.from({ length: 10_000 }, (_, i) => `# Heading ${i}`).join('\n');
+    const toc = extractToc(md);
+    expect(toc.length).toBeLessThanOrEqual(5000);
+    expect(toc.length).toBeGreaterThan(0);
+    expect(toc[0]!.title).toBe('Heading 0');
+  });
 });
 
 describe('extractSection', () => {

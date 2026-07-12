@@ -62,6 +62,26 @@ interface Heading {
 }
 
 /**
+ * Upper bound on how many headings `collectHeadings()` will ever record for
+ * one document. Without this, an adversarial-but-plausible input - e.g. a
+ * file consisting of many one-line "# x" headings, well within
+ * `maxFileBytes` on its own (4 bytes per heading; a 10MB file could hold
+ * ~2.5 million of them) - can produce a headings/anchors/TOC set numbering
+ * in the millions. Each entry is small, but `local.ts`/`remote.ts` both
+ * hold every indexed page's `toc` in memory for the process's lifetime
+ * with no eviction (see their own doc comments), so that many small
+ * objects for a *single* page still adds up to on the order of a hundred+
+ * MB retained indefinitely - well beyond what a byte-size cap on the
+ * source file alone would suggest is possible. 5,000 is generous enough
+ * that no real documentation page comes remotely close (a page with
+ * anywhere near that many headings would already be unusable as a single
+ * document rendered by any normal viewer), while bounding the pathological
+ * case to a small, predictable multiple of a reasonable page's actual
+ * heading count.
+ */
+const MAX_HEADINGS = 5000;
+
+/**
  * Scan markdown for headings (outside fenced code blocks), assigning each a
  * unique anchor. Anchors are de-duplicated globally (not just against same
  * "base" text) so a generated anchor like "foo-1" can never collide with
@@ -77,6 +97,7 @@ function collectHeadings(markdown: string): { lines: string[]; headings: Heading
   const nextSuffix = new Map<string, number>();
   const usedAnchors = new Set<string>();
   for (let i = 0; i < lines.length; i++) {
+    if (headings.length >= MAX_HEADINGS) break;
     const line = lines[i]!;
     if (FENCE_RE.test(line)) {
       inFence = !inFence;

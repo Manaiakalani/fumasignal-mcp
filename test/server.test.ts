@@ -107,6 +107,25 @@ describe('MCP tool result size cap (MAX_TOOL_RESULT_CHARS)', () => {
     expect((result as { _meta?: { truncated?: boolean } })._meta?.truncated).toBe(true);
   });
 
+  it('never returns a truncated result longer than the documented 200,000-character hard ceiling', async () => {
+    // Regression: the truncation notice used to be appended *after*
+    // slicing to the full 200,000-character limit, so a truncated result
+    // was actually ~115 characters longer than the "hard ceiling"
+    // MAX_TOOL_RESULT_CHARS's doc comment promises. Uses a payload large
+    // enough that the exact overshoot (if the bug were present) would
+    // clearly show up as a length just over 200,000 rather than under it.
+    const toc: TocEntry[] = Array.from({ length: 20_000 }, (_, i) => ({
+      depth: 1,
+      title: `Heading number ${i} with some extra padding text to grow the payload`,
+      anchor: `heading-${i}`,
+    }));
+    const client = await connect(new FakeSource({ toc }));
+    const result = await client.callTool({ name: 'get_toc', arguments: { ref: '/docs/big' } });
+    const text = textOf(result as { content: Array<{ type: string; text?: string }> });
+    expect(text.length).toBeLessThanOrEqual(200_000);
+    expect(text).toContain('response truncated at 200000');
+  });
+
   it('truncates an oversized get_meta result instead of returning it in full', async () => {
     // Regression: get_meta JSON.stringify()'s arbitrary frontmatter with
     // no cap - a crafted/huge frontmatter block had nothing bounding the

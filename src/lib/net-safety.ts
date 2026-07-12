@@ -65,6 +65,7 @@ function isPrivateIPv4(ip: string): boolean {
   if (a === 192 && b === 168) return true; // 192.168.0.0/16 private
   if (a === 0) return true; // 0.0.0.0/8 "this network"
   if (a === 100 && b >= 64 && b <= 127) return true; // 100.64.0.0/10 shared/CGNAT
+  if (a === 198 && (b === 18 || b === 19)) return true; // 198.18.0.0/15 RFC 2544 benchmark testing
   if (a >= 224) return true; // 224.0.0.0/4 multicast + 240.0.0.0/4 reserved
   return false;
 }
@@ -103,6 +104,7 @@ function isPrivateIPv6(ip: string): boolean {
   }
   if (/^fe[89ab]/.test(canonical)) return true; // fe80::/10 link-local
   if (canonical.startsWith('fc') || canonical.startsWith('fd')) return true; // fc00::/7 unique local
+  if (canonical.startsWith('ff')) return true; // ff00::/8 multicast
   return false;
 }
 
@@ -151,6 +153,17 @@ export async function assertPublicResolution(hostname: string, lookup: DnsLookup
     // trade for a tool whose job is fetching untrusted remote content.
     throw new Error(
       `Refusing to connect to "${hostname}": DNS resolution failed (${err instanceof Error ? err.message : String(err)}), so it cannot be verified as a public address.`,
+    );
+  }
+  // A successful lookup that resolves to zero addresses isn't a realistic
+  // getaddrinfo() outcome, but `[].find(...)` would return `undefined`
+  // either way, and this function's whole stated philosophy (see the throw
+  // above) is to fail closed on anything it can't positively verify as
+  // public - "no addresses to check" is exactly that, not "nothing unsafe
+  // found".
+  if (resolved.length === 0) {
+    throw new Error(
+      `Refusing to connect to "${hostname}": DNS resolution returned no addresses, so it cannot be verified as a public address.`,
     );
   }
   const unsafe = resolved.find((r) => isPrivateOrReservedAddress(r.address));

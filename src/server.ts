@@ -333,7 +333,14 @@ function safeTruncateLength(text: string, max: number): number {
  */
 function capToolResultChars(text: string): [string, boolean] {
   if (text.length <= MAX_TOOL_RESULT_CHARS) return [text, false];
-  const cut = safeTruncateLength(text, MAX_TOOL_RESULT_CHARS);
-  const out = `${text.slice(0, cut)}\n\n…[response truncated at ${MAX_TOOL_RESULT_CHARS} characters; use a more targeted tool or a smaller limit/prefix to retrieve less at once]`;
+  // The notice appended below must itself count against the hard ceiling
+  // this function's doc comment promises - it used to be appended *after*
+  // slicing to the full MAX_TOOL_RESULT_CHARS, so the returned string was
+  // actually ~115 characters longer than the "hard ceiling" it claims to
+  // enforce. Reserving the notice's length before computing the cut point
+  // guarantees `cut + notice.length <= MAX_TOOL_RESULT_CHARS`.
+  const notice = `\n\n…[response truncated at ${MAX_TOOL_RESULT_CHARS} characters; use a more targeted tool or a smaller limit/prefix to retrieve less at once]`;
+  const cut = safeTruncateLength(text, Math.max(0, MAX_TOOL_RESULT_CHARS - notice.length));
+  const out = `${text.slice(0, cut)}${notice}`;
   return [out, true];
 }

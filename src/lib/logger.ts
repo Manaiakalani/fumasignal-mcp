@@ -1,10 +1,61 @@
 import pino from 'pino';
 
+/**
+ * Cap on how many characters of an error's `message`/`stack` (or a plain
+ * string logged under the `err` key) are ever written to a log line.
+ * Generous for any real diagnostic need, but bounds a class of issue
+ * empirically confirmed while auditing this file: several call sites log
+ * `err` (or an error-derived string) built from content that can be
+ * attacker/site-influenced and unbounded in length - e.g.
+ * `errorResult()` in server.ts logs a tool's full error message before
+ * `capToolResultChars()` ever truncates it for the *response*, and a
+ * remote docs site controls what ends up in a fetch/parse error's
+ * `.message`. A single multi-hundred-KB log line was measured to make a
+ * CI job's synchronous stderr write (pino's well-known-fd destinations
+ * default to sync mode) take *minutes* in one environment even though
+ * the actual test logic finished in seconds - log destinations are not
+ * guaranteed to drain quickly, and there is no reason a diagnostic log
+ * line needs the *entire* value when the cap on the returned tool result
+ * already makes anything past a few hundred characters redundant for
+ * debugging purposes.
+ */
+const MAX_LOGGED_ERR_CHARS = 2_000;
+
+function truncateForLog(s: string): string {
+  return s.length > MAX_LOGGED_ERR_CHARS
+    ? `${s.slice(0, MAX_LOGGED_ERR_CHARS)}\u2026[truncated for log]`
+    : s;
+}
+
+/**
+ * Replaces pino's default `err` serializer (which reproduces `type`,
+ * `message`, and `stack` verbatim with no length limit) with one that
+ * caps `message`/`stack` via `truncateForLog()`. Applies the same cap to
+ * a plain string logged under `err` (as `errorResult()` does), since
+ * pino only serializes values that are `instanceof Error` by default and
+ * otherwise passes the value through completely unchanged.
+ *
+ * Exported (rather than kept as a `pino()`-config-local closure) purely
+ * so tests can exercise the truncation logic directly, without needing
+ * to intercept pino's actual destination stream.
+ */
+export function errSerializer(err: unknown): unknown {
+  if (err instanceof Error) {
+    return {
+      type: err.name,
+      message: truncateForLog(err.message),
+      ...(err.stack ? { stack: truncateForLog(err.stack) } : {}),
+    };
+  }
+  return typeof err === 'string' ? truncateForLog(err) : err;
+}
+
 // CRITICAL: STDIO transport uses stdout for JSON-RPC. ALL logging must go to stderr.
 export const logger = pino(
   {
     level: process.env.FUMASIGNAL_LOG_LEVEL ?? 'info',
     base: undefined,
+    serializers: { err: errSerializer },
   },
   pino.destination(2), // file descriptor 2 = stderr
 );
@@ -51,7 +102,28 @@ export function redactUrlForLogging(url: string): string {
     // resolving against a synthetic base, which would fabricate a scheme
     // that was never actually present and risk producing a misleading
     // logged value.
-    return url.replace(/^\/\/([^/?#@]*)@/, '//***@');
+    //
+    // Two things the pattern has to get right that a naive "up to the
+    // first @" match doesn't: (1) WHATWG userinfo parsing treats the
+    // *last* "@" before the next "/", "?", or "#" as the delimiter, not
+    // the first - a password can itself contain "@" (e.g.
+    // "//alice:very@secret@host/x" has password "very@secret", not
+    // username "alice", password "very", followed by a bare "secret@host"
+    // authority) - so excluding "@" from the captured span, as a
+    // first-match-wins character class would, leaks whatever comes after
+    // the first "@" verbatim. Allowing "@" *into* the captured span and
+    // relying on the regex engine's standard greedy-then-backtrack
+    // behavior reproduces that "last @ wins" semantics for free: `*` first
+    // consumes as much as possible, then backtracks one character at a
+    // time until the character immediately after the captured span is
+    // "@", which is necessarily the *last* "@" in the run. (2) a leading
+    // "//" isn't guaranteed to be the very first character - operator
+    // config values aren't guaranteed to be trimmed - so anchoring only at
+    // "^\/\/" would fail to match (and thus leave a value *completely*
+    // unredacted) if there's leading whitespace before it. Capturing
+    // optional leading whitespace alongside the "//" marker and preserving
+    // it in the replacement handles that without weakening the match.
+    return url.replace(/^(\s*\/\/)([^/?#]*)@/, '$1***@');
   }
   if (!parsed.username && !parsed.password) return url;
   parsed.username = '***';

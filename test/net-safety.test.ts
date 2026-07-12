@@ -14,6 +14,8 @@ describe('isPrivateOrReservedAddress', () => {
     expect(isPrivateOrReservedAddress('100.127.255.255')).toBe(true); // CGNAT end
     expect(isPrivateOrReservedAddress('224.0.0.1')).toBe(true); // multicast
     expect(isPrivateOrReservedAddress('255.255.255.255')).toBe(true); // reserved
+    expect(isPrivateOrReservedAddress('198.18.0.1')).toBe(true); // 198.18.0.0/15 RFC 2544 benchmark start
+    expect(isPrivateOrReservedAddress('198.19.255.255')).toBe(true); // 198.18.0.0/15 RFC 2544 benchmark end
   });
 
   it('allows public IPv4 addresses, including just outside private range boundaries', () => {
@@ -26,6 +28,8 @@ describe('isPrivateOrReservedAddress', () => {
     expect(isPrivateOrReservedAddress('100.63.255.255')).toBe(false); // just below CGNAT
     expect(isPrivateOrReservedAddress('100.128.0.0')).toBe(false); // just above CGNAT
     expect(isPrivateOrReservedAddress('223.255.255.255')).toBe(false); // just below multicast
+    expect(isPrivateOrReservedAddress('198.17.255.255')).toBe(false); // just below 198.18.0.0/15
+    expect(isPrivateOrReservedAddress('198.20.0.0')).toBe(false); // just above 198.18.0.0/15
   });
 
   it('flags private/reserved IPv6 ranges', () => {
@@ -36,6 +40,8 @@ describe('isPrivateOrReservedAddress', () => {
     expect(isPrivateOrReservedAddress('fe80::1')).toBe(true); // link-local
     expect(isPrivateOrReservedAddress('fc00::1')).toBe(true); // unique local
     expect(isPrivateOrReservedAddress('fd12:3456:789a::1')).toBe(true); // unique local
+    expect(isPrivateOrReservedAddress('ff02::1')).toBe(true); // multicast (all-nodes link-local)
+    expect(isPrivateOrReservedAddress('ff00::')).toBe(true); // multicast (ff00::/8 start)
   });
 
   it('allows public IPv6 addresses', () => {
@@ -140,6 +146,19 @@ describe('assertPublicResolution', () => {
     const lookup = vi.fn().mockRejectedValue(new Error('ENOTFOUND'));
     await expect(assertPublicResolution('nonexistent.invalid', lookup)).rejects.toThrow(
       /DNS resolution failed/,
+    );
+  });
+
+  it('fails closed (throws) when the lookup succeeds but resolves to zero addresses', async () => {
+    // Regression: `resolved.find(...)` on an empty array returns
+    // `undefined`, the same as "no unsafe address found" - so a lookup
+    // that resolves to nothing at all used to pass this check and let the
+    // request proceed, even though this function's own stated philosophy
+    // (see the DNS-failure case above) is to fail closed on anything it
+    // can't positively verify as public.
+    const lookup = vi.fn().mockResolvedValue([]);
+    await expect(assertPublicResolution('docs.example.com', lookup)).rejects.toThrow(
+      /no addresses/,
     );
   });
 });
