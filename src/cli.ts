@@ -1,4 +1,4 @@
-import { Command, Option } from 'commander';
+import { Command, InvalidArgumentError, Option } from 'commander';
 import { logger } from './lib/logger.js';
 import { LocalFumadocsSource } from './sources/local.js';
 import { RemoteFumadocsSource } from './sources/remote.js';
@@ -14,6 +14,16 @@ export interface ParsedOptions {
   cacheTtlMs: number;
 }
 
+const DEFAULT_CACHE_TTL_MS = 300_000;
+
+function parseCacheTtl(value: string): number {
+  const n = Number.parseInt(value, 10);
+  if (!Number.isFinite(n) || n < 0) {
+    throw new InvalidArgumentError('must be a non-negative integer (milliseconds).');
+  }
+  return n;
+}
+
 export function buildProgram(): Command {
   const program = new Command();
   program
@@ -22,35 +32,47 @@ export function buildProgram(): Command {
       'MCP server that exposes a Fumadocs site (remote URL or local repo) to AI assistants.',
     )
     .version('0.1.0', '-v, --version')
-    .option('-u, --url <url>', 'Base URL of a deployed Fumadocs site (e.g. https://fumadocs.dev).')
-    .option('-l, --local <path>', 'Path to a local Fumadocs project root (filesystem mode).')
     .addOption(
-      new Option('--search-path <path>', 'Path of the search API on the remote site.').default(
-        '/api/search',
-      ),
+      new Option(
+        '-u, --url <url>',
+        'Base URL of a deployed Fumadocs site (e.g. https://fumadocs.dev).',
+      ).env('FUMASIGNAL_URL'),
+    )
+    .addOption(
+      new Option(
+        '-l, --local <path>',
+        'Path to a local Fumadocs project root (filesystem mode).',
+      ).env('FUMASIGNAL_LOCAL'),
+    )
+    .addOption(
+      new Option('--search-path <path>', 'Path of the search API on the remote site.')
+        .default('/api/search')
+        .env('FUMASIGNAL_SEARCH_PATH'),
     )
     .addOption(
       new Option(
         '--docs-prefix <prefix>',
         'URL path prefix for documentation pages (used to filter sitemap and resolve slugs).',
-      ).default('/docs'),
+      ).default('/docs')
+        .env('FUMASIGNAL_DOCS_PREFIX'),
     )
     .addOption(
       new Option(
         '--content-dir <path>',
         'Path to the local content/docs directory (relative to --local or absolute). Default: "content/docs".',
-      ),
+      ).env('FUMASIGNAL_CONTENT_DIR'),
     )
     .addOption(
       new Option(
         '--auth-header <value>',
         'Authorization header value to send on remote requests (e.g. "Bearer abc123").',
-      ),
+      ).env('FUMASIGNAL_AUTH_HEADER'),
     )
     .addOption(
       new Option('--cache-ttl <ms>', 'Cache TTL for remote responses in ms.')
-        .default('300000')
-        .argParser((v) => Number.parseInt(v, 10)),
+        .default(DEFAULT_CACHE_TTL_MS)
+        .argParser(parseCacheTtl)
+        .env('FUMASIGNAL_CACHE_TTL'),
     );
   return program;
 }
@@ -69,15 +91,12 @@ export function parseOptions(argv: string[]): ParsedOptions {
     cacheTtl: number;
   }>();
 
-  const url = opts.url ?? process.env.FUMASIGNAL_URL;
-  const local = opts.local ?? process.env.FUMASIGNAL_LOCAL;
-
-  if (!url && !local) {
+  if (!opts.url && !opts.local) {
     program.error(
       'Error: must provide --url <url> or --local <path> (or set FUMASIGNAL_URL / FUMASIGNAL_LOCAL).',
     );
   }
-  if (url && local) {
+  if (opts.url && opts.local) {
     program.error('Error: --url and --local are mutually exclusive. Pick one.');
   }
 
@@ -86,14 +105,10 @@ export function parseOptions(argv: string[]): ParsedOptions {
     docsPrefix: normalizePrefix(opts.docsPrefix),
     cacheTtlMs: opts.cacheTtl,
   };
-  if (url) out.url = url;
-  if (local) out.local = local;
-  if (opts.contentDir ?? process.env.FUMASIGNAL_CONTENT_DIR) {
-    out.contentDir = opts.contentDir ?? process.env.FUMASIGNAL_CONTENT_DIR;
-  }
-  if (opts.authHeader ?? process.env.FUMASIGNAL_AUTH_HEADER) {
-    out.authHeader = opts.authHeader ?? process.env.FUMASIGNAL_AUTH_HEADER;
-  }
+  if (opts.url) out.url = opts.url;
+  if (opts.local) out.local = opts.local;
+  if (opts.contentDir) out.contentDir = opts.contentDir;
+  if (opts.authHeader) out.authHeader = opts.authHeader;
   return out;
 }
 

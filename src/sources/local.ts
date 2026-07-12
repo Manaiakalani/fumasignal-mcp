@@ -1,7 +1,8 @@
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
-import matter from 'gray-matter';
-import { extractSection, extractToc, slugify } from '../lib/markdown.js';
+import { extractSection, extractToc } from '../lib/markdown.js';
+import { parseFrontmatter } from '../lib/frontmatter.js';
+import { hasPathPrefix } from '../lib/sitemap.js';
 import { logger } from '../lib/logger.js';
 import {
   type FumadocsSource,
@@ -65,10 +66,13 @@ export class LocalFumadocsSource implements FumadocsSource {
     let stat;
     try {
       stat = await fs.stat(this.contentDir);
-    } catch {
-      throw new SourceError(
-        `Local content directory not found: ${this.contentDir}. Pass --content-dir to override.`,
-      );
+    } catch (err) {
+      if (isNotFoundError(err)) {
+        throw new SourceError(
+          `Local content directory not found: ${this.contentDir}. Pass --content-dir to override.`,
+        );
+      }
+      throw new SourceError(`Failed to access local content directory: ${this.contentDir}`, err);
     }
     if (!stat.isDirectory()) {
       throw new SourceError(`Not a directory: ${this.contentDir}`);
@@ -81,10 +85,16 @@ export class LocalFumadocsSource implements FumadocsSource {
       if (slug === 'index') slug = '';
       else if (slug.endsWith('/index')) slug = slug.slice(0, -'/index'.length);
       const url = slug ? `${this.urlPrefix}/${slug}` : this.urlPrefix;
-      const raw = await fs.readFile(file, 'utf8');
-      const parsed = matter(raw);
-      const body = parsed.content;
-      const meta = (parsed.data ?? {}) as Record<string, unknown>;
+      let raw: string;
+      let body: string;
+      let meta: Record<string, unknown>;
+      try {
+        raw = await fs.readFile(file, 'utf8');
+        ({ content: body, data: meta } = parseFrontmatter(raw));
+      } catch (err) {
+        logger.warn({ err, file }, 'local: skipping page that failed to read/parse');
+        continue;
+      }
       const toc = extractToc(body);
       const title =
         (meta.title as string | undefined) ??
@@ -137,6 +147,8 @@ export class LocalFumadocsSource implements FumadocsSource {
     const tokens = query.split(/\s+/).filter(Boolean);
     const scored: Array<{ hit: SearchHit; score: number }> = [];
     for (const page of idx.values()) {
+      if (opts.tag && !matchesTag(page.meta.tag, opts.tag)) continue;
+      if (opts.locale && page.meta.locale !== opts.locale) continue;
       const haystack = `${page.title}\n${page.description ?? ''}\n${page.body}`.toLowerCase();
       let score = 0;
       for (const t of tokens) {
@@ -157,6 +169,7 @@ export class LocalFumadocsSource implements FumadocsSource {
             ...(page.description ? { description: page.description } : {}),
             excerpt: snippet(page.body, tokens[0] ?? ''),
             score,
+            ...(typeof page.meta.tag === 'string' ? { tag: page.meta.tag } : {}),
           },
           score,
         });
@@ -171,7 +184,7 @@ export class LocalFumadocsSource implements FumadocsSource {
     const idx = await this.index();
     const out: PageSummary[] = [];
     for (const page of idx.values()) {
-      if (prefix && !page.url.startsWith(prefix)) continue;
+      if (prefix && !hasPathPrefix(page.url, prefix)) continue;
       out.push({
         id: page.url,
         url: page.url,
@@ -220,20 +233,34 @@ export class LocalFumadocsSource implements FumadocsSource {
   }
 
   async getLlmsTxt(full = false): Promise<string | null> {
-    const candidate = path.join(this.rootDir, full ? 'llms-full.txt' : 'llms.txt');
-    try {
-      return await fs.readFile(candidate, 'utf8');
-    } catch {
-      // Also check public/ directory.
+    const name = full ? 'llms-full.txt' : 'llms.txt';
+    const candidates = [path.join(this.rootDir, name), path.join(this.rootDir, 'public', name)];
+    for (const candidate of candidates) {
       try {
-        return await fs.readFile(
-          path.join(this.rootDir, 'public', full ? 'llms-full.txt' : 'llms.txt'),
-          'utf8',
-        );
-      } catch {
-        return null;
+        return await this.readFileWithinRoot(candidate);
+      } catch (err) {
+        if (isNotFoundError(err)) continue;
+        logger.warn({ err, candidate }, 'local: failed to read llms.txt candidate');
       }
     }
+    return null;
+  }
+
+  /**
+   * Read a file, refusing to follow a symlink that resolves outside
+   * `rootDir`. Git supports committing symlinks, so cloning an untrusted
+   * docs repo and pointing `--local` at it could otherwise let a symlink
+   * (e.g. `llms.txt -> /etc/passwd`) exfiltrate arbitrary host files via a
+   * fixed-name read.
+   */
+  private async readFileWithinRoot(candidate: string): Promise<string> {
+    const real = await fs.realpath(candidate);
+    const realRoot = await fs.realpath(this.rootDir);
+    const rel = path.relative(realRoot, real);
+    if (rel === '..' || rel.startsWith(`..${path.sep}`) || path.isAbsolute(rel)) {
+      throw new SourceError(`Refusing to read a file outside the project root: ${candidate}`);
+    }
+    return fs.readFile(real, 'utf8');
   }
 }
 
@@ -242,6 +269,11 @@ async function walk(dir: string): Promise<string[]> {
   const entries = await fs.readdir(dir, { withFileTypes: true });
   for (const entry of entries) {
     const full = path.join(dir, entry.name);
+    // entry.isDirectory()/isFile() reflect the dirent's own type and do NOT
+    // follow symlinks (a symlink's dirent type is neither "file" nor
+    // "directory"), so symlinked entries are intentionally skipped here
+    // rather than traversed/read - this prevents a symlink planted inside
+    // contentDir (e.g. from an untrusted cloned docs repo) from escaping it.
     if (entry.isDirectory()) {
       out.push(...(await walk(full)));
     } else if (entry.isFile()) {
@@ -249,6 +281,20 @@ async function walk(dir: string): Promise<string[]> {
     }
   }
   return out;
+}
+
+function isNotFoundError(err: unknown): boolean {
+  return (
+    typeof err === 'object' &&
+    err !== null &&
+    'code' in err &&
+    (err as { code?: unknown }).code === 'ENOENT'
+  );
+}
+
+function matchesTag(metaTag: unknown, wanted: string): boolean {
+  if (Array.isArray(metaTag)) return metaTag.includes(wanted);
+  return metaTag === wanted;
 }
 
 function firstHeading(body: string): string | undefined {
@@ -278,6 +324,3 @@ function snippet(body: string, needle: string, contextChars = 80): string {
   const suffix = end < body.length ? '…' : '';
   return `${prefix}${body.slice(start, end).replace(/\s+/g, ' ').trim()}${suffix}`;
 }
-
-// Suppress unused-import lint warning when slugify isn't used (kept for future).
-void slugify;
