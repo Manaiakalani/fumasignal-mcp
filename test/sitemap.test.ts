@@ -75,6 +75,30 @@ describe('decodeAndNormalizePathname', () => {
   it('returns null for malformed percent-encoding instead of throwing', () => {
     expect(decodeAndNormalizePathname('/docs/%')).toBeNull();
   });
+
+  it('rejects a double-encoded slash ("%252f") hiding a real separator', () => {
+    // decodeURIComponent unwraps exactly one layer: '%252f' -> the literal
+    // three-character text '%2f', which the WHATWG URL pathname parser
+    // deliberately leaves alone (it never decodes "%2f" into a real "/"
+    // while parsing, so it can't be confused about segment count). That
+    // makes "/docs/..%252fprivate" normalize to "/docs/..%2fprivate" - one
+    // harmless-looking segment to *us*, passing hasPathPrefix - but many
+    // real HTTP servers *do* decode "%2f" while resolving the request
+    // path, at which point "..%2fprivate" becomes the real segment "..",
+    // escaping docsPrefix even though we already fetched that exact
+    // literal pathname. Must fail closed instead.
+    expect(decodeAndNormalizePathname('/docs/..%252fprivate')).toBeNull();
+  });
+
+  it('rejects a double-encoded backslash ("%255c") hiding a real separator', () => {
+    expect(decodeAndNormalizePathname('/docs/..%255c..%255cadmin')).toBeNull();
+  });
+
+  it('does not false-positive on ordinary encoded characters (space, unicode, literal %)', () => {
+    expect(decodeAndNormalizePathname('/docs/my%20page')).toBe('/docs/my%20page');
+    expect(decodeAndNormalizePathname('/docs/caf%C3%A9')).toBe('/docs/caf%C3%A9');
+    expect(decodeAndNormalizePathname('/docs/50%25-off-sale')).toBe('/docs/50%-off-sale');
+  });
 });
 
 describe('filterToDocs', () => {
@@ -115,6 +139,12 @@ describe('filterToDocs', () => {
   it('drops a sitemap entry with malformed percent-encoding instead of throwing', () => {
     const urls = ['https://example.com/docs/%', 'https://example.com/docs/legit'];
     expect(() => filterToDocs(urls, 'https://example.com/', '/docs')).not.toThrow();
+    const filtered = filterToDocs(urls, 'https://example.com/', '/docs');
+    expect(filtered.map((f) => f.path)).toEqual(['/docs/legit']);
+  });
+
+  it('drops a sitemap entry hiding a double-encoded separator', () => {
+    const urls = ['https://example.com/docs/..%252fprivate', 'https://example.com/docs/legit'];
     const filtered = filterToDocs(urls, 'https://example.com/', '/docs');
     expect(filtered.map((f) => f.path)).toEqual(['/docs/legit']);
   });

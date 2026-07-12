@@ -62,6 +62,31 @@ describe('parseFrontmatter', () => {
     const { data } = parseFrontmatter(raw);
     expect((data.title as string).length).toBeLessThan(huge.length);
   });
+
+  it('does not let a "__proto__" frontmatter key hijack the sanitized object\'s prototype', () => {
+    // Regression: `out[k] = sanitizeNode(...)` on a plain `{}` object
+    // invokes Object.prototype's `__proto__` accessor setter when
+    // `k === '__proto__'`, *replacing* the output object's own prototype
+    // with the attacker's value instead of storing it as an ordinary data
+    // property. That lets unset fields silently "shadow"-resolve through
+    // the hijacked prototype chain (e.g. `data.locale`/`data.tag`) without
+    // ever appearing in Object.keys()/JSON.stringify() - a confused-deputy
+    // risk for any code that reads frontmatter fields via dot access.
+    const raw = `---
+__proto__:
+  title: "INJECTED"
+  polluted: true
+title: "legit title"
+---
+content`;
+    const { data } = parseFrontmatter(raw);
+    expect(data.title).toBe('legit title');
+    expect((data as Record<string, unknown>).polluted).toBeUndefined();
+    expect(Object.getPrototypeOf(data)).toBe(Object.prototype);
+    expect(Object.keys(data)).toContain('__proto__');
+    // The unrelated process-wide Object.prototype must be untouched too.
+    expect(({} as Record<string, unknown>).polluted).toBeUndefined();
+  });
 });
 
 describe('sanitizeParsedYaml', () => {

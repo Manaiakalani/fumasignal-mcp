@@ -562,6 +562,26 @@ describe('RemoteFumadocsSource', () => {
     await expect(src.getPage('/docs/%2e%2e%2fapi/private')).rejects.toThrow(/docs prefix/i);
   });
 
+  it('rejects a ref hiding a double-encoded separator ("%252f")', async () => {
+    // Regression (CWE-22): decodeURIComponent only unwraps one encoding
+    // layer, so "%252f" (which is "%2f" with its own "%" encoded) decodes
+    // to the literal text "%2f" - which the WHATWG URL parser leaves
+    // alone while parsing (it never decodes "%2f" into a real "/"). That
+    // makes "/docs/..%252fapi/private" normalize to one harmless-looking
+    // segment and pass hasPathPrefix(), yet the exact literal pathname
+    // "/docs/..%2fapi/private" is what actually gets fetched - and many
+    // real HTTP servers decode "%2f" while resolving *their* request
+    // path, which would resolve outside "/docs".
+    const src = new RemoteFumadocsSource({
+      baseUrl,
+      authHeader: '******',
+      fetchImpl: makeFetch({
+        'https://example.com/api/private': { body: 'top secret', contentType: 'text/plain' },
+      }),
+    });
+    await expect(src.getPage('/docs/..%252fapi/private')).rejects.toThrow(/unresolvable path/i);
+  });
+
   it('rejects a ref with malformed percent-encoding instead of treating it as a literal path', async () => {
     // Regression: decodeURIComponent throws on malformed percent-encoding
     // (including "overlong" UTF-8 encodings sometimes used to smuggle

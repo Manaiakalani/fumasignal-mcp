@@ -93,11 +93,28 @@ function decodeXmlEntities(s: string): string {
  * canonical *encoded* form rather than a decoded one - callers that need
  * a human-readable path should decode this return value themselves.
  *
+ * 3. Double-encoded *separator* (as opposed to double-encoded *dot
+ *    segment*, case 2 above): "%252f" is "%2f" with its own "%" encoded.
+ *    `decodeURIComponent()` only unwraps one layer, producing the literal
+ *    three-character text "%2f" - which is exactly what case 1 says the
+ *    WHATWG path parser leaves alone (it never decodes "%2f"/"%5c" into
+ *    an actual "/"/"\\" while parsing, precisely so it doesn't change how
+ *    many segments a path has). So "/docs/..%252fprivate" normalizes to
+ *    "/docs/..%2fprivate" - one harmless-looking segment to *us* - and
+ *    passes `hasPathPrefix()`. It is not harmless to every consumer: many
+ *    real HTTP servers/frameworks *do* decode "%2f"/"%5c" while resolving
+ *    the request path (the same well-documented traversal class as e.g.
+ *    CVE-2021-41773). Once such a server decodes it, "..%2fprivate"
+ *    becomes the real segment "..", escaping `docsPrefix` even though our
+ *    own check passed it and we go on to fetch that exact literal path
+ *    (see the "%2f"/"%5c" check below, after normalization).
+ *
  * Returns `null` (rather than throwing) if the pathname contains
- * malformed percent-encoding (`decodeURIComponent` throws) or - belt and
- * suspenders, shouldn't be reachable given the scratch URL always has a
- * valid base - if the result doesn't start with "/", so callers can fail
- * closed with their own error type/message.
+ * malformed percent-encoding (`decodeURIComponent` throws), still
+ * contains a literal (once-decoded) encoded separator per case 3 above,
+ * or - belt and suspenders, shouldn't be reachable given the scratch URL
+ * always has a valid base - if the result doesn't start with "/", so
+ * callers can fail closed with their own error type/message.
  */
 export function decodeAndNormalizePathname(pathname: string): string | null {
   let decoded: string;
@@ -114,6 +131,11 @@ export function decodeAndNormalizePathname(pathname: string): string | null {
   }
   const normalized = scratch.pathname;
   if (normalized !== '/' && !normalized.startsWith('/')) return null;
+  // A literal "%2f"/"%5c" surviving this far is never a legitimate doc
+  // slug - it's a hidden, still-encoded path separator (see case 3 above).
+  // Fail closed rather than handing a same-looking-to-us-but-not-to-
+  // everyone value to `hasPathPrefix()`.
+  if (/%2f|%5c/i.test(normalized)) return null;
   return normalized;
 }
 
