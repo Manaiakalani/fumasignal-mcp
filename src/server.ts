@@ -154,7 +154,8 @@ function registerTools(server: McpServer, source: FumadocsSource): void {
         let body = page.markdown;
         let truncated = false;
         if (body.length > MAX_PAGE_CHARS) {
-          body = `${body.slice(0, MAX_PAGE_CHARS)}\n\n…[truncated; ${body.length - MAX_PAGE_CHARS} more chars available via get_section]`;
+          const cut = safeTruncateLength(body, MAX_PAGE_CHARS);
+          body = `${body.slice(0, cut)}\n\n…[truncated; ${body.length - cut} more chars available via get_section]`;
           truncated = true;
         }
         const head = `# ${page.title}\n\n_URL: ${page.url}_${page.description ? `\n\n${page.description}` : ''}`;
@@ -300,7 +301,25 @@ function errorResult(
 }
 
 function truncate(s: string, max: number): string {
-  return s.length > max ? `${s.slice(0, max)}…` : s;
+  if (s.length <= max) return s;
+  return `${s.slice(0, safeTruncateLength(s, max))}…`;
+}
+
+/**
+ * Return a cut length `<= max` such that `text.slice(0, cut)` never splits
+ * a UTF-16 surrogate pair. Strings are sequences of UTF-16 code units, not
+ * code points: an emoji or other supplementary-plane character is stored
+ * as a high surrogate (0xD800-0xDBFF) followed by a low surrogate, and
+ * naively cutting at an arbitrary offset can land between the two. That
+ * leaves a dangling lone high surrogate at the end of the truncated
+ * string, which is not well-formed Unicode and can render as U+FFFD or
+ * confuse a downstream JSON/UTF-8 encoder. Used by every truncation site
+ * in this file so none of them can reintroduce this.
+ */
+function safeTruncateLength(text: string, max: number): number {
+  if (max <= 0 || max >= text.length) return Math.max(0, Math.min(max, text.length));
+  const before = text.charCodeAt(max - 1);
+  return before >= 0xd800 && before <= 0xdbff ? max - 1 : max;
 }
 
 /**
@@ -314,6 +333,7 @@ function truncate(s: string, max: number): string {
  */
 function capToolResultChars(text: string): [string, boolean] {
   if (text.length <= MAX_TOOL_RESULT_CHARS) return [text, false];
-  const out = `${text.slice(0, MAX_TOOL_RESULT_CHARS)}\n\n…[response truncated at ${MAX_TOOL_RESULT_CHARS} characters; use a more targeted tool or a smaller limit/prefix to retrieve less at once]`;
+  const cut = safeTruncateLength(text, MAX_TOOL_RESULT_CHARS);
+  const out = `${text.slice(0, cut)}\n\n…[response truncated at ${MAX_TOOL_RESULT_CHARS} characters; use a more targeted tool or a smaller limit/prefix to retrieve less at once]`;
   return [out, true];
 }

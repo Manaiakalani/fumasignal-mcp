@@ -1,7 +1,8 @@
 import { mkdtemp, mkdir, writeFile, rm, symlink } from 'node:fs/promises';
+import { promises as fsPromises } from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
-import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import { LocalFumadocsSource } from '../src/sources/local.js';
 
 let tmpDir: string;
@@ -382,6 +383,42 @@ describe('LocalFumadocsSource security fixes', () => {
       const src = new LocalFumadocsSource({ rootDir: dir, maxFileCount: 3 });
       const pages = await src.listPages();
       expect(pages.length).toBe(3);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('stops walk() itself from descending into further directories once maxFileCount is reached, not just from indexing further files', async () => {
+    // Regression: walk() used to fully enumerate every matching file path
+    // in the tree - recursing into every subdirectory no matter what -
+    // before buildIndex() ever got a chance to apply maxFileCount. For an
+    // extremely large tree, that means walk() itself (not just the later
+    // read/index step) could momentarily hold megabytes of path strings
+    // in memory before the budget was ever consulted. walk() now takes a
+    // limit and stops enumerating once it's reached, so verify fs.readdir
+    // is never even called for a sibling subdirectory once the budget is
+    // already exhausted. Uses two sibling subdirectories, each with one
+    // file, and maxFileCount: 1 - regardless of which of the two
+    // subdirectories the filesystem happens to enumerate first, walk()
+    // must find its one allowed file there and stop before descending
+    // into the other, so exactly 2 directories (the content root + one
+    // subdirectory) should ever be passed to fs.readdir, never 3.
+    const dir = await mkdtemp(path.join(os.tmpdir(), 'fumasignal-local-walklimit-'));
+    try {
+      const docs = path.join(dir, 'content', 'docs');
+      await mkdir(path.join(docs, 'a'), { recursive: true });
+      await mkdir(path.join(docs, 'z'), { recursive: true });
+      await writeFile(path.join(docs, 'a', 'one.md'), '# One');
+      await writeFile(path.join(docs, 'z', 'two.md'), '# Two');
+      const readdirSpy = vi.spyOn(fsPromises, 'readdir');
+      try {
+        const src = new LocalFumadocsSource({ rootDir: dir, maxFileCount: 1 });
+        const pages = await src.listPages();
+        expect(pages.length).toBe(1);
+        expect(readdirSpy.mock.calls.length).toBe(2);
+      } finally {
+        readdirSpy.mockRestore();
+      }
     } finally {
       await rm(dir, { recursive: true, force: true });
     }

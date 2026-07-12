@@ -39,9 +39,19 @@ export function redactUrlForLogging(url: string): string {
   try {
     parsed = new URL(url);
   } catch {
-    // Not a parseable absolute URL (e.g. a bare path) - nothing to redact,
-    // and safer to pass it through unchanged than to risk mangling it.
-    return url;
+    // Not parseable as a standalone absolute URL by the WHATWG parser.
+    // Most commonly this is just a bare path (e.g. "/docs/foo"), which
+    // structurally can't carry userinfo - safe to return unchanged rather
+    // than risk mangling it. But a *protocol-relative* URL
+    // ("//user:pass@host/...") is ALSO rejected here (the parser requires
+    // a base to resolve a leading "//" with no scheme), and unlike a bare
+    // path, that shape can carry real userinfo - operator-typed config
+    // values in particular aren't guaranteed to include a scheme. Mask it
+    // via a targeted pattern match on the original string rather than
+    // resolving against a synthetic base, which would fabricate a scheme
+    // that was never actually present and risk producing a misleading
+    // logged value.
+    return url.replace(/^\/\/([^/?#@]*)@/, '//***@');
   }
   if (!parsed.username && !parsed.password) return url;
   parsed.username = '***';

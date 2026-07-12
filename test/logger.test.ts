@@ -36,6 +36,34 @@ describe('redactUrlForLogging', () => {
     expect(redactUrlForLogging('/docs/getting-started')).toBe('/docs/getting-started');
   });
 
+  it('masks userinfo in a protocol-relative URL ("//user:pass@host/...") that the WHATWG parser rejects outright', () => {
+    // Regression: new URL() throws for a protocol-relative string (it has
+    // no scheme and no base to resolve against), which used to fall
+    // through to the "unparseable, return unchanged" branch - silently
+    // leaking real credentials for exactly the kind of operator-typed,
+    // not-yet-validated value (e.g. a --url passed before it's ever
+    // parsed/validated elsewhere) that's missing a scheme by mistake.
+    expect(redactUrlForLogging('//alice:s3cret@example.com/docs')).toBe('//***@example.com/docs');
+    expect(redactUrlForLogging('//alice:s3cret@example.com/docs')).not.toContain('s3cret');
+  });
+
+  it('masks userinfo in a protocol-relative URL with a username but no password', () => {
+    expect(redactUrlForLogging('//alice@example.com/docs')).toBe('//***@example.com/docs');
+  });
+
+  it('does not mistake an "@" inside a protocol-relative URL\'s path for userinfo', () => {
+    // No credentials here at all - just a path segment that happens to
+    // contain "@" (e.g. a retina-image-style filename). Must be left
+    // completely unchanged, not have a "//***@" prefix fabricated.
+    const url = '//example.com/docs/photo@2x.png';
+    expect(redactUrlForLogging(url)).toBe(url);
+  });
+
+  it('leaves an ordinary protocol-relative URL with no userinfo at all unchanged', () => {
+    const url = '//example.com/docs/page';
+    expect(redactUrlForLogging(url)).toBe(url);
+  });
+
   it('returns an empty string unchanged, without throwing', () => {
     expect(() => redactUrlForLogging('')).not.toThrow();
     expect(redactUrlForLogging('')).toBe('');

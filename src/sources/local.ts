@@ -66,6 +66,18 @@ export interface LocalSourceOptions {
    * alone leaves exactly this kind of gap for the shape it doesn't cover),
    * closes that gap. Default 50,000 - generous headroom for any real docs
    * tree, not a functional restriction.
+   *
+   * Also passed to `walk()` as the max number of paths it will ever
+   * enumerate, not just how many `buildIndex()` will index: capping only
+   * the read/index step would still let `walk()` itself collect (and hold
+   * in memory, as one big array of strings) every matching path in an
+   * arbitrarily large tree before that cap is ever consulted. One
+   * consequence: if any of the first `maxFileCount` files `walk()` finds
+   * are skipped (e.g. for exceeding `maxFileBytes`), the total actually
+   * indexed can end up below `maxFileCount` even if the tree contains
+   * further valid files beyond that point - an intentional trade-off
+   * (bounding enumeration cost) rather than a guarantee that exactly this
+   * many files will be indexed whenever that many valid ones exist.
    */
   maxFileCount?: number;
 }
@@ -151,10 +163,11 @@ export class LocalFumadocsSource implements FumadocsSource {
       // content-directory boundary instead of a fixed filename.
       await this.assertRealpathWithinRoot(this.contentDir);
     }
-    // walk() already filters to .md/.mdx during traversal (see its doc
-    // comment), so every entry here is a content file - no extension
-    // re-check needed.
-    const files = await walk(this.contentDir);
+    // walk() already filters to .md/.mdx during traversal, and stops
+    // enumerating once maxFileCount paths are found (see its doc comment),
+    // so every entry here is a content file and the list itself can never
+    // exceed maxFileCount - no extension re-check needed.
+    const files = await walk(this.contentDir, this.maxFileCount);
     let totalBytes = 0;
     let indexedCount = 0;
     for (const file of files) {
@@ -412,18 +425,30 @@ export class LocalFumadocsSource implements FumadocsSource {
 }
 
 /**
- * Recursively collect every `.md`/`.mdx` file under `dir`. Filtering to the
- * two content extensions *here*, during traversal, rather than after
- * `walk()` returns - matters when `dir` holds many non-content files
- * (images, generated assets, etc. are common in a docs repo): without it,
- * the returned array (and the recursive `push(...)` calls that build it -
- * see below) would momentarily hold every file path in the tree, not just
- * the ones `buildIndex()` will ever read.
+ * Recursively collect every `.md`/`.mdx` file under `dir`, up to `limit`
+ * total paths. Filtering to the two content extensions *here*, during
+ * traversal, rather than after `walk()` returns - matters when `dir` holds
+ * many non-content files (images, generated assets, etc. are common in a
+ * docs repo): without it, the returned array (and the recursive loop that
+ * builds it - see below) would momentarily hold every file path in the
+ * tree, not just the ones `buildIndex()` will ever read.
+ *
+ * `limit` (`buildIndex()` passes `maxFileCount`) stops the walk itself once
+ * enough paths have been found, rather than only being enforced after the
+ * fact by `buildIndex()`'s own loop: an untrusted `contentDir` (see
+ * `maxFileCount`'s doc comment) with an extremely large number of matching
+ * files would otherwise make `walk()` enumerate and return every one of
+ * them - megabytes of path strings alone - before `buildIndex()` ever gets
+ * a chance to apply its budget. Threaded through the recursion as "however
+ * much budget remains" rather than a shared mutable counter, since each
+ * call only needs to know how many more entries it may still contribute.
  */
-async function walk(dir: string): Promise<string[]> {
+async function walk(dir: string, limit: number): Promise<string[]> {
   const out: string[] = [];
+  if (limit <= 0) return out;
   const entries = await fs.readdir(dir, { withFileTypes: true });
   for (const entry of entries) {
+    if (out.length >= limit) break;
     const full = path.join(dir, entry.name);
     // entry.isDirectory()/isFile() reflect the dirent's own type and do NOT
     // follow symlinks (a symlink's dirent type is neither "file" nor
@@ -431,14 +456,14 @@ async function walk(dir: string): Promise<string[]> {
     // rather than traversed/read - this prevents a symlink planted inside
     // contentDir (e.g. from an untrusted cloned docs repo) from escaping it.
     if (entry.isDirectory()) {
-      // Not `out.push(...(await walk(full)))`: spreading a large array as
-      // call arguments hits a JS engine argument-count ceiling - empirically
-      // confirmed to throw `RangeError: Maximum call stack size exceeded`
-      // on Node for arrays of roughly 125,000+ elements (varies by engine
-      // build/version, but is well within reach of a docs tree with a
-      // large number of content files, deliberately structured to attack
+      // Not `out.push(...(await walk(full, ...)))`: spreading a large array
+      // as call arguments hits a JS engine argument-count ceiling -
+      // empirically confirmed to throw `RangeError: Maximum call stack size
+      // exceeded` on Node for arrays of roughly 125,000+ elements (varies by
+      // engine build/version, but is well within reach of a docs tree with
+      // a large number of content files, deliberately structured to attack
       // this or not). A plain loop has no such limit.
-      for (const child of await walk(full)) out.push(child);
+      for (const child of await walk(full, limit - out.length)) out.push(child);
     } else if (entry.isFile() && /\.mdx?$/i.test(entry.name)) {
       out.push(full);
     }
