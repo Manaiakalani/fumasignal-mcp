@@ -1,5 +1,5 @@
 import { logger } from '../lib/logger.js';
-import { TtlCache } from '../lib/cache.js';
+import { TtlCache, Coalescer } from '../lib/cache.js';
 import { htmlToMarkdown } from '../lib/html-to-md.js';
 import { extractSection, extractToc } from '../lib/markdown.js';
 import { parseFrontmatter, asNonEmptyString } from '../lib/frontmatter.js';
@@ -119,6 +119,12 @@ export class RemoteFumadocsSource implements FumadocsSource {
   private pageCache: TtlCache<string, PageContent>;
   private listCache: TtlCache<'all', PageSummary[]>;
   private llmsCache: TtlCache<string, string | null>;
+  // Coalesce concurrent cache-miss fetches for the same key so parallel
+  // callers share one fetch chain instead of each independently repeating
+  // it (see `Coalescer`'s doc comment).
+  private pagePending = new Coalescer<string, PageContent>();
+  private listPending = new Coalescer<'all', PageSummary[]>();
+  private llmsPending = new Coalescer<string, string | null>();
 
   constructor(opts: RemoteSourceOptions) {
     this.base = new URL(opts.baseUrl);
@@ -224,6 +230,14 @@ export class RemoteFumadocsSource implements FumadocsSource {
    * carry a page-fetch outside docsPrefix even though the original ref was
    * validated. Sitemap/search/llms.txt call sites omit it, since those
    * legitimately live outside docsPrefix.
+   *
+   * The hop-0 skip described above intentionally lets the initial fetch of
+   * a `/docs.md`-style root-sibling candidate through unchecked here - but
+   * `fetchPageBody()` itself filters those candidates out before they ever
+   * reach this method whenever `this.authHeader` is set, so a credential
+   * is never attached to a request outside docsPrefix even on hop 0 (see
+   * its doc comment). That filtering, not this method, is what keeps the
+   * root-sibling convenience from becoming an authorization-boundary leak.
    */
   private async fetchSameOrigin(
     url: URL,
@@ -324,32 +338,40 @@ export class RemoteFumadocsSource implements FumadocsSource {
 
   async listPages(prefix?: string): Promise<PageSummary[]> {
     const cached = this.listCache.get('all');
-    let all = cached;
-    if (!all) {
-      const urls = await this.fetchSitemapUrls(new URL('/sitemap.xml', this.base), 0, {
-        fetches: 0,
-        visited: new Set(),
-        totalUrls: 0,
-      });
-      const filtered = filterToDocs(urls, this.base.toString(), this.docsPrefix);
-      // Dedup by path: a repeated <loc> (within one sitemap, or the same
-      // page legitimately listed in more than one) would otherwise
-      // inflate the returned/cached list with duplicate entries.
-      const seen = new Set<string>();
-      all = [];
-      for (const { path } of filtered) {
-        if (seen.has(path)) continue;
-        seen.add(path);
-        all.push({
-          id: path,
-          url: path,
-          title: titleFromPath(path),
-          segments: path.split('/').filter(Boolean),
+    // Coalesce concurrent misses (see `Coalescer`'s doc comment) - without
+    // this, N concurrent `listPages()` calls before the sitemap has been
+    // fetched once would each independently trigger the full (bounded but
+    // still up to MAX_SITEMAP_FETCHES-request) sitemap-index traversal.
+    const all =
+      cached ??
+      (await this.listPending.run('all', async () => {
+        const raced = this.listCache.get('all');
+        if (raced) return raced;
+        const urls = await this.fetchSitemapUrls(new URL('/sitemap.xml', this.base), 0, {
+          fetches: 0,
+          visited: new Set(),
+          totalUrls: 0,
         });
-      }
-      this.listCache.set('all', all);
-      logger.debug({ count: all.length }, 'remote: built page list from sitemap');
-    }
+        const filtered = filterToDocs(urls, this.base.toString(), this.docsPrefix);
+        // Dedup by path: a repeated <loc> (within one sitemap, or the same
+        // page legitimately listed in more than one) would otherwise
+        // inflate the returned/cached list with duplicate entries.
+        const seen = new Set<string>();
+        const built: PageSummary[] = [];
+        for (const { path } of filtered) {
+          if (seen.has(path)) continue;
+          seen.add(path);
+          built.push({
+            id: path,
+            url: path,
+            title: titleFromPath(path),
+            segments: path.split('/').filter(Boolean),
+          });
+        }
+        this.listCache.set('all', built);
+        logger.debug({ count: built.length }, 'remote: built page list from sitemap');
+        return built;
+      }));
     if (!prefix) return all;
     return all.filter((p) => hasPathPrefix(p.url, prefix));
   }
@@ -436,31 +458,53 @@ export class RemoteFumadocsSource implements FumadocsSource {
 
   async getPage(ref: string): Promise<PageContent> {
     const target = this.resolveRef(ref);
-    const cacheKey = target.pathname;
+    // Must include the query string, not just the pathname: `fetchPageBody()`'s
+    // HTML-scrape fallback fetches `target` as-is (query intact - see its doc
+    // comment), so a response can genuinely vary by query. Keying the cache
+    // on pathname alone would let a query-bearing ref's response get cached
+    // under the *same* key as the plain path, so a later plain-path request
+    // would incorrectly receive whatever was fetched for the earlier query
+    // (or vice versa) instead of its own content. Empirically confirmed: a
+    // ref carrying a query string that changes the HTML response poisoned
+    // the plain-path cache entry with the query-specific content.
+    const cacheKey = target.pathname + target.search;
     const cached = this.pageCache.get(cacheKey);
     if (cached) return cached;
 
-    const { markdown, meta } = await this.fetchPageBody(target);
-    const toc = extractToc(markdown);
-    // meta.title/description are untrusted frontmatter values (see
-    // asNonEmptyString's doc comment) - guard both instead of an `as
-    // string` cast so a wrong-typed value (e.g. `title: 42`) falls
-    // through to the markdown/path-derived fallbacks instead of
-    // silently propagating a non-string into a `string`-typed field.
-    const title = asNonEmptyString(meta.title) ?? extractTitle(markdown) ?? titleFromPath(target.pathname);
-    const description = asNonEmptyString(meta.description);
-    const content: PageContent = {
-      id: target.pathname,
-      url: target.pathname,
-      title,
-      description,
-      segments: target.pathname.split('/').filter(Boolean),
-      markdown,
-      meta,
-      toc,
-    };
-    this.pageCache.set(cacheKey, content);
-    return content;
+    // Coalesce concurrent misses for the same key into one fetch chain
+    // (see `Coalescer`'s doc comment) instead of letting each concurrent
+    // caller independently repeat the full markdown-candidate-then-HTML
+    // fetch chain, which would multiply upstream requests and buffered
+    // response memory by the number of concurrent callers.
+    return this.pagePending.run(cacheKey, async () => {
+      // Re-check the cache: another caller may have populated it while we
+      // were waiting to be scheduled, between the check above and this
+      // callback actually running.
+      const raced = this.pageCache.get(cacheKey);
+      if (raced) return raced;
+
+      const { markdown, meta } = await this.fetchPageBody(target);
+      const toc = extractToc(markdown);
+      // meta.title/description are untrusted frontmatter values (see
+      // asNonEmptyString's doc comment) - guard both instead of an `as
+      // string` cast so a wrong-typed value (e.g. `title: 42`) falls
+      // through to the markdown/path-derived fallbacks instead of
+      // silently propagating a non-string into a `string`-typed field.
+      const title = asNonEmptyString(meta.title) ?? extractTitle(markdown) ?? titleFromPath(target.pathname);
+      const description = asNonEmptyString(meta.description);
+      const content: PageContent = {
+        id: target.pathname,
+        url: target.pathname,
+        title,
+        description,
+        segments: target.pathname.split('/').filter(Boolean),
+        markdown,
+        meta,
+        toc,
+      };
+      this.pageCache.set(cacheKey, content);
+      return content;
+    });
   }
 
   async getToc(ref: string): Promise<TocEntry[]> {
@@ -486,20 +530,25 @@ export class RemoteFumadocsSource implements FumadocsSource {
     const path = full ? '/llms-full.txt' : '/llms.txt';
     const cached = this.llmsCache.get(path);
     if (cached !== undefined) return cached;
-    const url = new URL(path, this.base);
-    const res = await this.fetchSameOrigin(url, { headers: this.headers() });
-    if (res.status === 404) {
-      await discardBody(res);
-      this.llmsCache.set(path, null);
-      return null;
-    }
-    if (!res.ok) {
-      await discardBody(res);
-      throw new SourceError(`Failed to fetch ${path}: ${res.status} ${res.statusText}`);
-    }
-    const text = await this.readCappedText(res);
-    this.llmsCache.set(path, text);
-    return text;
+    // Coalesce concurrent misses (see `Coalescer`'s doc comment).
+    return this.llmsPending.run(path, async () => {
+      const raced = this.llmsCache.get(path);
+      if (raced !== undefined) return raced;
+      const url = new URL(path, this.base);
+      const res = await this.fetchSameOrigin(url, { headers: this.headers() });
+      if (res.status === 404) {
+        await discardBody(res);
+        this.llmsCache.set(path, null);
+        return null;
+      }
+      if (!res.ok) {
+        await discardBody(res);
+        throw new SourceError(`Failed to fetch ${path}: ${res.status} ${res.statusText}`);
+      }
+      const text = await this.readCappedText(res);
+      this.llmsCache.set(path, text);
+      return text;
+    });
   }
 
   /**
@@ -509,7 +558,25 @@ export class RemoteFumadocsSource implements FumadocsSource {
   private async fetchPageBody(
     target: URL,
   ): Promise<{ markdown: string; meta: Record<string, unknown> }> {
-    const candidates = buildMarkdownCandidates(target);
+    let candidates = buildMarkdownCandidates(target);
+    if (this.authHeader) {
+      // `buildMarkdownCandidates()` deliberately produces two candidates
+      // that escape `docsPrefix` by one level when `target` is exactly the
+      // prefix root (e.g. "/docs" -> "/docs.md", "/docs.mdx" - siblings of
+      // the docs directory, not descendants of it; see its doc comment).
+      // `fetchSameOrigin()`'s hop-0 skip lets those through on purpose so
+      // that convention works. That widening is harmless when requests are
+      // unauthenticated, but `resolveRef()`'s docsPrefix check exists
+      // specifically to stop an Authorization header configured for this
+      // origin from being attached to a same-origin fetch outside the
+      // caller-authorized prefix (see its doc comment) - sending it to a
+      // fixed-but-still-outside-prefix sibling path defeats that boundary
+      // just as much as sending it to an attacker-chosen one would.
+      // Empirically confirmed: without this filter, `getPage("/docs")`
+      // with an authHeader configured sent Authorization to "/docs.md".
+      // Restrict to in-prefix candidates whenever a credential is in play.
+      candidates = candidates.filter((c) => hasPathPrefix(c.pathname, this.docsPrefix));
+    }
     for (const candidate of candidates) {
       const res = await this.fetchSameOrigin(candidate, {
         headers: this.headers({ Accept: 'text/markdown, text/plain;q=0.9' }),
