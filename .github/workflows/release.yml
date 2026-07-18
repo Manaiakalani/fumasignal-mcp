@@ -30,7 +30,15 @@ jobs:
           cache: npm
           registry-url: https://registry.npmjs.org
       - run: npm ci
-      - run: npm run build
+      # Runs typecheck+lint+test+build (in that order), not just build:
+      # `npm run build` alone only ran tsup, whose esbuild-based transpile
+      # doesn't type-check and would happily emit a publishable bundle from
+      # source with type errors, lint violations, or failing tests -
+      # ci.yml's own test matrix runs against the *same* push event but is
+      # a separate workflow with no `needs:` relationship to this one, so
+      # it cannot actually block this job from publishing regardless of its
+      # own result.
+      - run: npm run check
       - name: Create release PR or publish
         # Pinned to a commit SHA rather than the "v1" ref: unlike
         # actions/* above (GitHub's own namespace), "v1" here is a mutable

@@ -54,16 +54,14 @@ describe('parseOptions', () => {
     expect(typeof opts.cacheTtlMs).toBe('number');
   });
 
-  it('reads search-path/docs-prefix/content-dir/auth-header from env vars', () => {
-    process.env.FUMASIGNAL_LOCAL = '.';
+  it('reads remote-mode env vars (search-path/docs-prefix/auth-header) together', () => {
+    process.env.FUMASIGNAL_URL = 'https://example.com';
     process.env.FUMASIGNAL_SEARCH_PATH = '/api/custom-search';
     process.env.FUMASIGNAL_DOCS_PREFIX = '/guide';
-    process.env.FUMASIGNAL_CONTENT_DIR = 'my-docs';
     process.env.FUMASIGNAL_AUTH_HEADER = 'Bearer abc123';
     const opts = parseOptions(['node', 'cli']);
     expect(opts.searchPath).toBe('/api/custom-search');
     expect(opts.docsPrefix).toBe('/guide');
-    expect(opts.contentDir).toBe('my-docs');
     expect(opts.authHeader).toBe('Bearer abc123');
   });
 
@@ -127,7 +125,8 @@ describe('parseOptions', () => {
   describe('--url validation', () => {
     // Same rationale as the --cache-ttl block above: buildProgram() never
     // calls exitOverride(), so an argParser rejection prints to
-    // console.error and calls process.exit(1) by default.
+    // process.stderr.write (Commander's default writeErr, not console.error)
+    // and calls process.exit(1) by default.
     let exitSpy: ReturnType<typeof vi.spyOn>;
     let errorSpy: ReturnType<typeof vi.spyOn>;
 
@@ -135,7 +134,7 @@ describe('parseOptions', () => {
       exitSpy = vi.spyOn(process, 'exit').mockImplementation(() => {
         throw new Error('process.exit called');
       });
-      errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+      errorSpy = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
     });
 
     afterEach(() => {
@@ -173,5 +172,109 @@ describe('parseOptions', () => {
         expect(() => parseOptions(['node', 'cli', '--url', value])).toThrow();
       },
     );
+
+    it('redacts embedded credentials in the rejected-path error message instead of leaking them to stderr', () => {
+      // Regression: parseUrl()'s path/query/fragment rejection embedded
+      // the raw `value` argument verbatim in its InvalidArgumentError
+      // message, which Commander prints straight to stderr via
+      // process.stderr.write (not console.error).
+      // A --url with both a path *and* embedded "user:pass@" credentials
+      // (rejected here for the path, per the tests above) used to leak
+      // the credentials into that output - even though this same value
+      // would go on to be safely, non-leakingly rejected again by
+      // RemoteFumadocsSource's own userinfo check if it ever got that far.
+      expect(() =>
+        parseOptions(['node', 'cli', '--url', 'https://user:pass@example.com/some/path']),
+      ).toThrow();
+      const printed = errorSpy.mock.calls.map((c) => String(c[0])).join('\n');
+      expect(printed).not.toContain('pass');
+      expect(printed).toContain('https://***@example.com/some/path');
+    });
+  });
+
+  describe('excess positional arguments', () => {
+    let exitSpy: ReturnType<typeof vi.spyOn>;
+    let errorSpy: ReturnType<typeof vi.spyOn>;
+
+    beforeEach(() => {
+      exitSpy = vi.spyOn(process, 'exit').mockImplementation(() => {
+        throw new Error('process.exit called');
+      });
+      errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    });
+
+    afterEach(() => {
+      exitSpy.mockRestore();
+      errorSpy.mockRestore();
+    });
+
+    it('rejects a stray positional argument instead of silently ignoring it', () => {
+      // Regression: this program takes zero positional arguments - every
+      // input is a named option - but Commander's default
+      // (allowExcessArguments(true)) silently discards any bare word typed
+      // on the command line (e.g. a typo'd extra path after --local),
+      // giving no indication the user's intent wasn't captured anywhere.
+      expect(() => parseOptions(['node', 'cli', '--local', '.', 'typo'])).toThrow();
+    });
+
+    it('still accepts zero positional arguments', () => {
+      expect(() => parseOptions(['node', 'cli', '--local', '.'])).not.toThrow();
+    });
+  });
+
+  describe('mutually exclusive mode flags (.conflicts())', () => {
+    let exitSpy: ReturnType<typeof vi.spyOn>;
+    let errorSpy: ReturnType<typeof vi.spyOn>;
+
+    beforeEach(() => {
+      exitSpy = vi.spyOn(process, 'exit').mockImplementation(() => {
+        throw new Error('process.exit called');
+      });
+      errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    });
+
+    afterEach(() => {
+      exitSpy.mockRestore();
+      errorSpy.mockRestore();
+    });
+
+    // Regression: each of these remote-only/local-only flags used to be
+    // silently discarded by buildSource() when combined with the "wrong"
+    // mode instead of erroring - e.g. --search-path has no effect at all
+    // in local mode, so a user who passed both got no feedback that their
+    // flag was ignored.
+    it('rejects --search-path combined with --local', () => {
+      expect(() =>
+        parseOptions(['node', 'cli', '--local', '.', '--search-path', '/api/search']),
+      ).toThrow();
+    });
+
+    it('rejects --auth-header combined with --local', () => {
+      expect(() =>
+        parseOptions(['node', 'cli', '--local', '.', '--auth-header', '******']),
+      ).toThrow();
+    });
+
+    it('rejects --content-dir combined with --url', () => {
+      expect(() =>
+        parseOptions(['node', 'cli', '--url', 'https://example.com', '--content-dir', 'docs']),
+      ).toThrow();
+    });
+
+    // --cache-ttl deliberately applies to *both* modes (it's reused as the
+    // local index's refresh interval in local mode - see local.ts) and
+    // must NOT be treated as remote-only.
+    it('accepts --cache-ttl combined with --local without conflict', () => {
+      const opts = parseOptions(['node', 'cli', '--local', '.', '--cache-ttl', '1000']);
+      expect(opts.cacheTtlMs).toBe(1000);
+    });
+
+    // --docs-prefix genuinely applies to both modes (it filters/resolves
+    // slugs in both remote and local sources) and must stay unrestricted.
+    it('accepts --docs-prefix combined with --local without conflict', () => {
+      expect(() =>
+        parseOptions(['node', 'cli', '--local', '.', '--docs-prefix', '/guide']),
+      ).not.toThrow();
+    });
   });
 });

@@ -21,6 +21,18 @@ import {
  */
 class FakeSource implements FumadocsSource {
   readonly label = 'fake';
+  /**
+   * Records the exact arguments each method last received, so tests can
+   * assert on what actually crossed the tool-schema boundary (e.g. that
+   * Zod's `.trim()` stripped whitespace *before* the source ever saw it)
+   * without needing a real source implementation.
+   */
+  lastSearchOpts?: SearchOptions;
+  lastListPagesPrefix?: string;
+  lastGetPageRef?: string;
+  lastGetSectionArgs?: { ref: string; anchor: string };
+  lastGetTocRef?: string;
+  lastGetMetaRef?: string;
   constructor(
     private data: {
       hits?: SearchHit[];
@@ -39,26 +51,32 @@ class FakeSource implements FumadocsSource {
     if (this.data.throwOn === method) throw this.data.throwError ?? new NotFoundError('not found');
   }
 
-  async search(_opts: SearchOptions): Promise<SearchHit[]> {
+  async search(opts: SearchOptions): Promise<SearchHit[]> {
+    this.lastSearchOpts = opts;
     return this.data.hits ?? [];
   }
-  async listPages(_prefix?: string): Promise<PageSummary[]> {
+  async listPages(prefix?: string): Promise<PageSummary[]> {
+    this.lastListPagesPrefix = prefix;
     return this.data.pages ?? [];
   }
-  async getPage(_ref: string): Promise<PageContent> {
+  async getPage(ref: string): Promise<PageContent> {
+    this.lastGetPageRef = ref;
     this.maybeThrow('getPage');
     if (!this.data.page) throw new NotFoundError('no page configured');
     return this.data.page;
   }
-  async getToc(_ref: string): Promise<TocEntry[]> {
+  async getToc(ref: string): Promise<TocEntry[]> {
+    this.lastGetTocRef = ref;
     this.maybeThrow('getToc');
     return this.data.toc ?? [];
   }
-  async getMeta(_ref: string): Promise<Record<string, unknown>> {
+  async getMeta(ref: string): Promise<Record<string, unknown>> {
+    this.lastGetMetaRef = ref;
     this.maybeThrow('getMeta');
     return this.data.meta ?? {};
   }
-  async getSection(_ref: string, _anchor: string): Promise<{ title: string; markdown: string }> {
+  async getSection(ref: string, anchor: string): Promise<{ title: string; markdown: string }> {
+    this.lastGetSectionArgs = { ref, anchor };
     this.maybeThrow('getSection');
     if (!this.data.section) throw new NotFoundError('no section configured');
     return this.data.section;
@@ -244,5 +262,81 @@ describe('MCP tool result size cap (MAX_TOOL_RESULT_CHARS)', () => {
     const text = textOf(result as { content: Array<{ type: string; text?: string }> });
     expect(text).toContain('more chars available via get_section');
     expect(text).not.toContain('response truncated at 200000');
+  });
+});
+
+describe('input whitespace trimming (.trim() on string tool arguments)', () => {
+  // Regression: an LLM caller occasionally hallucinates incidental leading/
+  // trailing whitespace around an otherwise-correct argument value (e.g.
+  // " /docs/install " instead of "/docs/install"). Without .trim() on the
+  // Zod schemas, that whitespace passed straight through to the source
+  // untouched - a local/remote lookup keyed on exact string matching then
+  // failed for a ref/anchor/tag/locale/query that was, semantically,
+  // entirely valid.
+  it('trims whitespace from search_docs\' query/tag/locale before they reach the source', async () => {
+    const source = new FakeSource({ hits: [] });
+    const client = await connect(source);
+    await client.callTool({
+      name: 'search_docs',
+      arguments: { query: '  hello world  ', tag: '  guide  ', locale: '  en  ' },
+    });
+    expect(source.lastSearchOpts?.query).toBe('hello world');
+    expect(source.lastSearchOpts?.tag).toBe('guide');
+    expect(source.lastSearchOpts?.locale).toBe('en');
+  });
+
+  it('rejects a search_docs query that is whitespace-only instead of passing an empty string through', async () => {
+    // Ordering matters: .trim() must run *before* .min(1) in the schema,
+    // otherwise a 3-space string passes the length check pre-trim and is
+    // then silently transformed into an empty-string query post-validation.
+    const client = await connect(new FakeSource({ hits: [] }));
+    const result = await client.callTool({ name: 'search_docs', arguments: { query: '   ' } });
+    expect((result as { isError?: boolean }).isError).toBe(true);
+  });
+
+  it('trims whitespace from list_pages\' prefix before it reaches the source', async () => {
+    const source = new FakeSource({ pages: [] });
+    const client = await connect(source);
+    await client.callTool({ name: 'list_pages', arguments: { prefix: '  /docs/api  ' } });
+    expect(source.lastListPagesPrefix).toBe('/docs/api');
+  });
+
+  it('trims whitespace from get_page\'s ref before it reaches the source', async () => {
+    const page: PageContent = {
+      id: '/docs/a',
+      url: '/docs/a',
+      title: 'A',
+      markdown: 'body',
+      meta: {},
+      toc: [],
+    };
+    const source = new FakeSource({ page });
+    const client = await connect(source);
+    await client.callTool({ name: 'get_page', arguments: { ref: '  /docs/a  ' } });
+    expect(source.lastGetPageRef).toBe('/docs/a');
+  });
+
+  it('trims whitespace from get_section\'s ref and anchor before they reach the source', async () => {
+    const source = new FakeSource({ section: { title: 'S', markdown: 'body' } });
+    const client = await connect(source);
+    await client.callTool({
+      name: 'get_section',
+      arguments: { ref: '  /docs/a  ', anchor: '  intro  ' },
+    });
+    expect(source.lastGetSectionArgs).toEqual({ ref: '/docs/a', anchor: 'intro' });
+  });
+
+  it('trims whitespace from get_toc\'s ref before it reaches the source', async () => {
+    const source = new FakeSource({ toc: [] });
+    const client = await connect(source);
+    await client.callTool({ name: 'get_toc', arguments: { ref: '  /docs/a  ' } });
+    expect(source.lastGetTocRef).toBe('/docs/a');
+  });
+
+  it('trims whitespace from get_meta\'s ref before it reaches the source', async () => {
+    const source = new FakeSource({ meta: {} });
+    const client = await connect(source);
+    await client.callTool({ name: 'get_meta', arguments: { ref: '  /docs/a  ' } });
+    expect(source.lastGetMetaRef).toBe('/docs/a');
   });
 });

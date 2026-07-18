@@ -105,6 +105,21 @@ export interface LocalSourceOptions {
    * many files will be indexed whenever that many valid ones exist.
    */
   maxFileCount?: number;
+  /**
+   * How long (ms) a successfully-built index is served before the next
+   * `index()` call rebuilds it from disk, so edits/adds/deletes under
+   * `contentDir` eventually become visible without restarting the process.
+   * Without this, `indexPromise` below was cached *forever* once built:
+   * an MCP server is typically a long-lived background process (e.g. one
+   * spawned by an editor/assistant integration and left running for a
+   * whole session), and local mode's own value proposition - pointing it
+   * at docs you're actively writing - is defeated if the server can never
+   * see a change made after its first request. Default 5 minutes, matching
+   * `RemoteFumadocsSource`'s `cacheTtlMs` default (the CLI's `--cache-ttl`
+   * flag/`FUMASIGNAL_CACHE_TTL` env var feeds this in local mode, the same
+   * way it feeds the remote source's response cache in remote mode).
+   */
+  indexTtlMs?: number;
 }
 
 interface IndexedPage {
@@ -145,7 +160,17 @@ export class LocalFumadocsSource implements FumadocsSource {
   private maxFileBytes: number;
   private maxTotalBytes: number;
   private maxFileCount: number;
+  private indexTtlMs: number;
   private indexPromise: Promise<Map<string, IndexedPage>> | null = null;
+  /**
+   * When the currently-cached `indexPromise` expires and should be rebuilt
+   * on the next `index()` call. 0 is overloaded to mean "not applicable
+   * right now" - either no build has ever succeeded yet, or one is
+   * currently in flight - so a concurrent caller never mistakes an
+   * in-progress (not-yet-resolved) build for a stale one and kicks off a
+   * redundant second `buildIndex()` walk racing the first.
+   */
+  private indexExpiresAt = 0;
 
   constructor(opts: LocalSourceOptions) {
     this.rootDir = path.resolve(opts.rootDir);
@@ -156,11 +181,19 @@ export class LocalFumadocsSource implements FumadocsSource {
     this.maxFileBytes = opts.maxFileBytes ?? 10_000_000;
     this.maxTotalBytes = opts.maxTotalBytes ?? 200_000_000;
     this.maxFileCount = opts.maxFileCount ?? 50_000;
+    this.indexTtlMs = opts.indexTtlMs ?? 5 * 60 * 1000;
     this.label = `local:${this.rootDir}`;
   }
 
   private async index(): Promise<Map<string, IndexedPage>> {
-    if (!this.indexPromise) {
+    const isStale =
+      this.indexPromise !== null && this.indexExpiresAt !== 0 && Date.now() >= this.indexExpiresAt;
+    if (!this.indexPromise || isStale) {
+      // Mark "build in flight" *before* starting the rebuild so a
+      // concurrent call arriving while it's pending sees indexExpiresAt
+      // === 0 (not "stale") and awaits this same build instead of
+      // triggering another one - see indexExpiresAt's doc comment.
+      this.indexExpiresAt = 0;
       // buildIndex() can fail for reasons that are transient or
       // environment-specific rather than a fixed, permanent
       // misconfiguration - e.g. a network-mounted contentDir that hiccups
@@ -171,10 +204,16 @@ export class LocalFumadocsSource implements FumadocsSource {
       // caused it has resolved - until the process is restarted. Resetting
       // indexPromise to null on rejection (before letting the caller see
       // it) makes the *next* call retry buildIndex() from scratch instead.
-      this.indexPromise = this.buildIndex().catch((err: unknown) => {
-        this.indexPromise = null;
-        throw err;
-      });
+      this.indexPromise = this.buildIndex()
+        .then((idx) => {
+          this.indexExpiresAt = Date.now() + this.indexTtlMs;
+          return idx;
+        })
+        .catch((err: unknown) => {
+          this.indexPromise = null;
+          this.indexExpiresAt = 0;
+          throw err;
+        });
     }
     return this.indexPromise;
   }
