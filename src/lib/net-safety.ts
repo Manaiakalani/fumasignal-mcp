@@ -73,6 +73,19 @@ function isPrivateIPv4(ip: string): boolean {
   return false;
 }
 
+/**
+ * Convert two 16-bit hex groups (the low 32 bits of an IPv4-embedding IPv6
+ * address, e.g. "7f00" + "1" from "::ffff:7f00:1") into dotted-quad IPv4
+ * notation ("127.0.0.1"). Shared by every embedded-IPv4 form recognized in
+ * `isPrivateIPv6()` (IPv4-mapped, IPv4-compatible, and NAT64).
+ */
+function embeddedIPv4FromHexGroups(hiHex: string, loHex: string): string {
+  const hi = parseInt(hiHex, 16);
+  const lo = parseInt(loHex, 16);
+  // Each 16-bit hex group holds 2 bytes of the embedded IPv4 address.
+  return `${(hi >> 8) & 0xff}.${hi & 0xff}.${(lo >> 8) & 0xff}.${lo & 0xff}`;
+}
+
 function isPrivateIPv6(ip: string): boolean {
   // IPv6 has many equivalent textual spellings of the same address
   // (fully-expanded vs. "::"-compressed, zero-padded groups, and - for
@@ -99,11 +112,32 @@ function isPrivateIPv6(ip: string): boolean {
   if (canonical === '::1' || canonical === '::') return true; // loopback / unspecified
   const mapped = /^::ffff:([0-9a-f]{1,4}):([0-9a-f]{1,4})$/.exec(canonical);
   if (mapped) {
-    const hi = parseInt(mapped[1]!, 16);
-    const lo = parseInt(mapped[2]!, 16);
-    // Each 16-bit hex group holds 2 bytes of the embedded IPv4 address.
-    const embeddedIPv4 = `${(hi >> 8) & 0xff}.${hi & 0xff}.${(lo >> 8) & 0xff}.${lo & 0xff}`;
-    return isPrivateIPv4(embeddedIPv4); // IPv4-mapped - validate the embedded address
+    return isPrivateIPv4(embeddedIPv4FromHexGroups(mapped[1]!, mapped[2]!)); // IPv4-mapped - validate the embedded address
+  }
+  // The IPv4-compatible range (::/96, e.g. "::7f00:1" == "::127.0.0.1")
+  // and the NAT64 well-known prefix (64:ff9b::/96, RFC 6052, e.g.
+  // "64:ff9b::a9fe:a9fe" == 169.254.169.254) both embed a 32-bit IPv4
+  // address in their low 32 bits, exactly like the "::ffff:" IPv4-mapped
+  // form above - but neither was previously recognized, so an internal
+  // IPv4 (loopback, 169.254.169.254 metadata, RFC 1918, ...) spelled in
+  // either form slipped past this check as an "ordinary" public IPv6
+  // address. Both are reachable within this file's stated threat model: a
+  // hijacked/dangling DNS record can resolve to either spelling directly,
+  // and in an IPv6-only network fronted by NAT64/DNS64 (increasingly
+  // common in cloud environments), a synthesized AAAA for an internal
+  // IPv4-only name lands in 64:ff9b::/96 and is then translated back to
+  // that internal IPv4 at connect time. Validate the embedded IPv4 the
+  // same way the mapped case does, so a private embedded address is
+  // blocked while a public one still passes (matching how ::ffff:8.8.8.8
+  // is allowed). No legitimate *public* global-unicast address
+  // canonicalizes to the ::/96 form (the range is deprecated, RFC 4291,
+  // and its only assigned addresses - "::"/"::1" - are handled above), so
+  // this cannot cause a false positive on a real host.
+  const embedded =
+    /^::([0-9a-f]{1,4}):([0-9a-f]{1,4})$/.exec(canonical) ?? // IPv4-compatible ::/96
+    /^64:ff9b::([0-9a-f]{1,4}):([0-9a-f]{1,4})$/.exec(canonical); // NAT64 well-known prefix 64:ff9b::/96
+  if (embedded) {
+    return isPrivateIPv4(embeddedIPv4FromHexGroups(embedded[1]!, embedded[2]!));
   }
   if (/^fe[89ab]/.test(canonical)) return true; // fe80::/10 link-local
   if (/^fe[cdef]/.test(canonical)) return true; // fec0::/10 site-local (deprecated by RFC 3879, but still a syntactically valid, potentially-still-configured non-public range - a DNS-rebinding attacker controls the *resolved address*, not whether a target network happens to still use it)
