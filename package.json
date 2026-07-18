@@ -1,6 +1,6 @@
 {
   "name": "fumasignal-mcp",
-  "version": "0.1.4",
+  "version": "0.1.5",
   "description": "MCP server that lets AI assistants search and read any Fumadocs documentation site.",
   "keywords": [
     "mcp",
