@@ -77,6 +77,39 @@ describe('isPrivateOrReservedAddress', () => {
     expect(isPrivateOrReservedAddress('::ffff:808:808')).toBe(false); // hex form of ::ffff:8.8.8.8
   });
 
+  it('flags IPv4-compatible (::/96) addresses that embed a private/reserved IPv4', () => {
+    // Regression: only the IPv4-*mapped* form (::ffff:a.b.c.d) was
+    // recognized; the deprecated IPv4-*compatible* form (::a.b.c.d, which
+    // Node canonicalizes to "::hi:lo") embeds the same 32-bit IPv4 in its
+    // low bits and slipped past as an "ordinary" public IPv6 address. A
+    // hijacked/dangling DNS record can resolve directly to this spelling.
+    expect(isPrivateOrReservedAddress('::127.0.0.1')).toBe(true); // -> ::7f00:1 (loopback)
+    expect(isPrivateOrReservedAddress('::7f00:1')).toBe(true); // hex form of ::127.0.0.1
+    expect(isPrivateOrReservedAddress('::169.254.169.254')).toBe(true); // -> ::a9fe:a9fe (cloud metadata)
+    expect(isPrivateOrReservedAddress('::10.0.0.1')).toBe(true); // -> ::a00:1 (RFC 1918)
+  });
+
+  it('allows IPv4-compatible (::/96) addresses that embed a public IPv4', () => {
+    // Matches how ::ffff:8.8.8.8 (mapped, public) is allowed above - only
+    // a *private* embedded address is blocked.
+    expect(isPrivateOrReservedAddress('::8.8.8.8')).toBe(false); // -> ::808:808
+  });
+
+  it('flags NAT64 (64:ff9b::/96) addresses that embed a private/reserved IPv4', () => {
+    // Regression: in an IPv6-only network fronted by NAT64/DNS64, a
+    // synthesized AAAA for an internal IPv4-only name lands in the
+    // well-known prefix 64:ff9b::/96 (RFC 6052) and is translated back to
+    // that internal IPv4 at connect time - a documented SSRF bypass. The
+    // embedded IPv4 must be validated the same way as the mapped form.
+    expect(isPrivateOrReservedAddress('64:ff9b::a9fe:a9fe')).toBe(true); // 169.254.169.254 cloud metadata
+    expect(isPrivateOrReservedAddress('64:ff9b::7f00:1')).toBe(true); // 127.0.0.1 loopback
+    expect(isPrivateOrReservedAddress('64:ff9b::a00:1')).toBe(true); // 10.0.0.1 RFC 1918
+  });
+
+  it('allows NAT64 (64:ff9b::/96) addresses that embed a public IPv4', () => {
+    expect(isPrivateOrReservedAddress('64:ff9b::808:808')).toBe(false); // 8.8.8.8
+  });
+
   it('flags loopback/unspecified regardless of which equivalent IPv6 spelling is used', () => {
     expect(isPrivateOrReservedAddress('0:0:0:0:0:0:0:1')).toBe(true); // fully expanded ::1
     expect(isPrivateOrReservedAddress('0:0:0:0:0:0:0:0')).toBe(true); // fully expanded ::
