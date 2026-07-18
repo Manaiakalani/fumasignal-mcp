@@ -45,12 +45,13 @@ jobs:
           # never touches package-lock.json, so a bare `npx changeset
           # version` silently leaves the lockfile's "version" field
           # pointing at the *previous* release on every future bump
-          # (exactly what happened for the 0.1.0 -> 0.1.1 jump). Re-run
-          # npm install in lockfile-only mode (no node_modules changes, so
-          # this can't accidentally pull in new dependency versions) right
-          # after so the commit this action makes always has a lockfile
-          # that matches package.json.
-          version: npx changeset version && npm install --package-lock-only
+          # (exactly what happened for the 0.1.0 -> 0.1.1 jump). The
+          # changesets/action `version` input is passed straight to a single
+          # command invocation (it errors with "too many arguments" on a
+          # compound `a && b` string), so the lockfile-sync step lives in
+          # the "changeset-version" npm script instead and this just calls
+          # that script.
+          version: npm run changeset-version
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
