@@ -28,13 +28,13 @@ exactly what this server does for your docs.
   `get_toc`, `get_meta`, `get_llms_txt`.
 - 📦 **Single binary**: `npx -y fumasignal-mcp --url https://your-docs.com`.
 - 🔒 **Read-only** — never mutates your docs.
-- 🧪 **Well-tested** — 75+ unit tests, fixtures for the search/sitemap/HTML paths.
+- 🧪 **Well-tested** — 280+ unit tests, fixtures for the search/sitemap/HTML paths.
 
 ---
 
 ## Quick start
 
-### Claude Desktop / Claude Code
+### Claude Desktop
 
 Add this to your `claude_desktop_config.json`
 (`~/Library/Application Support/Claude/claude_desktop_config.json` on macOS,
@@ -53,6 +53,12 @@ Add this to your `claude_desktop_config.json`
 
 Restart Claude Desktop. You'll see seven `fumadocs__*` tools available.
 
+### Claude Code
+
+```bash
+claude mcp add --transport stdio fumadocs -- npx -y fumasignal-mcp --url https://fumadocs.dev
+```
+
 ### Cursor
 
 In `~/.cursor/mcp.json` (or via the IDE settings):
@@ -68,7 +74,7 @@ In `~/.cursor/mcp.json` (or via the IDE settings):
 }
 ```
 
-### VS Code (with GitHub Copilot Chat / Continue)
+### VS Code (GitHub Copilot Chat)
 
 Add to `.vscode/mcp.json`:
 
@@ -86,22 +92,32 @@ Add to `.vscode/mcp.json`:
 
 ### Continue.dev
 
-In `~/.continue/config.json`:
+Continue reads standalone MCP configs from a `.continue/mcpServers/` folder
+(create it at your workspace root, or under `~/.continue/mcpServers/` for a
+global config). Simplest option — reuse the same JSON shown above for Claude
+Desktop / Cursor, saved as `.continue/mcpServers/mcp.json`:
 
 ```json
 {
-  "experimental": {
-    "modelContextProtocolServers": [
-      {
-        "transport": {
-          "type": "stdio",
-          "command": "npx",
-          "args": ["-y", "fumasignal-mcp", "--url", "https://fumadocs.dev"]
-        }
-      }
-    ]
+  "mcpServers": {
+    "fumadocs": {
+      "command": "npx",
+      "args": ["-y", "fumasignal-mcp", "--url", "https://fumadocs.dev"]
+    }
   }
 }
+```
+
+Or Continue's native YAML format, e.g. `.continue/mcpServers/fumadocs.yaml`:
+
+```yaml
+name: Fumadocs MCP
+version: 0.0.1
+schema: v1
+mcpServers:
+  - name: fumadocs
+    command: npx
+    args: ["-y", "fumasignal-mcp", "--url", "https://fumadocs.dev"]
 ```
 
 > Replace `https://fumadocs.dev` with your own Fumadocs site URL. Multiple
@@ -145,9 +161,13 @@ or a slug under the docs prefix.
 -h, --help                Show help
 ```
 
-Every flag also reads from a corresponding `FUMASIGNAL_*` env var
-(`FUMASIGNAL_URL`, `FUMASIGNAL_LOCAL`, `FUMASIGNAL_AUTH_HEADER`,
-`FUMASIGNAL_CONTENT_DIR`).
+Every flag also reads from a corresponding `FUMASIGNAL_*` env var:
+`FUMASIGNAL_URL`, `FUMASIGNAL_LOCAL`, `FUMASIGNAL_SEARCH_PATH`,
+`FUMASIGNAL_DOCS_PREFIX`, `FUMASIGNAL_CONTENT_DIR`, `FUMASIGNAL_AUTH_HEADER`,
+`FUMASIGNAL_CACHE_TTL`. An explicit CLI flag always takes precedence over its
+env var. There's also `FUMASIGNAL_LOG_LEVEL` (default: `info`; any
+[pino level](https://getpino.io/#/docs/api?id=levels) works), which has no
+CLI-flag equivalent.
 
 ### Examples
 
@@ -161,9 +181,11 @@ npx -y fumasignal-mcp --local ./my-docs-site
 # Custom prefixes (for sites that put docs at /handbook instead of /docs)
 npx -y fumasignal-mcp --url https://acme.com --docs-prefix /handbook
 
-# Authenticated docs site
-npx -y fumasignal-mcp --url https://internal.docs.acme.com \
-  --auth-header "Bearer $DOCS_TOKEN"
+# Authenticated docs site - prefer the env var over --auth-header so the
+# secret doesn't linger in your shell history or show up in `ps`/process
+# listings visible to other users on the machine.
+FUMASIGNAL_AUTH_HEADER="<your Authorization header value>" \
+  npx -y fumasignal-mcp --url https://internal.docs.acme.com
 ```
 
 ---
@@ -221,7 +243,10 @@ preferred path. If yours doesn't, the HTML scrape strips `nav`/`aside`/
 for site-specific adapters.
 
 **Tools don't show up in my client**
-Run `npm run inspector` (or `npx -y @modelcontextprotocol/inspector node ./dist/index.js --url https://fumadocs.dev`) to interactively verify the server.
+Run `npm run inspector -- --url https://fumadocs.dev` (forward your own
+`--url`/`--local` after the `--`; the script builds first, then launches
+[MCP Inspector](https://github.com/modelcontextprotocol/inspector) against
+`dist/index.js`) to interactively verify the server.
 
 ---
 
@@ -231,9 +256,12 @@ Run `npm run inspector` (or `npx -y @modelcontextprotocol/inspector node ./dist/
 git clone https://github.com/Manaiakalani/fumasignal-mcp
 cd fumasignal-mcp
 npm install
+npm run typecheck      # tsc --noEmit
+npm run lint           # eslint
 npm test               # vitest
 npm run build          # tsup → dist/
-npm run inspector      # MCP Inspector against dist/
+npm run check          # typecheck + lint + test + build, in one go
+npm run inspector -- --url https://fumadocs.dev   # MCP Inspector against dist/
 ```
 
 Contributions welcome — please open an issue first for non-trivial changes.

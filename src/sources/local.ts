@@ -456,13 +456,28 @@ export class LocalFumadocsSource implements FumadocsSource {
   async getLlmsTxt(full = false): Promise<string | null> {
     const name = full ? 'llms-full.txt' : 'llms.txt';
     const candidates = [path.join(this.rootDir, name), path.join(this.rootDir, 'public', name)];
+    // Track the first non-"not found" failure (oversized file, a symlink
+    // escaping rootDir, permission denied, ...) across both candidates
+    // rather than only logging-and-continuing as before: swallowing it
+    // into the same `null` this method returns for a genuine absence
+    // mirrors RemoteFumadocsSource.getLlmsTxt's real 404 vs. request-
+    // failure distinction, so the get_llms_txt tool doesn't misreport "this
+    // site does not expose llms.txt" when the file actually exists but
+    // couldn't be read for an unrelated reason.
+    let lastError: unknown;
     for (const candidate of candidates) {
       try {
         return await this.readFileWithinRoot(candidate);
       } catch (err) {
         if (isNotFoundError(err)) continue;
+        lastError = err;
         logger.warn({ err, candidate }, 'local: failed to read llms.txt candidate');
       }
+    }
+    if (lastError !== undefined) {
+      throw new SourceError(
+        `Found ${name} but could not read it: ${lastError instanceof Error ? lastError.message : String(lastError)}`,
+      );
     }
     return null;
   }

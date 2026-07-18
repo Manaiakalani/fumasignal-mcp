@@ -623,6 +623,26 @@ describe('RemoteFumadocsSource', () => {
     expect(hits[0]!.description).toBeUndefined();
   });
 
+  it('wraps a non-JSON search response in a SourceError with URL context instead of an unhandled SyntaxError', async () => {
+    // Regression: JSON.parse() on a malformed body (e.g. an HTML error
+    // page from a misconfigured proxy/CDN sitting in front of the search
+    // endpoint, or a truncated response) used to throw a bare SyntaxError
+    // with no indication of which request failed or why - unlike every
+    // other failure mode in this method, which all throw a SourceError
+    // carrying the request URL.
+    const src = new RemoteFumadocsSource({
+      baseUrl,
+      fetchImpl: makeFetch({
+        'https://example.com/api/search?query=x': {
+          body: '<html>502 Bad Gateway</html>',
+          contentType: 'text/html',
+        },
+      }),
+    });
+    await expect(src.search({ query: 'x' })).rejects.toThrow(/not valid JSON/i);
+    await expect(src.search({ query: 'x' })).rejects.toThrow(/api\/search/);
+  });
+
   it('fetches markdown via .md endpoint when available', async () => {
     const src = new RemoteFumadocsSource({
       baseUrl,

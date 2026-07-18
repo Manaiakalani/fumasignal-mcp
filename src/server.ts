@@ -2,6 +2,7 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
 import { logger } from './lib/logger.js';
 import { safeTruncateLength } from './lib/text-safety.js';
+import { VERSION } from './lib/version.js';
 import {
   type FumadocsSource,
   NotFoundError,
@@ -9,7 +10,7 @@ import {
 } from './sources/types.js';
 
 const SERVER_NAME = 'fumasignal-mcp';
-const SERVER_VERSION = '0.1.0';
+const SERVER_VERSION = VERSION;
 
 /** Maximum characters of markdown returned per call (truncates with notice). */
 const MAX_PAGE_CHARS = 60_000;
@@ -91,7 +92,7 @@ function registerTools(server: McpServer, source: FumadocsSource): void {
         });
         return textResult(lines.join('\n\n'));
       } catch (err) {
-        return errorResult(err);
+        return errorResult(err, 'search_docs');
       }
     },
   );
@@ -108,7 +109,13 @@ function registerTools(server: McpServer, source: FumadocsSource): void {
           .max(500)
           .optional()
           .describe('Filter to pages whose URL starts with this prefix (e.g. "/docs/api").'),
-        limit: z.number().int().positive().max(1000).optional().describe('Max entries to return.'),
+        limit: z
+          .number()
+          .int()
+          .positive()
+          .max(1000)
+          .optional()
+          .describe('Max entries to return (default 1000, max 1000).'),
       },
     },
     async (args) => {
@@ -135,7 +142,7 @@ function registerTools(server: McpServer, source: FumadocsSource): void {
         const header = `${limited.length} page(s)${pages.length !== limited.length ? ` (of ${pages.length} total)` : ''}:`;
         return textResult(`${header}\n${lines.join('\n')}`);
       } catch (err) {
-        return errorResult(err);
+        return errorResult(err, 'list_pages');
       }
     },
   );
@@ -146,7 +153,7 @@ function registerTools(server: McpServer, source: FumadocsSource): void {
     {
       title: 'Get page content',
       description:
-        'Fetch the full Markdown content of a documentation page. Pass either a URL path (e.g. "/docs/getting-started"), an absolute URL on the same site, or a slug relative to the docs prefix.',
+        'Fetch a documentation page as Markdown. Very large pages are truncated (with a notice); use get_section or get_toc to retrieve the rest in parts. Pass either a URL path (e.g. "/docs/getting-started"), an absolute URL on the same site, or a slug relative to the docs prefix.',
       inputSchema: {
         ref: z
           .string()
@@ -166,7 +173,7 @@ function registerTools(server: McpServer, source: FumadocsSource): void {
         let truncated = false;
         if (body.length > MAX_PAGE_CHARS) {
           const cut = safeTruncateLength(body, MAX_PAGE_CHARS);
-          body = `${body.slice(0, cut)}\n\n…[truncated; ${body.length - cut} more chars available via get_section]`;
+          body = `${body.slice(0, cut)}\n\n…[truncated; ${body.length - cut} more chars available via get_section or get_toc]`;
           truncated = true;
         }
         const head = `# ${page.title}\n\n_URL: ${page.url}_${page.description ? `\n\n${page.description}` : ''}`;
@@ -176,7 +183,7 @@ function registerTools(server: McpServer, source: FumadocsSource): void {
         const content = `${head}${metaBlock}\n\n${body}`;
         return textResult(content, { truncated });
       } catch (err) {
-        return errorResult(err);
+        return errorResult(err, 'get_page');
       }
     },
   );
@@ -202,7 +209,7 @@ function registerTools(server: McpServer, source: FumadocsSource): void {
         const section = await source.getSection(args.ref, args.anchor);
         return textResult(section.markdown);
       } catch (err) {
-        return errorResult(err);
+        return errorResult(err, 'get_section');
       }
     },
   );
@@ -224,7 +231,7 @@ function registerTools(server: McpServer, source: FumadocsSource): void {
         const lines = toc.map((t) => `${'  '.repeat(Math.max(0, t.depth - 1))}- ${t.title} (#${t.anchor})`);
         return textResult(lines.join('\n'));
       } catch (err) {
-        return errorResult(err);
+        return errorResult(err, 'get_toc');
       }
     },
   );
@@ -242,9 +249,9 @@ function registerTools(server: McpServer, source: FumadocsSource): void {
     async (args) => {
       try {
         const meta = await source.getMeta(args.ref);
-        return textResult(JSON.stringify(meta, null, 2));
+        return textResult(`\`\`\`json\n${JSON.stringify(meta, null, 2)}\n\`\`\``);
       } catch (err) {
-        return errorResult(err);
+        return errorResult(err, 'get_meta');
       }
     },
   );
@@ -255,7 +262,7 @@ function registerTools(server: McpServer, source: FumadocsSource): void {
     {
       title: 'Get llms.txt',
       description:
-        'Fetch the site\'s llms.txt (or llms-full.txt if `full: true`) if exposed. Returns null-text if the file is not available.',
+        'Fetch the site\'s llms.txt (or llms-full.txt if `full: true`) if exposed. If the site does not expose this file, returns a plain-text explanation rather than an error.',
       inputSchema: {
         full: z
           .boolean()
@@ -273,7 +280,7 @@ function registerTools(server: McpServer, source: FumadocsSource): void {
         }
         return textResult(text);
       } catch (err) {
-        return errorResult(err);
+        return errorResult(err, 'get_llms_txt');
       }
     },
   );
@@ -294,6 +301,7 @@ function textResult(
 
 function errorResult(
   err: unknown,
+  toolName: string,
 ): { content: { type: 'text'; text: string }[]; isError: true } {
   const message =
     err instanceof NotFoundError
@@ -303,7 +311,13 @@ function errorResult(
         : err instanceof Error
           ? `Error: ${err.message}`
           : `Error: ${String(err)}`;
-  logger.warn({ err: message }, 'fumasignal-mcp: tool error');
+  // `tool` is a separate structured field (not inlined into the message
+  // string) so operators can filter/correlate error logs by tool name -
+  // consistent with this codebase's existing pino idiom elsewhere (see
+  // remote.ts's nested-sitemap warning) - while the text returned to the
+  // MCP client stays unchanged, since the caller already knows which tool
+  // it invoked.
+  logger.warn({ tool: toolName, err: message }, 'fumasignal-mcp: tool error');
   const [out] = capToolResultChars(message);
   return {
     content: [{ type: 'text', text: out }],

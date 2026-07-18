@@ -424,8 +424,12 @@ describe('LocalFumadocsSource security fixes', () => {
   });
 
   it.skipIf(process.platform === 'win32')(
-    'refuses to follow a symlink that escapes the project root for llms.txt',
+    'throws (rather than silently returning null) for a symlink that escapes the project root for llms.txt',
     async () => {
+      // Regression: this used to fall into the same logged-and-swallowed
+      // path as any other non-"not found" failure, silently returning
+      // `null` (indistinguishable from a genuine absence) for what is
+      // actually a security-relevant condition worth surfacing loudly.
       const dir = await mkdtemp(path.join(os.tmpdir(), 'fumasignal-local-symlink-'));
       const outside = await mkdtemp(path.join(os.tmpdir(), 'fumasignal-outside-'));
       try {
@@ -433,8 +437,7 @@ describe('LocalFumadocsSource security fixes', () => {
         await writeFile(secretPath, 'SECRET_CONTENT_OUTSIDE_ROOT');
         await symlink(secretPath, path.join(dir, 'llms.txt'));
         const src = new LocalFumadocsSource({ rootDir: dir });
-        const result = await src.getLlmsTxt();
-        expect(result).toBeNull();
+        await expect(src.getLlmsTxt()).rejects.toThrow(/outside the project root/i);
       } finally {
         await rm(dir, { recursive: true, force: true });
         await rm(outside, { recursive: true, force: true });
@@ -511,11 +514,28 @@ describe('LocalFumadocsSource security fixes', () => {
     }
   });
 
-  it('refuses to read an llms.txt that exceeds maxFileBytes', async () => {
+  it('throws (rather than silently returning null) for an llms.txt that exceeds maxFileBytes', async () => {
+    // Regression: a non-"not found" failure (this oversized-file case,
+    // permission denied, a symlink escaping rootDir, ...) used to be
+    // logged and then swallowed into the same `null` this method returns
+    // for a genuine absence - so get_llms_txt's tool wrapper would
+    // misreport "this site does not expose llms.txt" even though the file
+    // exists and the real problem is unrelated to whether it's present.
     const dir = await mkdtemp(path.join(os.tmpdir(), 'fumasignal-local-maxfile-llms-'));
     try {
       await writeFile(path.join(dir, 'llms.txt'), 'x'.repeat(1000));
       const src = new LocalFumadocsSource({ rootDir: dir, maxFileBytes: 100 });
+      await expect(src.getLlmsTxt()).rejects.toThrow(/llms\.txt/);
+      await expect(src.getLlmsTxt()).rejects.toThrow(/exceeds/i);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('still returns null (no error) when llms.txt is genuinely absent', async () => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), 'fumasignal-local-no-llms-'));
+    try {
+      const src = new LocalFumadocsSource({ rootDir: dir });
       expect(await src.getLlmsTxt()).toBeNull();
     } finally {
       await rm(dir, { recursive: true, force: true });
