@@ -110,6 +110,26 @@ describe('isPrivateOrReservedAddress', () => {
     expect(isPrivateOrReservedAddress('64:ff9b::808:808')).toBe(false); // 8.8.8.8
   });
 
+  it('flags NAT64 local-use (64:ff9b:1::/48, RFC 8215) addresses that embed a private/reserved IPv4', () => {
+    // Regression: RFC 8215 defines 64:ff9b:1::/48 as an operator-assigned
+    // alternative to the well-known prefix (e.g. for sites running NAT64
+    // on both sides of a double translation, where reusing the WKP for
+    // both would be ambiguous). An operator picks their own /96 (or other
+    // length - only /96, RFC 8215's recommendation, is handled here)
+    // within that /48, so the middle groups vary by deployment; only the
+    // fixed "64:ff9b:1:" prefix and the trailing embedded-IPv4 groups are
+    // guaranteed. Covers both the maximally-compressed ("::" right after
+    // the fixed prefix) and fully-expanded-with-non-zero-middle cases.
+    expect(isPrivateOrReservedAddress('64:ff9b:1::a9fe:a9fe')).toBe(true); // 169.254.169.254 cloud metadata
+    expect(isPrivateOrReservedAddress('64:ff9b:1::7f00:1')).toBe(true); // 127.0.0.1 loopback
+    expect(isPrivateOrReservedAddress('64:ff9b:1:dead:beef:cafe:a00:1')).toBe(true); // 10.0.0.1, non-zero middle
+  });
+
+  it('allows NAT64 local-use (64:ff9b:1::/48, RFC 8215) addresses that embed a public IPv4', () => {
+    expect(isPrivateOrReservedAddress('64:ff9b:1::808:808')).toBe(false); // 8.8.8.8
+    expect(isPrivateOrReservedAddress('64:ff9b:1:dead:beef:cafe:808:808')).toBe(false); // 8.8.8.8, non-zero middle
+  });
+
   it('flags loopback/unspecified regardless of which equivalent IPv6 spelling is used', () => {
     expect(isPrivateOrReservedAddress('0:0:0:0:0:0:0:1')).toBe(true); // fully expanded ::1
     expect(isPrivateOrReservedAddress('0:0:0:0:0:0:0:0')).toBe(true); // fully expanded ::

@@ -114,28 +114,41 @@ function isPrivateIPv6(ip: string): boolean {
   if (mapped) {
     return isPrivateIPv4(embeddedIPv4FromHexGroups(mapped[1]!, mapped[2]!)); // IPv4-mapped - validate the embedded address
   }
-  // The IPv4-compatible range (::/96, e.g. "::7f00:1" == "::127.0.0.1")
-  // and the NAT64 well-known prefix (64:ff9b::/96, RFC 6052, e.g.
-  // "64:ff9b::a9fe:a9fe" == 169.254.169.254) both embed a 32-bit IPv4
-  // address in their low 32 bits, exactly like the "::ffff:" IPv4-mapped
-  // form above - but neither was previously recognized, so an internal
-  // IPv4 (loopback, 169.254.169.254 metadata, RFC 1918, ...) spelled in
-  // either form slipped past this check as an "ordinary" public IPv6
-  // address. Both are reachable within this file's stated threat model: a
-  // hijacked/dangling DNS record can resolve to either spelling directly,
-  // and in an IPv6-only network fronted by NAT64/DNS64 (increasingly
-  // common in cloud environments), a synthesized AAAA for an internal
-  // IPv4-only name lands in 64:ff9b::/96 and is then translated back to
+  // The IPv4-compatible range (::/96, e.g. "::7f00:1" == "::127.0.0.1"),
+  // the NAT64 well-known prefix (64:ff9b::/96, RFC 6052, e.g.
+  // "64:ff9b::a9fe:a9fe" == 169.254.169.254), and the NAT64 *local-use*
+  // prefix (64:ff9b:1::/48, RFC 8215 - an operator-assigned alternative to
+  // the well-known prefix for sites that can't use it, e.g. because they
+  // run NAT64 on both sides of a double translation) all embed a 32-bit
+  // IPv4 address in their low 32 bits, exactly like the "::ffff:"
+  // IPv4-mapped form above - but none were previously recognized, so an
+  // internal IPv4 (loopback, 169.254.169.254 metadata, RFC 1918, ...)
+  // spelled in any of these forms slipped past this check as an
+  // "ordinary" public IPv6 address. All are reachable within this file's
+  // stated threat model: a hijacked/dangling DNS record can resolve to
+  // any of these spellings directly, and in an IPv6-only network fronted
+  // by NAT64/DNS64 (increasingly common in cloud environments), a
+  // synthesized AAAA for an internal IPv4-only name lands in whichever of
+  // these prefixes the local NAT64 gateway uses and is translated back to
   // that internal IPv4 at connect time. Validate the embedded IPv4 the
   // same way the mapped case does, so a private embedded address is
   // blocked while a public one still passes (matching how ::ffff:8.8.8.8
   // is allowed). No legitimate *public* global-unicast address
   // canonicalizes to the ::/96 form (the range is deprecated, RFC 4291,
-  // and its only assigned addresses - "::"/"::1" - are handled above), so
-  // this cannot cause a false positive on a real host.
+  // and its only assigned addresses - "::"/"::1" - are handled above) or
+  // to 64:ff9b::/96 or 64:ff9b:1::/48 (both reserved exclusively for
+  // NAT64 translation, never allocated for ordinary public unicast use),
+  // so none of these can cause a false positive on a real host. The
+  // RFC 8215 prefix is only a /48 - an operator picks their own /96 (or
+  // other length; /96 is what RFC 8215 recommends and the only length
+  // handled here) within it - so unlike the fixed-width WKP match, this
+  // one allows arbitrary hex/colons between the fixed "64:ff9b:1:" prefix
+  // and the trailing embedded-IPv4 groups, however that middle portion
+  // happens to be "::"-compressed (or not) in the canonical form.
   const embedded =
     /^::([0-9a-f]{1,4}):([0-9a-f]{1,4})$/.exec(canonical) ?? // IPv4-compatible ::/96
-    /^64:ff9b::([0-9a-f]{1,4}):([0-9a-f]{1,4})$/.exec(canonical); // NAT64 well-known prefix 64:ff9b::/96
+    /^64:ff9b::([0-9a-f]{1,4}):([0-9a-f]{1,4})$/.exec(canonical) ?? // NAT64 well-known prefix 64:ff9b::/96
+    /^64:ff9b:1:[0-9a-f:]*:([0-9a-f]{1,4}):([0-9a-f]{1,4})$/.exec(canonical); // NAT64 local-use prefix 64:ff9b:1::/48
   if (embedded) {
     return isPrivateIPv4(embeddedIPv4FromHexGroups(embedded[1]!, embedded[2]!));
   }
