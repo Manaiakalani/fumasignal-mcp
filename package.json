@@ -43,7 +43,8 @@
     "test:watch": "vitest",
     "check": "npm run typecheck && npm run lint && npm test && npm run build",
     "prepublishOnly": "npm run build",
-    "inspector": "npm run build && npx -y @modelcontextprotocol/inspector node dist/index.js"
+    "inspector": "npm run build && npx -y @modelcontextprotocol/inspector node dist/index.js",
+    "changeset-version": "changeset version && npm install --package-lock-only"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.0.4",
