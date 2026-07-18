@@ -22,7 +22,7 @@
   "author": "Manaiakalani",
   "type": "module",
   "bin": {
-    "fumasignal-mcp": "./dist/index.js"
+    "fumasignal-mcp": "dist/index.js"
   },
   "files": [
     "dist",
