@@ -41,7 +41,16 @@ jobs:
         uses: changesets/action@a45c4d594aa4e2c509dc14a9f2b3b67ba3780d0d # v1.9.0
         with:
           publish: npx changeset publish
-          version: npx changeset version
+          # `changeset version` only rewrites package.json/CHANGELOG.md; it
+          # never touches package-lock.json, so a bare `npx changeset
+          # version` silently leaves the lockfile's "version" field
+          # pointing at the *previous* release on every future bump
+          # (exactly what happened for the 0.1.0 -> 0.1.1 jump). Re-run
+          # npm install in lockfile-only mode (no node_modules changes, so
+          # this can't accidentally pull in new dependency versions) right
+          # after so the commit this action makes always has a lockfile
+          # that matches package.json.
+          version: npx changeset version && npm install --package-lock-only
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           NPM_TOKEN: ${{ secrets.NPM_TOKEN }}

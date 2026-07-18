@@ -1,5 +1,6 @@
 import { Command, InvalidArgumentError, Option } from 'commander';
 import { logger, redactUrlForLogging } from './lib/logger.js';
+import { VERSION } from './lib/version.js';
 import { LocalFumadocsSource } from './sources/local.js';
 import { RemoteFumadocsSource } from './sources/remote.js';
 import type { FumadocsSource } from './sources/types.js';
@@ -37,6 +38,34 @@ function parseCacheTtl(value: string): number {
   return n;
 }
 
+function parseUrl(value: string): string {
+  let parsed: URL;
+  try {
+    parsed = new URL(value);
+  } catch {
+    throw new InvalidArgumentError(
+      'must be an absolute URL, e.g. "https://example.com".',
+    );
+  }
+  if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+    throw new InvalidArgumentError('must use the "http" or "https" scheme.');
+  }
+  // --search-path and the sitemap fetch are always resolved from the
+  // site's *origin* (see RemoteFumadocsSource), so any path/query/hash
+  // included here is silently discarded rather than erroring - the most
+  // common cause of a confusing "Search request failed: 404" or an empty
+  // list_pages result is a user reasonably assuming --url's path is used
+  // as-is. Reject it up front instead, pointing at the option that
+  // actually exists for this: --docs-prefix.
+  if ((parsed.pathname !== '/' && parsed.pathname !== '') || parsed.search || parsed.hash) {
+    throw new InvalidArgumentError(
+      `must be the site's origin only, with no path/query/fragment (got "${value}"). ` +
+        'Use --docs-prefix for a documentation path prefix, or --search-path for a non-default search API path.',
+    );
+  }
+  return value;
+}
+
 export function buildProgram(): Command {
   const program = new Command();
   program
@@ -44,12 +73,13 @@ export function buildProgram(): Command {
     .description(
       'MCP server that exposes a Fumadocs site (remote URL or local repo) to AI assistants.',
     )
-    .version('0.1.0', '-v, --version')
+    .version(VERSION, '-v, --version')
     .addOption(
       new Option(
         '-u, --url <url>',
-        'Base URL of a deployed Fumadocs site (e.g. https://fumadocs.dev).',
-      ).env('FUMASIGNAL_URL'),
+        'Origin of a deployed Fumadocs site - scheme + host only, e.g. https://fumadocs.dev (no path; use --docs-prefix for sites that mount docs under a subpath).',
+      ).argParser(parseUrl)
+        .env('FUMASIGNAL_URL'),
     )
     .addOption(
       new Option(
@@ -144,7 +174,15 @@ export function buildSource(opts: ParsedOptions): FumadocsSource {
       urlPrefix: opts.docsPrefix,
     });
   }
-  throw new Error('No source configured (this is a bug).');
+  // Unreachable in practice: parseOptions() above always calls
+  // program.error() (which exits the process) unless at least one of
+  // url/local is set, so this is only a defensive invariant check for a
+  // caller that constructs ParsedOptions some other way (e.g. a test) -
+  // not a validation message a real user should ever see.
+  throw new Error(
+    'buildSource() invariant violated: neither --url nor --local was set. ' +
+      'This should have been rejected by parseOptions() already - please file a bug.',
+  );
 }
 
 function normalizePrefix(p: string): string {

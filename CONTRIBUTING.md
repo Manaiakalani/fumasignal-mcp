@@ -6,6 +6,8 @@ Thanks for your interest! A few quick guidelines:
 
 ```bash
 npm install
+npm run typecheck
+npm run lint
 npm test
 npm run build
 ```
@@ -14,7 +16,7 @@ npm run build
 
 1. Open an issue first for any non-trivial change so we can align on direction.
 2. Branch from `main`, write tests, keep changes focused.
-3. Run `npm run typecheck && npm test` before pushing.
+3. Run `npm run check` (typecheck + lint + test + build) before pushing.
 4. Add a changeset (`npx changeset`) describing your change — the release workflow will pick it up.
 
 ## Code style

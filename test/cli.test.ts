@@ -123,4 +123,55 @@ describe('parseOptions', () => {
       expect(opts.cacheTtlMs).toBe(0);
     });
   });
+
+  describe('--url validation', () => {
+    // Same rationale as the --cache-ttl block above: buildProgram() never
+    // calls exitOverride(), so an argParser rejection prints to
+    // console.error and calls process.exit(1) by default.
+    let exitSpy: ReturnType<typeof vi.spyOn>;
+    let errorSpy: ReturnType<typeof vi.spyOn>;
+
+    beforeEach(() => {
+      exitSpy = vi.spyOn(process, 'exit').mockImplementation(() => {
+        throw new Error('process.exit called');
+      });
+      errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    });
+
+    afterEach(() => {
+      exitSpy.mockRestore();
+      errorSpy.mockRestore();
+    });
+
+    it('accepts a bare origin with no path', () => {
+      const opts = parseOptions(['node', 'cli', '--url', 'https://example.com']);
+      expect(opts.url).toBe('https://example.com');
+    });
+
+    it('accepts an origin with only a trailing slash', () => {
+      const opts = parseOptions(['node', 'cli', '--url', 'https://example.com/']);
+      expect(opts.url).toBe('https://example.com/');
+    });
+
+    it('rejects a malformed URL instead of letting it fail deep in RemoteFumadocsSource', () => {
+      expect(() => parseOptions(['node', 'cli', '--url', 'not-a-url'])).toThrow();
+    });
+
+    it('rejects a non-http(s) scheme', () => {
+      expect(() => parseOptions(['node', 'cli', '--url', 'ftp://example.com'])).toThrow();
+    });
+
+    // Regression: --search-path/--docs-prefix and the sitemap fetch are
+    // always resolved from the URL's *origin* (see RemoteFumadocsSource),
+    // so a --url with a path used to be silently accepted and then
+    // silently ignored - producing a confusing 404/empty result far away
+    // from the actual misconfiguration instead of an immediate, actionable
+    // error pointing at --docs-prefix.
+    it.each(['https://example.com/docs', 'https://example.com/docs/', 'https://example.com?q=1', 'https://example.com#frag'])(
+      'rejects a --url with a path/query/fragment (%j) instead of silently discarding it',
+      (value) => {
+        expect(() => parseOptions(['node', 'cli', '--url', value])).toThrow();
+      },
+    );
+  });
 });

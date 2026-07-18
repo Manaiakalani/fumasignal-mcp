@@ -466,7 +466,19 @@ export class RemoteFumadocsSource implements FumadocsSource {
           `Search request failed: ${res.status} ${res.statusText} (${url})`,
         );
       }
-      const data = JSON.parse(await this.readCappedText(res)) as unknown;
+      const bodyText = await this.readCappedText(res);
+      let data: unknown;
+      try {
+        data = JSON.parse(bodyText);
+      } catch (err) {
+        // A search endpoint returning non-JSON (an HTML error page from a
+        // proxy/CDN, a truncated body, etc.) used to surface as an
+        // unhandled SyntaxError with no URL context, instead of the same
+        // SourceError shape every other failure in this method produces.
+        throw new SourceError(
+          `Search response from ${url} was not valid JSON: ${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
       const hits = parseSearchResponse(data);
       const limit = opts.limit ?? 10;
       return hits.slice(0, limit);
