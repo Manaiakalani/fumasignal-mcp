@@ -57,7 +57,7 @@ function registerTools(server: McpServer, source: FumadocsSource): void {
       description:
         'Full-text search across the Fumadocs site. Returns ranked hits with URL, title, description and a matching excerpt.',
       inputSchema: {
-        query: z.string().min(1).max(500).describe('Search query.'),
+        query: z.string().trim().min(1).max(500).describe('Search query.'),
         limit: z
           .number()
           .int()
@@ -67,10 +67,11 @@ function registerTools(server: McpServer, source: FumadocsSource): void {
           .describe('Max results to return (default 10, max 50).'),
         tag: z
           .string()
+          .trim()
           .max(100)
           .optional()
           .describe('Optional tag filter (used by Fumadocs multi-docs sites).'),
-        locale: z.string().max(100).optional().describe('Optional locale filter (e.g. "en", "cn").'),
+        locale: z.string().trim().max(100).optional().describe('Optional locale filter (e.g. "en", "cn").'),
       },
     },
     async (args) => {
@@ -106,6 +107,7 @@ function registerTools(server: McpServer, source: FumadocsSource): void {
       inputSchema: {
         prefix: z
           .string()
+          .trim()
           .max(500)
           .optional()
           .describe('Filter to pages whose URL starts with this prefix (e.g. "/docs/api").'),
@@ -157,6 +159,7 @@ function registerTools(server: McpServer, source: FumadocsSource): void {
       inputSchema: {
         ref: z
           .string()
+          .trim()
           .min(1)
           .max(2000)
           .describe('URL path, absolute URL, or slug of the page to fetch.'),
@@ -196,9 +199,10 @@ function registerTools(server: McpServer, source: FumadocsSource): void {
       description:
         'Return only the markdown of one section of a page, identified by its heading anchor slug (lowercased, hyphenated). Use get_toc first to find available anchors.',
       inputSchema: {
-        ref: z.string().min(1).max(2000).describe('URL path, absolute URL, or slug of the page.'),
+        ref: z.string().trim().min(1).max(2000).describe('URL path, absolute URL, or slug of the page.'),
         anchor: z
           .string()
+          .trim()
           .min(1)
           .max(200)
           .describe('Heading anchor slug (no leading "#"). E.g. "getting-started".'),
@@ -221,7 +225,7 @@ function registerTools(server: McpServer, source: FumadocsSource): void {
       title: 'Get a page table of contents',
       description: 'List the headings of a page with their depth and anchor slug.',
       inputSchema: {
-        ref: z.string().min(1).max(2000).describe('URL path, absolute URL, or slug of the page.'),
+        ref: z.string().trim().min(1).max(2000).describe('URL path, absolute URL, or slug of the page.'),
       },
     },
     async (args) => {
@@ -243,7 +247,7 @@ function registerTools(server: McpServer, source: FumadocsSource): void {
       title: 'Get page metadata',
       description: 'Return the frontmatter / metadata of a page as JSON.',
       inputSchema: {
-        ref: z.string().min(1).max(2000).describe('URL path, absolute URL, or slug of the page.'),
+        ref: z.string().trim().min(1).max(2000).describe('URL path, absolute URL, or slug of the page.'),
       },
     },
     async (args) => {

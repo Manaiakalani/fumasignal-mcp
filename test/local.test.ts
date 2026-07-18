@@ -832,4 +832,90 @@ describe('LocalFumadocsSource security fixes', () => {
       await rm(dir, { recursive: true, force: true });
     }
   });
+
+  describe('index TTL / refresh', () => {
+    it('does not rebuild the index again within the TTL window', async () => {
+      const dir = await mkdtemp(path.join(os.tmpdir(), 'fumasignal-local-ttl-'));
+      try {
+        const docs = path.join(dir, 'content', 'docs');
+        await mkdir(docs, { recursive: true });
+        await writeFile(path.join(docs, 'a.md'), '# A');
+        const opendirSpy = vi.spyOn(fsPromises, 'opendir');
+        try {
+          const src = new LocalFumadocsSource({ rootDir: dir, indexTtlMs: 60_000 });
+          await src.listPages();
+          const callsAfterFirst = opendirSpy.mock.calls.length;
+          expect(callsAfterFirst).toBeGreaterThan(0);
+          await src.listPages();
+          // Still well within the TTL window - must reuse the cached
+          // index rather than walking the filesystem again.
+          expect(opendirSpy.mock.calls.length).toBe(callsAfterFirst);
+        } finally {
+          opendirSpy.mockRestore();
+        }
+      } finally {
+        await rm(dir, { recursive: true, force: true });
+      }
+    });
+
+    it('rebuilds the index after the TTL expires, picking up a newly added page', async () => {
+      // Regression: the index was cached *forever* once built, with no
+      // TTL at all - a long-lived local-mode server (the common case: an
+      // MCP server left running for a whole editor/assistant session)
+      // could never see docs added/edited/removed after its first
+      // request, defeating local mode's whole point of pointing it at
+      // docs actively being written. Date.now() is mocked so this doesn't
+      // depend on real elapsed time.
+      const dir = await mkdtemp(path.join(os.tmpdir(), 'fumasignal-local-ttl-refresh-'));
+      try {
+        const docs = path.join(dir, 'content', 'docs');
+        await mkdir(docs, { recursive: true });
+        await writeFile(path.join(docs, 'a.md'), '# A');
+        const nowSpy = vi.spyOn(Date, 'now').mockReturnValue(1_000_000);
+        try {
+          const src = new LocalFumadocsSource({ rootDir: dir, indexTtlMs: 1000 });
+          const first = await src.listPages();
+          expect(first.map((p) => p.url)).not.toContain('/docs/b');
+
+          await writeFile(path.join(docs, 'b.md'), '# B');
+          nowSpy.mockReturnValue(1_000_000 + 1000);
+          const second = await src.listPages();
+          expect(second.map((p) => p.url)).toContain('/docs/b');
+        } finally {
+          nowSpy.mockRestore();
+        }
+      } finally {
+        await rm(dir, { recursive: true, force: true });
+      }
+    });
+
+    it('shares one in-flight rebuild across concurrent callers instead of racing multiple filesystem walks', async () => {
+      // Regression risk in the TTL redesign itself: indexExpiresAt is
+      // reset to 0 *before* the rebuild starts, specifically so a
+      // concurrent caller arriving while a (re)build is in flight sees
+      // "not stale yet" and awaits the same pending promise, instead of
+      // treating the zeroed timestamp as "expired" and kicking off a
+      // second, redundant buildIndex() walk racing the first.
+      const dir = await mkdtemp(path.join(os.tmpdir(), 'fumasignal-local-ttl-concurrent-'));
+      try {
+        const docs = path.join(dir, 'content', 'docs');
+        await mkdir(docs, { recursive: true });
+        await writeFile(path.join(docs, 'a.md'), '# A');
+        const opendirSpy = vi.spyOn(fsPromises, 'opendir');
+        try {
+          const src = new LocalFumadocsSource({ rootDir: dir, indexTtlMs: 60_000 });
+          const [a, b] = await Promise.all([src.listPages(), src.listPages()]);
+          expect(a).toEqual(b);
+          // Exactly one walk (one opendir call for the single
+          // content/docs directory, which has no subdirectories) despite
+          // two concurrent callers.
+          expect(opendirSpy.mock.calls.length).toBe(1);
+        } finally {
+          opendirSpy.mockRestore();
+        }
+      } finally {
+        await rm(dir, { recursive: true, force: true });
+      }
+    });
+  });
 });

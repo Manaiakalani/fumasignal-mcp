@@ -81,6 +81,24 @@ export interface HeadingIndex {
    * section rather than ending where the document itself ends).
    */
   truncated: boolean;
+  /**
+   * True if the document had more than `MAX_HEADINGS` headings and
+   * `collectHeadings()` stopped recording new ones partway through -
+   * *independently* of `truncated` above, since a heading-dense document
+   * (e.g. one heading roughly every other line) can hit this cap tens of
+   * thousands of lines before `MAX_LINES` would ever apply. Unlike the
+   * line cap, this doesn't shrink `lines` - every line is still present
+   * and still scanned for section content - it only means some headings
+   * past the cap were never *recorded*. That matters for
+   * `sectionFromHeadingIndex()`: a section whose true closing heading
+   * exists only past the cap looks, from the recorded `headings` array
+   * alone, exactly like a section with no closing heading at all (i.e.
+   * one that legitimately runs to the end of the document) - so without
+   * this flag such a section would silently swallow all of the
+   * document's remaining (uncounted) content with no indication that
+   * more, unrelated sections actually followed it.
+   */
+  headingsTruncated: boolean;
 }
 
 /**
@@ -144,10 +162,14 @@ function collectHeadings(markdown: string): HeadingIndex {
   const lines = truncated ? allLines.slice(0, MAX_LINES) : allLines;
   const headings: Heading[] = [];
   let inFence = false;
+  let headingsTruncated = false;
   const nextSuffix = new Map<string, number>();
   const usedAnchors = new Set<string>();
   for (let i = 0; i < lines.length; i++) {
-    if (headings.length >= MAX_HEADINGS) break;
+    if (headings.length >= MAX_HEADINGS) {
+      headingsTruncated = true;
+      break;
+    }
     const line = lines[i]!;
     if (FENCE_RE.test(line)) {
       inFence = !inFence;
@@ -171,7 +193,7 @@ function collectHeadings(markdown: string): HeadingIndex {
     usedAnchors.add(anchor);
     headings.push({ depth, title, anchor, line: i });
   }
-  return { lines, headings, truncated };
+  return { lines, headings, truncated, headingsTruncated };
 }
 
 /**
@@ -206,7 +228,7 @@ export function sectionFromHeadingIndex(
   index: HeadingIndex,
   anchor: string,
 ): { title: string; markdown: string } | null {
-  const { lines, headings, truncated } = index;
+  const { lines, headings, truncated, headingsTruncated } = index;
   const targetIdx = headings.findIndex((h) => h.anchor === anchor);
   if (targetIdx === -1) return null;
   const target = headings[targetIdx]!;
@@ -231,6 +253,14 @@ export function sectionFromHeadingIndex(
   // complete would be misleading.
   if (truncated && !hasFollowingHeading) {
     markdown += `\n\n…[document exceeds the ${MAX_LINES}-line indexing limit; this section may be incomplete]`;
+  } else if (headingsTruncated && !hasFollowingHeading) {
+    // Same ambiguity as above, but from the *heading* cap rather than the
+    // line cap: `lines` itself wasn't cut short here, but the closing
+    // heading that would have set `endIdx` may exist past MAX_HEADINGS
+    // and was simply never recorded - see HeadingIndex.headingsTruncated.
+    // `else` avoids stacking a second, redundant notice when the line cap
+    // already explains the same section as possibly incomplete.
+    markdown += `\n\n…[document has more than ${MAX_HEADINGS} headings; this section may be incomplete]`;
   }
   return { title: target.title, markdown };
 }

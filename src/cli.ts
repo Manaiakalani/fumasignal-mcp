@@ -38,17 +38,27 @@ function parseCacheTtl(value: string): number {
   return n;
 }
 
-function parseUrl(value: string): string {
+// Deliberately NOT wired up as a Commander .argParser(): when an
+// argParser throws InvalidArgumentError, Commander's own option-handling
+// wraps it in `error: option '...' argument '<value>' is invalid. <msg>` -
+// embedding the raw, *unredacted* CLI/env value verbatim in that outer
+// wrapper regardless of how careful <msg> is about redaction. A --url
+// with both a path *and* embedded "user:pass@" credentials would still
+// leak the credentials via that wrapper even with a fully redacted <msg>.
+// Running this as a plain post-parse check (see parseOptions() below) and
+// reporting failures through program.error() directly means every
+// character of the final printed message is ours to control.
+function validateUrl(program: Command, value: string): void {
   let parsed: URL;
   try {
     parsed = new URL(value);
   } catch {
-    throw new InvalidArgumentError(
-      'must be an absolute URL, e.g. "https://example.com".',
-    );
+    program.error('Error: --url must be an absolute URL, e.g. "https://example.com".');
+    return;
   }
   if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
-    throw new InvalidArgumentError('must use the "http" or "https" scheme.');
+    program.error('Error: --url must use the "http" or "https" scheme.');
+    return;
   }
   // --search-path and the sitemap fetch are always resolved from the
   // site's *origin* (see RemoteFumadocsSource), so any path/query/hash
@@ -58,12 +68,16 @@ function parseUrl(value: string): string {
   // as-is. Reject it up front instead, pointing at the option that
   // actually exists for this: --docs-prefix.
   if ((parsed.pathname !== '/' && parsed.pathname !== '') || parsed.search || parsed.hash) {
-    throw new InvalidArgumentError(
-      `must be the site's origin only, with no path/query/fragment (got "${value}"). ` +
+    // Echo the redacted form, not `value` itself: see the leak this
+    // function's docstring above describes - redactUrlForLogging() exists
+    // to prevent exactly this everywhere else a URL is logged (see
+    // logger.ts, and RemoteFumadocsSource's own userinfo rejection in
+    // remote.ts).
+    program.error(
+      `Error: --url must be the site's origin only, with no path/query/fragment (got "${redactUrlForLogging(value)}"). ` +
         'Use --docs-prefix for a documentation path prefix, or --search-path for a non-default search API path.',
     );
   }
-  return value;
 }
 
 export function buildProgram(): Command {
@@ -74,12 +88,19 @@ export function buildProgram(): Command {
       'MCP server that exposes a Fumadocs site (remote URL or local repo) to AI assistants.',
     )
     .version(VERSION, '-v, --version')
+    // This program takes no positional arguments at all - every input is a
+    // named option. Commander's default (`allowExcessArguments(true)`)
+    // silently ignores anything typed as a bare positional word (e.g. a
+    // stray "fumasignal-mcp --local ./docs typo"), which just as silently
+    // discards whatever the user actually meant to pass. Rejecting it
+    // instead surfaces the mistake immediately, consistent with this CLI's
+    // existing fail-fast validation (validateUrl/parseCacheTtl above).
+    .allowExcessArguments(false)
     .addOption(
       new Option(
         '-u, --url <url>',
         'Origin of a deployed Fumadocs site - scheme + host only, e.g. https://fumadocs.dev (no path; use --docs-prefix for sites that mount docs under a subpath).',
-      ).argParser(parseUrl)
-        .env('FUMASIGNAL_URL'),
+      ).env('FUMASIGNAL_URL'),
     )
     .addOption(
       new Option(
@@ -90,7 +111,13 @@ export function buildProgram(): Command {
     .addOption(
       new Option('--search-path <path>', 'Path of the search API on the remote site.')
         .default('/api/search')
-        .env('FUMASIGNAL_SEARCH_PATH'),
+        .env('FUMASIGNAL_SEARCH_PATH')
+        // Remote-only: search_docs always calls the remote site's search
+        // API. Without `.conflicts()`, passing this alongside --local (or
+        // just having FUMASIGNAL_SEARCH_PATH set in the environment from an
+        // unrelated remote-mode invocation) was silently discarded by
+        // buildSource() with no indication the flag/env-var had no effect.
+        .conflicts('local'),
     )
     .addOption(
       new Option(
@@ -103,16 +130,24 @@ export function buildProgram(): Command {
       new Option(
         '--content-dir <path>',
         'Path to the local content/docs directory (relative to --local or absolute). Default: "content/docs".',
-      ).env('FUMASIGNAL_CONTENT_DIR'),
+      ).env('FUMASIGNAL_CONTENT_DIR')
+        // Local-only: see --search-path's .conflicts() above for why this
+        // matters - --content-dir has no meaning for a remote source.
+        .conflicts('url'),
     )
     .addOption(
       new Option(
         '--auth-header <value>',
         'Authorization header value to send on remote requests (e.g. "Bearer abc123").',
-      ).env('FUMASIGNAL_AUTH_HEADER'),
+      ).env('FUMASIGNAL_AUTH_HEADER')
+        // Remote-only: see --search-path's .conflicts() above.
+        .conflicts('local'),
     )
     .addOption(
-      new Option('--cache-ttl <ms>', 'Cache TTL for remote responses in ms.')
+      new Option(
+        '--cache-ttl <ms>',
+        'Cache TTL in ms: how long remote responses are cached (remote mode), or how often the local filesystem index is refreshed to pick up doc changes (local mode).',
+      )
         .default(DEFAULT_CACHE_TTL_MS)
         .argParser(parseCacheTtl)
         .env('FUMASIGNAL_CACHE_TTL'),
@@ -141,6 +176,9 @@ export function parseOptions(argv: string[]): ParsedOptions {
   }
   if (opts.url && opts.local) {
     program.error('Error: --url and --local are mutually exclusive. Pick one.');
+  }
+  if (opts.url) {
+    validateUrl(program, opts.url);
   }
 
   const out: ParsedOptions = {
@@ -172,6 +210,7 @@ export function buildSource(opts: ParsedOptions): FumadocsSource {
       rootDir: opts.local,
       ...(opts.contentDir ? { contentDir: opts.contentDir } : {}),
       urlPrefix: opts.docsPrefix,
+      indexTtlMs: opts.cacheTtlMs,
     });
   }
   // Unreachable in practice: parseOptions() above always calls

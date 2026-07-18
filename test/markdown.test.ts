@@ -83,6 +83,7 @@ describe('extractToc', () => {
     expect(toc.length).toBeLessThanOrEqual(5000);
     expect(toc.length).toBeGreaterThan(0);
     expect(toc[0]!.title).toBe('Heading 0');
+    expect(buildHeadingIndex(md).headingsTruncated).toBe(true);
   });
 
   it('caps the number of lines retained for a single document, independent of heading count (memory regression)', () => {
@@ -101,12 +102,17 @@ describe('extractToc', () => {
     expect(index.truncated).toBe(true);
     // The one heading lives past the cap, so it must not be found.
     expect(tocFromHeadingIndex(index)).toHaveLength(0);
+    // Only one heading (well under MAX_HEADINGS) even exists in this doc,
+    // so the heading cap itself was never reached - this is purely the
+    // line cap's doing, and the two flags must stay independent.
+    expect(index.headingsTruncated).toBe(false);
   });
 
   it('still finds headings comfortably within the line cap', () => {
     const md = '\n'.repeat(10) + '# Reachable';
     const index = buildHeadingIndex(md);
     expect(index.truncated).toBe(false);
+    expect(index.headingsTruncated).toBe(false);
     expect(extractToc(md).map((t) => t.title)).toEqual(['Reachable']);
   });
 });
@@ -169,6 +175,33 @@ describe('extractSection', () => {
   it('does not append a truncation notice when the document is within the line cap', () => {
     const md = `# Top\n\nbody`;
     expect(extractSection(md, 'top')?.markdown).not.toContain('…[document exceeds');
+  });
+
+  it('appends a heading-cap truncation notice only to the section built from the last recorded heading', () => {
+    // Regression: when a document has more than MAX_HEADINGS headings,
+    // collectHeadings() stops *recording* new ones but keeps scanning/
+    // retaining every line (unlike the line cap above). The section for
+    // the last heading that *was* recorded then has no "next heading" in
+    // the index to bound it - exactly like the line-cap case - except
+    // here `lines` is fully present, so the section silently absorbed
+    // every unrecorded heading's content past the cap as if it were all
+    // one section, with nothing to indicate more (unrelated) sections
+    // actually followed. This doc has 5,010 one-line top-level headings -
+    // 10 past MAX_HEADINGS (5,000) - but only 5,010 lines total, nowhere
+    // near MAX_LINES (50,000), so this exercises the heading cap in
+    // isolation from the line cap.
+    const md = Array.from({ length: 5010 }, (_, i) => `# Heading ${i}`).join('\n');
+    const last = extractSection(md, 'heading-4999')!;
+    expect(last.markdown).toContain('…[document has more than 5000 headings');
+    // Before the fix, this would have silently included every later,
+    // never-recorded heading's line as if it were part of this section.
+    expect(last.markdown).toContain('# Heading 5009');
+
+    // An early heading, correctly closed by another *recorded* heading,
+    // must be unaffected by truncation that only happens much later.
+    const first = extractSection(md, 'heading-0')!;
+    expect(first.markdown).not.toContain('…[document has more than');
+    expect(first.markdown).toBe('# Heading 0');
   });
 });
 
