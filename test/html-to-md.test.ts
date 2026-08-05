@@ -30,15 +30,35 @@ describe('pickArticle', () => {
     expect(pickArticle(html)).toBe(html);
   });
 
-  it('matches the original lazy-regex non-nesting-aware behavior for nested same tags', () => {
-    // Historical behavior (regex `<article\b[^>]*>([\s\S]*?)<\/article>`):
-    // the lazy group stops at the FIRST closer, so nested same-name tags
-    // resolve to the outer opener + inner closer, leaving a dangling
-    // closer as leftover. The linear rewrite intentionally preserves this
-    // rather than attempting real nesting-aware parsing (out of scope -
-    // this is regex-based best-effort extraction, not an HTML parser).
+  it('pairs nested same-name tags by depth instead of stopping at the first closer', () => {
+    // Regression: the previous implementation paired every opener with
+    // whatever `</article>` came next, with no notion of depth, so the
+    // OUTER article was treated as ending at the INNER article's closer.
+    // The extracted body stopped there and everything after it was
+    // dropped - on a real docs page using an `<article>` card list inside
+    // its own `<article>`, that silently discarded the rest of the page.
     const html = '<article><article>inner</article></article>';
-    expect(pickArticle(html)).toBe('<article>inner');
+    expect(pickArticle(html)).toBe('<article>inner</article>');
+  });
+
+  it('keeps content that follows a nested block inside the same outer tag', () => {
+    // The concrete data-loss shape: "3" (and, on a real page, everything
+    // after the nested block) used to be discarded entirely.
+    const html = '<article>1<article>2</article>3</article>';
+    expect(pickArticle(html)).toBe('1<article>2</article>3');
+  });
+
+  it('does not mistake a closer inside an opening tag\u2019s attribute for the block closer', () => {
+    // `>`-finding is attribute-unaware (unchanged, longstanding behavior
+    // of this best-effort regex extraction - a real HTML parser would
+    // skip quoted attribute values), so the opening tag is considered to
+    // end at the `>` inside the attribute and the leading `">` bleeds
+    // into the content. What matters here is the pairing: the
+    // `</article>` sitting inside that attribute is NOT taken as the
+    // block's closing tag, so the body still survives instead of
+    // collapsing to an empty match.
+    const html = '<article title="</article>">body</article>';
+    expect(pickArticle(html)).toBe('">body');
   });
 
   it('does not exhibit quadratic blowup on adversarial input (many unclosed openers)', () => {
@@ -133,6 +153,19 @@ describe('stripChrome', () => {
   it('leaves an unclosed chrome tag untouched', () => {
     const html = '<p>keep</p><nav>unclosed forever';
     expect(stripChrome(html)).toBe(html);
+  });
+
+  it('removes a whole nested chrome block rather than leaking its tail', () => {
+    // Regression: pairing the outer <nav> with the FIRST </nav> it found
+    // ended the removal at the inner block's closer, so everything between
+    // that and the real closer survived - i.e. the navigation chrome this
+    // pass exists to strip was left in the output.
+    expect(stripChrome('<p>keep</p><nav><nav></nav> LEAKED </nav>')).toBe('<p>keep</p>');
+  });
+
+  it('removes deeply nested chrome blocks entirely', () => {
+    const html = '<p>a</p><nav>1<nav>2<nav>3</nav>4</nav>5</nav><p>b</p>';
+    expect(stripChrome(html)).toBe('<p>a</p><p>b</p>');
   });
 
   it('does not exhibit quadratic blowup on adversarial input (many unclosed openers)', () => {

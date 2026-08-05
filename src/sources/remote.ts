@@ -3,6 +3,7 @@ import { TtlCache, Coalescer, Semaphore } from '../lib/cache.js';
 import { htmlToMarkdown } from '../lib/html-to-md.js';
 import {
   type HeadingIndex,
+  FenceTracker,
   buildHeadingIndex,
   sectionFromHeadingIndex,
   tocFromHeadingIndex,
@@ -381,7 +382,7 @@ export class RemoteFumadocsSource implements FumadocsSource {
         );
       }
       try {
-        await assertPublicResolution(current.hostname, this.dnsLookup);
+        await assertPublicResolution(current.hostname, this.dnsLookup, this.fetchTimeoutMs);
       } catch (err) {
         throw new SourceError(err instanceof Error ? err.message : String(err));
       }
@@ -459,6 +460,14 @@ export class RemoteFumadocsSource implements FumadocsSource {
       url.searchParams.set('query', opts.query);
       if (opts.tag) url.searchParams.set('tag', opts.tag);
       if (opts.locale) url.searchParams.set('locale', opts.locale);
+      // Forward the limit so the upstream endpoint can return enough
+      // results to satisfy it. Without this the request only ever got the
+      // remote's own default page size (typically 10), so the `hits.slice`
+      // below could never produce more than that no matter what the caller
+      // asked for - a request for 50 silently returned 10. The slice still
+      // stands as the authoritative cap, since the remote is free to
+      // ignore or exceed the parameter.
+      if (opts.limit !== undefined) url.searchParams.set('limit', String(opts.limit));
       const res = await this.fetchSameOrigin(url, { headers: this.headers() });
       if (!res.ok) {
         await discardBody(res);
@@ -929,7 +938,17 @@ function extractTitle(markdown: string): string | undefined {
   // `(.*)$` has nothing after it to backtrack against, so it's linear
   // regardless of line length; the loop preserves the original's
   // "skip a bare '#' line with no real content, keep scanning" behavior.
+  //
+  // Fenced code blocks are skipped via the same tracker `collectHeadings`
+  // uses. Without it, a page with no real `# ` heading of its own would
+  // take the first `#`-prefixed line from inside a code block as its
+  // title - e.g. a shell snippet's `# install the CLI` comment, or worse
+  // something like `# rm -rf /` - and that string then propagates into
+  // search results, `list_pages` output and the MCP tool responses as if
+  // it were the document's actual title.
+  const fence = new FenceTracker();
   for (const line of markdown.split(/\r?\n/)) {
+    if (fence.consume(line)) continue;
     const m = /^#\s+(.*)$/.exec(line);
     if (!m) continue;
     const title = m[1]!.trim();

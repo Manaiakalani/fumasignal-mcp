@@ -114,20 +114,73 @@ describe('isPrivateOrReservedAddress', () => {
     // Regression: RFC 8215 defines 64:ff9b:1::/48 as an operator-assigned
     // alternative to the well-known prefix (e.g. for sites running NAT64
     // on both sides of a double translation, where reusing the WKP for
-    // both would be ambiguous). An operator picks their own /96 (or other
-    // length - only /96, RFC 8215's recommendation, is handled here)
-    // within that /48, so the middle groups vary by deployment; only the
-    // fixed "64:ff9b:1:" prefix and the trailing embedded-IPv4 groups are
-    // guaranteed. Covers both the maximally-compressed ("::" right after
-    // the fixed prefix) and fully-expanded-with-non-zero-middle cases.
+    // both would be ambiguous).
     expect(isPrivateOrReservedAddress('64:ff9b:1::a9fe:a9fe')).toBe(true); // 169.254.169.254 cloud metadata
     expect(isPrivateOrReservedAddress('64:ff9b:1::7f00:1')).toBe(true); // 127.0.0.1 loopback
     expect(isPrivateOrReservedAddress('64:ff9b:1:dead:beef:cafe:a00:1')).toBe(true); // 10.0.0.1, non-zero middle
   });
 
-  it('allows NAT64 local-use (64:ff9b:1::/48, RFC 8215) addresses that embed a public IPv4', () => {
-    expect(isPrivateOrReservedAddress('64:ff9b:1::808:808')).toBe(false); // 8.8.8.8
-    expect(isPrivateOrReservedAddress('64:ff9b:1:dead:beef:cafe:808:808')).toBe(false); // 8.8.8.8, non-zero middle
+  it('flags the whole NAT64 local-use /48, including addresses whose trailing groups look public', () => {
+    // This range is rejected wholesale rather than decoded. Inside the /48
+    // an operator picks their own translation prefix at any of the RFC 6052
+    // lengths (/32, /40, /48, /56, /64 or /96), and only the /96 layout
+    // puts the embedded IPv4 in the low 32 bits. Decoding only that layout
+    // (as this used to) misreads every other one: "64:ff9b:1:0:a:0:100:0"
+    // carries 10.0.0.1 under a /64-style layout, yet reading its trailing
+    // groups yields the public-looking 1.0.0.0 and let it through. The
+    // operator's chosen prefix length isn't recoverable from the address
+    // alone, so the ambiguity can't be decoded away - and since the entire
+    // /48 is reserved exclusively for NAT64 translation and never
+    // allocated for ordinary public unicast, rejecting all of it costs
+    // nothing real.
+    expect(isPrivateOrReservedAddress('64:ff9b:1:0:a:0:100:0')).toBe(true); // 10.0.0.1 under a /64-style layout
+    expect(isPrivateOrReservedAddress('64:ff9b:1::808:808')).toBe(true);
+    expect(isPrivateOrReservedAddress('64:ff9b:1:dead:beef:cafe:808:808')).toBe(true);
+  });
+
+  it('flags 6to4 (2002::/16, RFC 3056) addresses that embed a private/reserved IPv4', () => {
+    // 6to4 embeds the IPv4 address in bits 16-47, so a host with 6to4
+    // configured encapsulates and delivers this traffic to the embedded
+    // IPv4 - the same reachability argument as the NAT64 prefixes.
+    // Both the compressed and expanded spellings must be caught: matching
+    // the canonical *text* missed "2002:7f00::1", where the third group is
+    // swallowed by the "::" run.
+    expect(isPrivateOrReservedAddress('2002:a9fe:a9fe::')).toBe(true); // 169.254.169.254 cloud metadata
+    expect(isPrivateOrReservedAddress('2002:7f00:1::')).toBe(true); // 127.0.0.1 loopback
+    expect(isPrivateOrReservedAddress('2002:7f00::1')).toBe(true); // 127.0.0.0, second group compressed away
+    expect(isPrivateOrReservedAddress('2002:a00:1::')).toBe(true); // 10.0.0.1 RFC 1918
+  });
+
+  it('allows 6to4 (2002::/16) addresses that embed a public IPv4', () => {
+    expect(isPrivateOrReservedAddress('2002:808:808::')).toBe(false); // 8.8.8.8
+  });
+
+  it('flags Teredo (2001::/32, RFC 4380) addresses whose XOR-obfuscated client IPv4 is private', () => {
+    // Teredo stores the client's IPv4 in the last 32 bits XORed with
+    // all-ones, so 10.0.0.1 (0a000001) is stored as f5fffffe and
+    // 127.0.0.1 (7f000001) as 80fffffe.
+    expect(isPrivateOrReservedAddress('2001:0:4136:e378:8000:63bf:f5ff:fffe')).toBe(true); // 10.0.0.1
+    expect(isPrivateOrReservedAddress('2001:0:4136:e378:8000:63bf:80ff:fffe')).toBe(true); // 127.0.0.1
+  });
+
+  it('allows Teredo addresses whose decoded client IPv4 is public', () => {
+    // 8.8.8.8 (08080808) is stored as f7f7f7f7.
+    expect(isPrivateOrReservedAddress('2001:0:4136:e378:8000:63bf:f7f7:f7f7')).toBe(false); // 8.8.8.8
+  });
+
+  it('flags additional non-public IPv6 special-purpose ranges', () => {
+    expect(isPrivateOrReservedAddress('2001:2::1')).toBe(true); // 2001:2::/48 benchmarking (RFC 5180)
+    expect(isPrivateOrReservedAddress('2001:10::1')).toBe(true); // 2001:10::/28 ORCHID (RFC 4843)
+    expect(isPrivateOrReservedAddress('2001:20::1')).toBe(true); // 2001:20::/28 ORCHIDv2 (RFC 7343)
+    expect(isPrivateOrReservedAddress('100::1')).toBe(true); // 100::/64 discard-only (RFC 6666)
+    expect(isPrivateOrReservedAddress('100:0:0:1::1')).toBe(true); // 100:0:0:1::/64 dummy prefix (RFC 9780)
+    expect(isPrivateOrReservedAddress('3fff::1')).toBe(true); // 3fff::/20 documentation (RFC 9637)
+    expect(isPrivateOrReservedAddress('5f00::1')).toBe(true); // 5f00::/16 SRv6 SIDs (RFC 9602)
+  });
+
+  it('still allows ordinary public IPv6 addresses', () => {
+    expect(isPrivateOrReservedAddress('2001:4860:4860::8888')).toBe(false); // Google public DNS
+    expect(isPrivateOrReservedAddress('2606:4700:4700::1111')).toBe(false); // Cloudflare public DNS
   });
 
   it('flags loopback/unspecified regardless of which equivalent IPv6 spelling is used', () => {
@@ -227,6 +280,49 @@ describe('assertPublicResolution', () => {
   it('does not throw when all resolved addresses are public', async () => {
     const lookup = vi.fn().mockResolvedValue([{ address: '8.8.8.8' }, { address: '1.1.1.1' }]);
     await expect(assertPublicResolution('docs.example.com', lookup)).resolves.toBeUndefined();
+  });
+
+  it('gives up on a lookup that never settles, instead of hanging forever', async () => {
+    // Regression: the caller's fetch timeout only starts once fetch() is
+    // called, so this pre-flight lookup was completely unbounded. A
+    // resolver that accepts the query and never answers stalled the
+    // request indefinitely while holding its slot in the fetch semaphore -
+    // a few of those wedge every concurrency slot and stall the server.
+    // Reachable by whoever controls DNS for the configured host, which is
+    // exactly the adversary this module already assumes exists.
+    const lookup = vi.fn().mockReturnValue(new Promise(() => {}));
+    await expect(assertPublicResolution('docs.example.com', lookup, 20)).rejects.toThrow(
+      /DNS resolution failed.*timed out after 20ms/s,
+    );
+  });
+
+  it('still fails closed on a timed-out lookup rather than proceeding unverified', async () => {
+    const lookup = vi.fn().mockReturnValue(new Promise(() => {}));
+    // The timeout must surface through the same fail-closed path as any
+    // other lookup failure - never as a silent pass.
+    await expect(assertPublicResolution('docs.example.com', lookup, 20)).rejects.toThrow(
+      /cannot be verified as a public address/,
+    );
+  });
+
+  it('does not time out a lookup that answers within the budget', async () => {
+    const lookup = vi
+      .fn()
+      .mockReturnValue(
+        new Promise((resolve) => setTimeout(() => resolve([{ address: '8.8.8.8' }]), 5)),
+      );
+    await expect(
+      assertPublicResolution('docs.example.com', lookup, 5000),
+    ).resolves.toBeUndefined();
+  });
+
+  it('treats a missing or non-positive timeout as unbounded rather than instantly failing', async () => {
+    const lookup = vi.fn().mockResolvedValue([{ address: '8.8.8.8' }]);
+    await expect(assertPublicResolution('docs.example.com', lookup)).resolves.toBeUndefined();
+    await expect(assertPublicResolution('docs.example.com', lookup, 0)).resolves.toBeUndefined();
+    await expect(
+      assertPublicResolution('docs.example.com', lookup, Number.NaN),
+    ).resolves.toBeUndefined();
   });
 
   it('fails closed (throws) when the lookup itself fails, rather than letting the request proceed unverified', async () => {

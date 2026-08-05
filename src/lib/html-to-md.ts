@@ -84,14 +84,106 @@ function lazyAngleFinder(html: string): (from: number) => number {
   return lazyPositionFinder((fromIndex) => html.indexOf('>', fromIndex));
 }
 
-/** Lazy finder for `</tag>` (case-insensitive). */
-function lazyCloserFinder(html: string, tag: string): (from: number) => number {
-  const re = new RegExp(`<\\/${tag}>`, 'gi');
-  return lazyPositionFinder((fromIndex) => {
-    re.lastIndex = fromIndex;
-    const m = re.exec(html);
-    return m ? m.index : -1;
-  });
+/** One matched `<tag ...>...</tag>` block found by {@link eachTagBlock}. */
+interface TagBlock {
+  /** Index of the `<` that opens the block. */
+  start: number;
+  /** Index just past the opening tag's `>`. */
+  contentStart: number;
+  /** Index of the `<` that opens the matching closing tag. */
+  closeStart: number;
+  /** Index just past the matching closing tag's `>`. */
+  end: number;
+  /** Nesting depth of this block; 0 for an outermost one. */
+  depth: number;
+}
+
+/**
+ * Yield every `<tag ...>...</tag>` block in `html`, pairing each opening
+ * tag with its *properly nested* closing tag.
+ *
+ * Both callers previously paired an opening tag with whatever `</tag>`
+ * happened to come next, with no notion of depth. HTML5 permits nesting
+ * for both tags this file cares about, and real documentation pages do it
+ * (an `<article>` card list inside the page's own `<article>`, a `<nav>`
+ * inside a `<nav>`), so that shortcut silently mis-parsed such pages in
+ * two opposite but equally wrong ways:
+ *
+ *  - {@link findLargestTagBlock} on
+ *    `<article>1<article>2</article>3</article>` treated the *outer*
+ *    article as ending at the *inner* article's closer, so the extracted
+ *    body stopped after "2" and everything after it ("3", i.e. the rest
+ *    of the page) was dropped.
+ *  - {@link removeTagBlocks} on `<nav><nav></nav> LEAKED </nav>` removed
+ *    only up to the first closer, leaving " LEAKED </nav>" - the very
+ *    navigation chrome the strip pass exists to remove - in the output.
+ *
+ * Pairing is done with an explicit stack of open tags: openers and
+ * closers are walked in a single merged pass, each opener is pushed, and
+ * each closer pops the innermost still-open tag. `depth` is reported so
+ * `removeTagBlocks` can act on outermost blocks only (a nested block is
+ * already inside the text its parent removes).
+ *
+ * The O(n) guarantee the previous implementation was carefully built for
+ * (see {@link findLargestTagBlock}'s comment for the quadratic-blowup
+ * history) is preserved: `openRe`/`closeRe` are *bounded* patterns with
+ * no unbounded quantifier, each is driven by `exec()` over its own
+ * monotonically advancing `lastIndex`, `nextAngle` only ever moves
+ * forward (openers are consumed in increasing index order), and every
+ * loop iteration consumes exactly one opener or one closer. Total work is
+ * therefore proportional to the number of tag occurrences plus the
+ * distance scanned for `>` - linear in `html.length` regardless of how
+ * the tags nest, or whether they are closed at all.
+ */
+function* eachTagBlock(html: string, tag: string): Generator<TagBlock> {
+  // Cheap existence pre-check before doing any real work below. This
+  // guards a *different, narrower* case than the lazy `>` finder does: a
+  // document that never contains `tag` at all short-circuits in
+  // O(html.length) via this one bounded regex test, without even
+  // constructing the finder or the two global regexes. A non-global
+  // one-off RegExp (no `g` flag) is used so it can't perturb `openRe`'s
+  // own `lastIndex` state below.
+  if (!new RegExp(`<${tag}\\b`, 'i').test(html)) return;
+  const openRe = new RegExp(`<${tag}\\b`, 'gi');
+  const closeRe = new RegExp(`<\\/${tag}>`, 'gi');
+  const nextAngle = lazyAngleFinder(html);
+  const closeLen = `</${tag}>`.length;
+  const open: Array<{ start: number; contentStart: number }> = [];
+  let opener = openRe.exec(html);
+  let closer = closeRe.exec(html);
+  while (closer !== null) {
+    if (opener !== null && opener.index < closer.index) {
+      // Position of the literal '>' that ends *this* opening tag -
+      // equivalent to what an `[^>]*>` suffix would have matched.
+      const angle = nextAngle(opener.index + opener[0].length);
+      if (angle === -1) return; // this (and every later) opening tag never terminates
+      open.push({ start: opener.index, contentStart: angle + 1 });
+      opener = openRe.exec(html);
+      continue;
+    }
+    const innermost = open[open.length - 1];
+    if (innermost === undefined) {
+      closer = closeRe.exec(html); // stray closer with nothing open - ignore it
+      continue;
+    }
+    if (innermost.contentStart > closer.index) {
+      // This "closer" sits inside the opening tag's own text (e.g.
+      // `<article title="</article>">`), so it closes nothing.
+      closer = closeRe.exec(html);
+      continue;
+    }
+    open.pop();
+    yield {
+      start: innermost.start,
+      contentStart: innermost.contentStart,
+      closeStart: closer.index,
+      end: closer.index + closeLen,
+      depth: open.length,
+    };
+    closer = closeRe.exec(html);
+  }
+  // Anything still on `open` never got a closer; leave it unreported, so
+  // callers treat it as "no block here" exactly as they did before.
 }
 
 /**
@@ -113,46 +205,22 @@ function lazyCloserFinder(html: string, tag: string): (from: number) => number {
  * though the *closing*-tag search was already fixed. Empirically
  * confirmed: ~5.5s for 200KB of "<nav" repeated with no ">" anywhere.
  *
- * Fixed the same way: find opener starts with a *bounded* regex
- * (`<tag\b`, no trailing quantifier - matching or failing at any one
- * position is O(tag.length), not O(remaining)), then walk openers once,
- * advancing both a "closing `>` of this opening tag" finder and a
- * "closing `</tag>`" finder that only ever move forward - see
- * {@link lazyPositionFinder}. Total work is O(n) regardless of how many
- * openers/closers exist or whether either exists at all, AND without
- * ever eagerly materializing a position array sized by how many `>`/
- * closer occurrences exist elsewhere in the document, unrelated to
- * `tag` - see the pre-check comment just below for why that distinction
- * matters even with the O(n) bound already in place.
+ * Both are avoided by {@link eachTagBlock}, which pairs bounded opener/
+ * closer patterns against a forward-only `>` finder - see its comment
+ * for why the whole walk stays O(n), and for why it tracks nesting depth
+ * rather than pairing each opener with the next closer it can find.
  */
 function findLargestTagBlock(html: string, tag: string): string | null {
-  // Cheap existence pre-check before doing any real work below. This
-  // guards a *different, narrower* case than the lazy finders do: a
-  // document that never contains `tag` at all short-circuits in
-  // O(html.length) via this one bounded regex test, without even
-  // constructing the closer/angle finders. Tags that DO appear (even
-  // just once, amid megabytes of unrelated content) are now handled
-  // efficiently by the finders' own laziness instead of needing a
-  // separate guard - they only ever scan as far as the actual matches
-  // require, never the whole remaining document regardless of `tag`'s
-  // presence. A non-global one-off RegExp (no `g` flag) is used here so
-  // it can't perturb `openRe`'s own `lastIndex` state in the loop below.
-  if (!new RegExp(`<${tag}\\b`, 'i').test(html)) return null;
-  const openRe = new RegExp(`<${tag}\\b`, 'gi');
-  const nextCloser = lazyCloserFinder(html, tag);
-  const nextAngle = lazyAngleFinder(html);
   let best: string | null = null;
-  let m: RegExpExecArray | null;
-  while ((m = openRe.exec(html)) !== null) {
-    // Position of the literal '>' that ends *this* opening tag -
-    // equivalent to what the old `[^>]*>` suffix would have matched.
-    const angle = nextAngle(m.index + m[0].length);
-    if (angle === -1) break; // this (and every later) opening tag never closes
-    const contentStart = angle + 1;
-    const closeStart = nextCloser(contentStart);
-    if (closeStart === -1) break; // no more closers available for any further opener
-    const inner = html.slice(contentStart, closeStart);
-    if (best === null || inner.length > best.length) best = inner;
+  let bestLength = -1;
+  for (const block of eachTagBlock(html, tag)) {
+    const length = block.closeStart - block.contentStart;
+    // Strictly greater, so the *first* block wins a tie - matching the
+    // previous implementation's behavior.
+    if (length > bestLength) {
+      bestLength = length;
+      best = html.slice(block.contentStart, block.closeStart);
+    }
   }
   return best;
 }
@@ -167,34 +235,20 @@ export function stripChrome(html: string): string {
 }
 
 /**
- * Remove every non-overlapping `<tag ...>...</tag>` block from `html`.
- * Same O(n) approach as {@link findLargestTagBlock} - see that function's
- * comment for why this avoids the quadratic-blowup regex pattern (both
- * for the closing-tag search and the opening-tag search), and for why
- * lazily-computed finders (rather than eager position arrays) matter
- * even with the O(n) bound already in place.
+ * Remove every outermost `<tag ...>...</tag>` block from `html`.
+ *
+ * Only depth-0 blocks are acted on: a nested block of the same tag is
+ * already contained in the span its outermost ancestor removes, so
+ * removing it separately would double-count and corrupt the output.
+ * See {@link eachTagBlock} for the pairing rules and the O(n) argument.
  */
 function removeTagBlocks(html: string, tag: string): string {
-  // Same pre-check as findLargestTagBlock() above, for the same reason -
-  // see its comment.
-  if (!new RegExp(`<${tag}\\b`, 'i').test(html)) return html;
-  const openRe = new RegExp(`<${tag}\\b`, 'gi');
-  const nextCloser = lazyCloserFinder(html, tag);
-  const nextAngle = lazyAngleFinder(html);
-  const closeLen = `</${tag}>`.length;
   let result = '';
   let cursor = 0;
-  let m: RegExpExecArray | null;
-  while ((m = openRe.exec(html)) !== null) {
-    const angle = nextAngle(m.index + m[0].length);
-    if (angle === -1) break; // this (and every later) opening tag never closes; leave the remainder untouched
-    const contentStart = angle + 1;
-    const closeStart = nextCloser(contentStart);
-    if (closeStart === -1) break; // unclosed; leave the remainder untouched
-    const closeEnd = closeStart + closeLen;
-    result += html.slice(cursor, m.index);
-    cursor = closeEnd;
-    openRe.lastIndex = closeEnd;
+  for (const block of eachTagBlock(html, tag)) {
+    if (block.depth !== 0) continue;
+    result += html.slice(cursor, block.start);
+    cursor = block.end;
   }
   result += html.slice(cursor);
   return result;

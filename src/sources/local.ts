@@ -405,6 +405,23 @@ export class LocalFumadocsSource implements FumadocsSource {
     const query = opts.query.trim().toLowerCase();
     if (!query) return [];
     const tokens = [...new Set(query.split(/\s+/).filter(Boolean))].slice(0, MAX_SEARCH_TOKENS);
+    // `snippet()` matches against the *original-case* body with a `/i`
+    // regex, so it must be given the user's original-case tokens too, not
+    // only the lowercased ones used for scoring. JavaScript's `i` flag
+    // implements simple, not full, Unicode case folding: Turkish "İ"
+    // (U+0130) lowercases to the two code units "i" + U+0307, and
+    // `/i\u0307/i` does not match a literal "İ" - so a query that scored
+    // a page perfectly well (scoring runs over a lowercased haystack,
+    // where both sides folded identically) then failed to locate itself
+    // in the body and silently degraded the excerpt to `body.slice(0,
+    // 200)`. Passing both spellings lets whichever one actually occurs in
+    // the body win, and costs nothing for the ASCII case where they are
+    // identical and de-duplicated away.
+    const rawTokens = [...new Set(opts.query.trim().split(/\s+/).filter(Boolean))].slice(
+      0,
+      MAX_SEARCH_TOKENS,
+    );
+    const snippetTokens = [...new Set([...rawTokens, ...tokens])];
     const scored: Array<{ hit: SearchHit; score: number }> = [];
     for (const page of idx.values()) {
       if (opts.tag && !matchesTag(page.meta.tag, opts.tag)) continue;
@@ -427,7 +444,7 @@ export class LocalFumadocsSource implements FumadocsSource {
             url: page.url,
             title: page.title,
             ...(page.description ? { description: page.description } : {}),
-            excerpt: snippet(page.body, tokens),
+            excerpt: snippet(page.body, snippetTokens),
             score,
             ...(typeof page.meta.tag === 'string' ? { tag: page.meta.tag } : {}),
           },
@@ -435,7 +452,14 @@ export class LocalFumadocsSource implements FumadocsSource {
         });
       }
     }
-    scored.sort((a, b) => b.score - a.score);
+    // Ties are broken by url so results are deterministic. `Array#sort` is
+    // stable, but the order it preserves here is the index Map's insertion
+    // order, which comes from `fs.opendir()` and is filesystem/OS
+    // dependent - so without an explicit tiebreak, equally-scored hits
+    // (very common for short queries) come back in a different order on
+    // different machines for the same query and the same content.
+    // `listPages()` already sorts by url for the same reason.
+    scored.sort((a, b) => b.score - a.score || a.hit.url.localeCompare(b.hit.url));
     const limit = opts.limit ?? 10;
     return scored.slice(0, limit).map((s) => s.hit);
   }

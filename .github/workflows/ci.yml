@@ -5,12 +5,34 @@ on:
     branches: [main]
   pull_request:
 
+# A force-push or rapid follow-up commit otherwise leaves the superseded
+# run burning matrix runners for a commit nobody will merge. `main` runs
+# are excluded from cancellation (the ref is its own group and
+# cancel-in-progress is keyed off the event) so release-relevant history
+# always gets a complete result.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   test:
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
     strategy:
+      # One failing OS/Node cell should still report the others, otherwise
+      # a Windows-only path bug masks whether Linux is healthy.
+      fail-fast: false
       matrix:
+        os: [ubuntu-latest]
         node: [20, 22]
+        # This package resolves filesystem paths, compares them against a
+        # root prefix, and normalizes URL<->path separators - all behavior
+        # that differs on Windows (backslashes, drive letters, case-
+        # insensitive comparison, no symlink permission by default). Cover
+        # it on one Node version rather than the full matrix to keep the
+        # runner-minute cost proportionate.
+        include:
+          - os: windows-latest
+            node: 22
     steps:
       # SHA-pinned rather than the "v4" tag: even for GitHub's own first-
       # party actions, a mutable major-version tag is one compromised or
