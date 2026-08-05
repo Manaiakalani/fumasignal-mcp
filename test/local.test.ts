@@ -65,6 +65,63 @@ describe('LocalFumadocsSource', () => {
     expect(hits[0]!.url).toBe('/docs/guides/install');
   });
 
+  it('breaks score ties by url so results are deterministic across filesystems', async () => {
+    // Regression: `Array#sort` is stable, so equally-scored hits came back
+    // in the index Map's insertion order - which comes from `fs.opendir()`
+    // and is filesystem/OS dependent. The same query over the same content
+    // could therefore return a different order on different machines,
+    // which silently changes what a `limit`-capped result set contains.
+    const dir = await mkdtemp(path.join(os.tmpdir(), 'fumasignal-local-searchtie-'));
+    try {
+      const docs = path.join(dir, 'content', 'docs');
+      await mkdir(docs, { recursive: true });
+      // Identical bodies and no title match => identical scores for all four.
+      for (const name of ['delta', 'bravo', 'charlie', 'alpha']) {
+        await writeFile(path.join(docs, `${name}.md`), '# Page\n\nzzq appears once here');
+      }
+      const src = new LocalFumadocsSource({ rootDir: dir });
+      const hits = await src.search({ query: 'zzq' });
+      expect(hits).toHaveLength(4);
+      expect(new Set(hits.map((h) => h.score)).size).toBe(1);
+      expect(hits.map((h) => h.url)).toEqual([
+        '/docs/alpha',
+        '/docs/bravo',
+        '/docs/charlie',
+        '/docs/delta',
+      ]);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('still excerpts around a Turkish dotted-I match instead of degrading to the body head', async () => {
+    // Regression: scoring lowercases both sides, so "İSTANBUL" matched
+    // fine and the page was returned - but `snippet()` was handed only the
+    // lowercased tokens and matches against the original-case body with a
+    // `/i` regex. JS `i` implements simple (not full) Unicode case
+    // folding: "İ" (U+0130) lowercases to "i" + U+0307, and `/i\u0307/i`
+    // does not match a literal "İ". The excerpt silently fell back to
+    // `body.slice(0, 200)`, so the hit's excerpt never showed the match.
+    const dir = await mkdtemp(path.join(os.tmpdir(), 'fumasignal-local-searchfold-'));
+    try {
+      const docs = path.join(dir, 'content', 'docs');
+      await mkdir(docs, { recursive: true });
+      const filler = 'padding word '.repeat(40);
+      await writeFile(
+        path.join(docs, 'city.md'),
+        `# City\n\n${filler}\n\nThe city of \u0130STANBUL straddles two continents.\n`,
+      );
+      const src = new LocalFumadocsSource({ rootDir: dir });
+      const hits = await src.search({ query: '\u0130STANBUL' });
+      expect(hits).toHaveLength(1);
+      expect(hits[0]!.excerpt).toContain('\u0130STANBUL');
+      // Proves it is a real excerpt, not the leading-slice fallback.
+      expect(hits[0]!.excerpt.startsWith('# City')).toBe(false);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
   it('deduplicates repeated query tokens instead of scoring each repetition separately', async () => {
     // Regression: search() scored every token in the split query
     // independently, with no deduplication - a query that repeats the

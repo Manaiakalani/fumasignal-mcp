@@ -582,6 +582,65 @@ describe('RemoteFumadocsSource', () => {
     expect(hits[0]!.url).toBe('/docs/intro');
   });
 
+  it('forwards the caller\u2019s limit to the upstream search endpoint', async () => {
+    // Regression: `limit` was only ever applied as a local `slice()` on the
+    // response. The upstream request carried no limit, so it returned the
+    // remote's own default page size (typically 10) and a caller asking for
+    // more than that silently got 10 - the slice could not conjure results
+    // the request never asked for.
+    const seen: string[] = [];
+    const src = new RemoteFumadocsSource({
+      baseUrl,
+      fetchImpl: async (input: RequestInfo | URL) => {
+        const url = typeof input === 'string' ? input : input.toString();
+        seen.push(url);
+        return new Response(JSON.stringify([]), {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        });
+      },
+    });
+    await src.search({ query: 'hello', limit: 50 });
+    expect(seen).toHaveLength(1);
+    expect(new URL(seen[0]!).searchParams.get('limit')).toBe('50');
+  });
+
+  it('omits the limit parameter entirely when the caller does not set one', async () => {
+    const seen: string[] = [];
+    const src = new RemoteFumadocsSource({
+      baseUrl,
+      fetchImpl: async (input: RequestInfo | URL) => {
+        const url = typeof input === 'string' ? input : input.toString();
+        seen.push(url);
+        return new Response(JSON.stringify([]), {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        });
+      },
+    });
+    await src.search({ query: 'hello' });
+    expect(new URL(seen[0]!).searchParams.has('limit')).toBe(false);
+  });
+
+  it('still caps results at the requested limit even if the remote ignores it', async () => {
+    const src = new RemoteFumadocsSource({
+      baseUrl,
+      fetchImpl: async () =>
+        new Response(
+          JSON.stringify(
+            Array.from({ length: 8 }, (_, i) => ({
+              url: `/docs/p${i}`,
+              title: `P${i}`,
+              type: 'page',
+            })),
+          ),
+          { status: 200, headers: { 'content-type': 'application/json' } },
+        ),
+    });
+    const hits = await src.search({ query: 'hello', limit: 3 });
+    expect(hits).toHaveLength(3);
+  });
+
   it('parses {hits:[{document}]} search responses', async () => {
     const src = new RemoteFumadocsSource({
       baseUrl,
@@ -657,6 +716,24 @@ describe('RemoteFumadocsSource', () => {
     expect(page.title).toBe('Intro');
     expect(page.markdown).toContain('body');
     expect(page.toc.find((t) => t.anchor === 'intro')).toBeDefined();
+  });
+
+  it('does not take a "#" line inside a fenced code block as the page title', async () => {
+    // Regression: extractTitle() scanned every line for a leading `#`
+    // without tracking fences, so a page whose first `#` occurrence was a
+    // shell comment or a markdown example inside a code block adopted that
+    // as its title - e.g. a quickstart page opening with an install snippet.
+    const src = new RemoteFumadocsSource({
+      baseUrl,
+      fetchImpl: makeFetch({
+        'https://example.com/docs/fenced.md': {
+          body: '```sh\n# Install the CLI first\nnpm i pkg\n```\n\n# Real Heading\n\nbody text',
+          contentType: 'text/markdown',
+        },
+      }),
+    });
+    const page = await src.getPage('/docs/fenced');
+    expect(page.title).toBe('Real Heading');
   });
 
   it('falls back to the markdown heading when frontmatter title is a non-string YAML value', async () => {

@@ -31,7 +31,82 @@ export function slugify(text: string): string {
 // before failing) took ~36s to reject; 10KB exceeded 120s. See
 // `stripAtxClosingSequence` below for the replacement.
 const HEADING_PREFIX_RE = /^(#{1,6})\s+/;
-const FENCE_RE = /^```/;
+
+/**
+ * Matches a CommonMark fenced-code-block delimiter: up to 3 leading
+ * spaces of indentation, then a run of 3+ backticks or 3+ tildes.
+ *
+ * The previous `/^```/` plus a bare `inFence = !inFence` toggle got three
+ * things wrong, all of which surface `#` lines from *inside* code blocks
+ * as real document headings (polluting the TOC, and fragmenting
+ * `extractSection` around headings that don't exist):
+ *   - Tilde fences (`~~~`) weren't recognized at all, so an entire
+ *     tilde-fenced block was scanned as prose. Docs use tilde fences
+ *     precisely when the content itself contains backticks - i.e. exactly
+ *     the markdown-about-markdown pages most likely to contain `#` lines.
+ *   - Indented fences (CommonMark allows up to 3 spaces) weren't
+ *     recognized, e.g. a fence nested inside a list item.
+ *   - Fence *length* was ignored. CommonMark closes a fence only with a
+ *     run of the same character at least as long as the opener, so a
+ *     4-backtick block may contain 3-backtick lines. A blind toggle flips
+ *     to "outside" at the inner ``` and treats the rest of the code
+ *     block - and, because the real closing fence then toggles back
+ *     *in*, an arbitrary span of the following prose - as the wrong kind
+ *     of content.
+ * `\s*$` after the run rejects a line with an info string as a *closing*
+ * fence (CommonMark forbids one there) while still allowing it to open a
+ * fence; both call sites below use the two capture groups to enforce the
+ * same-character, at-least-as-long rule.
+ */
+const FENCE_RE = /^ {0,3}((`{3,})|(~{3,}))(.*)$/;
+
+/**
+ * Tracks whether a line-by-line scan is currently inside a fenced code
+ * block, applying CommonMark's opening/closing rules (see
+ * {@link FENCE_RE}). Shared by every scanner in this codebase that walks
+ * markdown a line at a time and must ignore `#` lines inside code.
+ */
+export class FenceTracker {
+  /** The delimiter run that opened the current fence, or null if outside. */
+  private open: string | null = null;
+
+  /**
+   * Feed the next line. Returns true if this line is a fence delimiter or
+   * lies inside a fenced block - i.e. the caller should not treat it as
+   * prose.
+   */
+  consume(line: string): boolean {
+    const m = FENCE_RE.exec(line);
+    if (this.open === null) {
+      // CommonMark forbids a backtick in a *backtick* fence's info string,
+      // precisely so that an inline-code span like "``` x ```" on its own
+      // line stays a paragraph. Treating it as an opener meant the tracker
+      // entered a fence that nothing in the rest of the document would
+      // ever close, and every heading after it was silently dropped from
+      // the TOC. (Tilde fences have no such restriction.)
+      if (m && !(m[1]![0] === '`' && m[4]!.includes('`'))) {
+        this.open = m[1]!;
+        return true;
+      }
+      return false;
+    }
+    if (m) {
+      const run = m[1]!;
+      const info = m[4]!;
+      // A closing fence must use the same character, be at least as long
+      // as the opener, and carry no info string.
+      if (run[0] === this.open[0] && run.length >= this.open.length && info.trim() === '') {
+        this.open = null;
+      }
+    }
+    return true;
+  }
+
+  /** True if the scan is currently inside a fenced code block. */
+  get inFence(): boolean {
+    return this.open !== null;
+  }
+}
 
 /**
  * Strip an optional ATX heading closing sequence - trailing whitespace,
@@ -161,7 +236,7 @@ function collectHeadings(markdown: string): HeadingIndex {
   // backing store - see MAX_LINES's doc comment for why that matters.
   const lines = truncated ? allLines.slice(0, MAX_LINES) : allLines;
   const headings: Heading[] = [];
-  let inFence = false;
+  const fence = new FenceTracker();
   let headingsTruncated = false;
   const nextSuffix = new Map<string, number>();
   const usedAnchors = new Set<string>();
@@ -171,11 +246,7 @@ function collectHeadings(markdown: string): HeadingIndex {
       break;
     }
     const line = lines[i]!;
-    if (FENCE_RE.test(line)) {
-      inFence = !inFence;
-      continue;
-    }
-    if (inFence) continue;
+    if (fence.consume(line)) continue;
     const m = HEADING_PREFIX_RE.exec(line);
     if (!m) continue;
     const depth = m[1]!.length;

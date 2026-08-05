@@ -5,12 +5,34 @@ on:
     branches: [main]
   pull_request:
 
+# A force-push or rapid follow-up commit otherwise leaves the superseded
+# run burning matrix runners for a commit nobody will merge. `main` runs
+# are excluded from cancellation (the ref is its own group and
+# cancel-in-progress is keyed off the event) so release-relevant history
+# always gets a complete result.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   test:
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
     strategy:
+      # One failing OS/Node cell should still report the others, otherwise
+      # a Windows-only path bug masks whether Linux is healthy.
+      fail-fast: false
       matrix:
+        os: [ubuntu-latest]
         node: [20, 22]
+        # This package resolves filesystem paths, compares them against a
+        # root prefix, and normalizes URL<->path separators - all behavior
+        # that differs on Windows (backslashes, drive letters, case-
+        # insensitive comparison, no symlink permission by default). Cover
+        # it on one Node version rather than the full matrix to keep the
+        # runner-minute cost proportionate.
+        include:
+          - os: windows-latest
+            node: 22
     steps:
       # SHA-pinned rather than the "v4" tag: even for GitHub's own first-
       # party actions, a mutable major-version tag is one compromised or
@@ -26,3 +48,26 @@ jobs:
       - run: npm run lint
       - run: npm test
       - run: npm run build
+
+  # Kept out of the test matrix deliberately: this is the only step that
+  # depends on the advisory registry being reachable, and there is nothing
+  # OS- or Node-specific about it, so running it once avoids multiplying a
+  # network dependency across every cell.
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 22
+      # No `npm ci` needed: `npm audit` resolves the virtual tree straight
+      # from the lockfile, so this job never installs (and therefore has no
+      # use for the setup-node cache).
+      #
+      # The lockfile is now the only thing holding transitive packages at
+      # patched versions: the brace-expansion `overrides` were removed once
+      # they proved to be no-ops, so nothing forces a version floor any
+      # more. Without this check, a transitive dependency pinning an exact
+      # vulnerable release would land silently and only surface later as a
+      # Dependabot alert against the default branch.
+      - run: npm audit --audit-level=high
