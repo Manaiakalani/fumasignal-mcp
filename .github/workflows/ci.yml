@@ -60,7 +60,10 @@ jobs:
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: 22
-          cache: npm
+      # No `npm ci` needed: `npm audit` resolves the virtual tree straight
+      # from the lockfile, so this job never installs (and therefore has no
+      # use for the setup-node cache).
+      #
       # The lockfile is now the only thing holding transitive packages at
       # patched versions: the brace-expansion `overrides` were removed once
       # they proved to be no-ops, so nothing forces a version floor any

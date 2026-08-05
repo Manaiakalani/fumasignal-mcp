@@ -273,14 +273,23 @@ export function stripChrome(html: string): string {
  * stack ever being balanced.
  *
  * The buffer is flushed every time a `depth === 0` block arrives, which
- * is what keeps memory bounded: with the stack empty, no later block can
- * turn out to be an ancestor of anything already buffered, so the batch
- * is final and can be written out. Without that flush, a hostile page
- * near the 10MB response cap (~870k blocks) retained the whole block
- * array at once - measured at ~106MB of peak heap, multiplied by the
- * concurrent-fetch limit. Note this genuinely needs the buffer: a single
- * "pending block" variant is wrong, because one ancestor can supersede
- * several already-emitted siblings.
+ * is what bounds memory on sibling-heavy pages: with the stack empty, no
+ * later block can turn out to be an ancestor of anything already
+ * buffered, so the batch is final and can be written out. Without that
+ * flush, a hostile page near the 10MB response cap (~870k sibling
+ * blocks) retained the whole block array at once - ~88MB of peak heap,
+ * multiplied by the concurrent-fetch limit. With it, ~10MB.
+ *
+ * This bounds the *sibling* case, not every case. A page that is 10MB of
+ * uniformly deepening nesting never reaches `depth === 0` until its last
+ * block, so the batch still grows to full size (~140MB measured). That
+ * shape is no worse than it was before the flush, and most of its cost
+ * is `eachTagBlock`'s own opener stack, which is inherent to pairing and
+ * cannot be flushed early. Bounding it would take a real depth cap.
+ *
+ * Note this genuinely needs the buffer: a single "pending block" variant
+ * is wrong, because one ancestor can supersede several already-emitted
+ * siblings.
  *
  * See {@link eachTagBlock} for the pairing rules and the O(n) argument.
  */
