@@ -83,6 +83,23 @@ describe('extractToc', () => {
     expect(extractToc(md).map((t) => t.title)).toEqual(['Real', 'Also Real']);
   });
 
+  it('does not enter a fence on a backtick line whose info string contains backticks', () => {
+    // Regression: CommonMark forbids backticks in a *backtick* fence's info
+    // string precisely so a line like "``` x ```" stays an ordinary
+    // paragraph containing inline code. Accepting it as an opener put the
+    // tracker inside a fence that nothing later would ever close, so every
+    // remaining heading in the document was silently dropped from the TOC.
+    const md = '# A\n\n``` x ```\n\n# B\n\n## C';
+    expect(extractToc(md).map((t) => t.title)).toEqual(['A', 'B', 'C']);
+  });
+
+  it('still allows backticks in a tilde fence\u2019s info string', () => {
+    // The restriction is backtick-fence-specific; a tilde fence may carry
+    // anything, so this one really does open a code block.
+    const md = '# A\n\n~~~ ` ~~~\n# Not a heading\n~~~\n\n# B';
+    expect(extractToc(md).map((t) => t.title)).toEqual(['A', 'B']);
+  });
+
   it('strips an optional closing "#" sequence and surrounding whitespace', () => {
     const md = '## Setup ##\n\n### Trailing Space  \n\n#### Mixed ## \t ';
     expect(extractToc(md).map((t) => t.title)).toEqual([

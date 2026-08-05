@@ -143,11 +143,24 @@ function* eachTagBlock(html: string, tag: string): Generator<TagBlock> {
   // constructing the finder or the two global regexes. A non-global
   // one-off RegExp (no `g` flag) is used so it can't perturb `openRe`'s
   // own `lastIndex` state below.
-  if (!new RegExp(`<${tag}\\b`, 'i').test(html)) return;
-  const openRe = new RegExp(`<${tag}\\b`, 'gi');
-  const closeRe = new RegExp(`<\\/${tag}>`, 'gi');
+  // `\b` is *not* good enough for a tag-name boundary: it fires between a
+  // word char and any non-word char, so `<nav\b` happily matches
+  // `<nav-bar`. That mattered a great deal - `</nav-bar>` then fails to
+  // match `closeRe`, so the opener it pushed is never popped, and every
+  // later block of that tag is left with a phantom ancestor on the stack.
+  // A single custom element named `nav-*`/`header-*`/`footer-*` was enough
+  // to silently disable chrome-stripping for that tag across the whole
+  // page. An HTML tag name ends at whitespace, `/`, or `>`, so require one
+  // of those to follow. (This still rejects `<navs>`, as `\b` did.)
+  const openSrc = `<${tag}(?=[\\s/>])`;
+  if (!new RegExp(openSrc, 'i').test(html)) return;
+  const openRe = new RegExp(openSrc, 'gi');
+  // HTML5 permits whitespace between the tag name and `>` in an end tag,
+  // so `</nav >` is a perfectly valid closer and must not be missed - an
+  // unmatched closer leaves its opener stranded on the stack, with the
+  // same consequences described above.
+  const closeRe = new RegExp(`<\\/${tag}\\s*>`, 'gi');
   const nextAngle = lazyAngleFinder(html);
-  const closeLen = `</${tag}>`.length;
   const open: Array<{ start: number; contentStart: number }> = [];
   let opener = openRe.exec(html);
   let closer = closeRe.exec(html);
@@ -177,7 +190,9 @@ function* eachTagBlock(html: string, tag: string): Generator<TagBlock> {
       start: innermost.start,
       contentStart: innermost.contentStart,
       closeStart: closer.index,
-      end: closer.index + closeLen,
+      // Closer length is read from the match, not from `</tag>`.length,
+      // because `closeRe` now tolerates internal whitespace.
+      end: closer.index + closer[0].length,
       depth: open.length,
     };
     closer = closeRe.exec(html);
@@ -237,16 +252,28 @@ export function stripChrome(html: string): string {
 /**
  * Remove every outermost `<tag ...>...</tag>` block from `html`.
  *
- * Only depth-0 blocks are acted on: a nested block of the same tag is
- * already contained in the span its outermost ancestor removes, so
- * removing it separately would double-count and corrupt the output.
+ * Selection is by *span overlap*, not by reported nesting depth. Depth
+ * looks like the natural filter, but it is only meaningful when every
+ * opener eventually gets a closer: an opener that never closes is never
+ * popped, so it inflates the depth of every block that follows it and
+ * those blocks are then skipped entirely. Real pages hit that constantly
+ * (a stray `<nav>`, a tag closed by an ancestor rather than its own
+ * closer), and the failure is silent - chrome simply stops being removed
+ * from that point on.
+ *
+ * Sorting by start and walking left-to-right, skipping anything that
+ * begins inside a span already removed, keeps the "remove the outermost,
+ * never double-count a nested one" guarantee without depending on the
+ * stack ever being balanced. `k` is the number of paired blocks of this
+ * tag, so the sort is negligible against the O(n) scan that produced it.
  * See {@link eachTagBlock} for the pairing rules and the O(n) argument.
  */
 function removeTagBlocks(html: string, tag: string): string {
+  const blocks = [...eachTagBlock(html, tag)].sort((a, b) => a.start - b.start);
   let result = '';
   let cursor = 0;
-  for (const block of eachTagBlock(html, tag)) {
-    if (block.depth !== 0) continue;
+  for (const block of blocks) {
+    if (block.start < cursor) continue; // nested inside a span already removed
     result += html.slice(cursor, block.start);
     cursor = block.end;
   }

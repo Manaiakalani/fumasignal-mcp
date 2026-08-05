@@ -155,17 +155,26 @@ describe('isPrivateOrReservedAddress', () => {
     expect(isPrivateOrReservedAddress('2002:808:808::')).toBe(false); // 8.8.8.8
   });
 
-  it('flags Teredo (2001::/32, RFC 4380) addresses whose XOR-obfuscated client IPv4 is private', () => {
-    // Teredo stores the client's IPv4 in the last 32 bits XORed with
-    // all-ones, so 10.0.0.1 (0a000001) is stored as f5fffffe and
-    // 127.0.0.1 (7f000001) as 80fffffe.
-    expect(isPrivateOrReservedAddress('2001:0:4136:e378:8000:63bf:f5ff:fffe')).toBe(true); // 10.0.0.1
-    expect(isPrivateOrReservedAddress('2001:0:4136:e378:8000:63bf:80ff:fffe')).toBe(true); // 127.0.0.1
+  it('flags the whole Teredo range (2001::/32, RFC 4380), not just a private client IPv4', () => {
+    // Teredo carries TWO IPv4 addresses: the server's in bits 32-63 and
+    // the client's, XOR-obfuscated, in bits 96-127. Decoding only the
+    // client left the server field unchecked - the second case below names
+    // 169.254.169.254 as its server while presenting the public 8.8.8.8 as
+    // its client, and was allowed through. All of 2001::/32 is IANA
+    // special-purpose and never ordinary global unicast, so the range is
+    // now rejected wholesale rather than decoded.
+    expect(isPrivateOrReservedAddress('2001:0:4136:e378:8000:63bf:f5ff:fffe')).toBe(true); // client 10.0.0.1
+    expect(isPrivateOrReservedAddress('2001:0:4136:e378:8000:63bf:80ff:fffe')).toBe(true); // client 127.0.0.1
+    expect(isPrivateOrReservedAddress('2001:0:a9fe:a9fe::f7f7:f7f7')).toBe(true); // server 169.254.169.254
+    expect(isPrivateOrReservedAddress('2001:0:7f00:1::f7f7:f7f7')).toBe(true); // server 127.0.0.1
+    expect(isPrivateOrReservedAddress('2001:0:4136:e378:8000:63bf:f7f7:f7f7')).toBe(true); // client 8.8.8.8
   });
 
-  it('allows Teredo addresses whose decoded client IPv4 is public', () => {
-    // 8.8.8.8 (08080808) is stored as f7f7f7f7.
-    expect(isPrivateOrReservedAddress('2001:0:4136:e378:8000:63bf:f7f7:f7f7')).toBe(false); // 8.8.8.8
+  it('flags IPv4-translated ::ffff:0:0:0/96 addresses carrying a private IPv4', () => {
+    // Note the extra zero group vs. IPv4-mapped ::ffff:0:0/96 - here 0xffff
+    // sits in group 4, not group 5, so the mapped-address arm never saw it.
+    expect(isPrivateOrReservedAddress('::ffff:0:a9fe:a9fe')).toBe(true); // 169.254.169.254
+    expect(isPrivateOrReservedAddress('::ffff:0:7f00:1')).toBe(true); // 127.0.0.1
   });
 
   it('flags additional non-public IPv6 special-purpose ranges', () => {

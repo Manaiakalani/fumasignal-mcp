@@ -78,8 +78,17 @@ export class FenceTracker {
   consume(line: string): boolean {
     const m = FENCE_RE.exec(line);
     if (this.open === null) {
-      if (m) this.open = m[1]!;
-      return m !== null;
+      // CommonMark forbids a backtick in a *backtick* fence's info string,
+      // precisely so that an inline-code span like "``` x ```" on its own
+      // line stays a paragraph. Treating it as an opener meant the tracker
+      // entered a fence that nothing in the rest of the document would
+      // ever close, and every heading after it was silently dropped from
+      // the TOC. (Tilde fences have no such restriction.)
+      if (m && !(m[1]![0] === '`' && m[4]!.includes('`'))) {
+        this.open = m[1]!;
+        return true;
+      }
+      return false;
     }
     if (m) {
       const run = m[1]!;

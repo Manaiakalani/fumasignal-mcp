@@ -459,7 +459,15 @@ export class LocalFumadocsSource implements FumadocsSource {
     // (very common for short queries) come back in a different order on
     // different machines for the same query and the same content.
     // `listPages()` already sorts by url for the same reason.
-    scored.sort((a, b) => b.score - a.score || a.hit.url.localeCompare(b.hit.url));
+    //
+    // Compared with `<`/`>` rather than `localeCompare()`: the entire point
+    // here is a result order that does not vary by machine, and the default
+    // collator follows the host locale - under `LANG=tr_TR` an ICU collator
+    // orders "i" and "\u0131" differently than under `en_US`, which would
+    // reintroduce exactly the cross-machine variance this tiebreak exists
+    // to remove. Code-unit order is arbitrary but identical everywhere,
+    // which is the property that actually matters for a tiebreak.
+    scored.sort((a, b) => b.score - a.score || compareUrls(a.hit.url, b.hit.url));
     const limit = opts.limit ?? 10;
     return scored.slice(0, limit).map((s) => s.hit);
   }
@@ -477,7 +485,7 @@ export class LocalFumadocsSource implements FumadocsSource {
         segments: page.url.split('/').filter(Boolean),
       });
     }
-    out.sort((a, b) => a.url.localeCompare(b.url));
+    out.sort((a, b) => compareUrls(a.url, b.url));
     return out;
   }
 
@@ -668,6 +676,22 @@ function isNotFoundError(err: unknown): boolean {
     'code' in err &&
     (err as { code?: unknown }).code === 'ENOENT'
   );
+}
+
+/**
+ * Locale-independent url ordering.
+ *
+ * Deliberately not `localeCompare()`: both call sites sort purely so that
+ * identical content yields an identical order on every machine, and the
+ * default collator is locale-sensitive, so the host's `LANG` would leak
+ * back into the result order it is meant to stabilize. UTF-16 code-unit
+ * order is arbitrary but reproducible, which is the property being bought
+ * here. Urls are ASCII-dominated paths, so the two rarely differ anyway.
+ */
+function compareUrls(a: string, b: string): number {
+  if (a < b) return -1;
+  if (a > b) return 1;
+  return 0;
 }
 
 function matchesTag(metaTag: unknown, wanted: string): boolean {

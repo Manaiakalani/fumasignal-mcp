@@ -198,6 +198,15 @@ function isPrivateIPv6(ip: string): boolean {
   // in whichever translation prefix the local gateway uses and is
   // translated back to that internal IPv4 at connect time.
   if (topSixZero && g5 === 0xffff) return isPrivateIPv4(ipv4FromGroups(g6, g7)); // ::ffff:0:0/96 IPv4-mapped
+  // ::ffff:0:0:0/96 IPv4-translated (RFC 2765/SIIT). Note the extra zero
+  // group: the embedded IPv4 sits in g6:g7 here too, but g4 is 0xffff
+  // rather than g5, so the mapped-address arm above (which requires
+  // g4 === 0) never saw it and "::ffff:0:a9fe:a9fe" was allowed through.
+  // Deprecated by RFC 6145 and not realistically routable, but it costs
+  // one comparison to keep the "not globally reachable" coverage complete.
+  if (g0 === 0 && g1 === 0 && g2 === 0 && g3 === 0 && g4 === 0xffff && g5 === 0) {
+    return isPrivateIPv4(ipv4FromGroups(g6, g7));
+  }
   // ::/96 IPv4-compatible (deprecated by RFC 4291; its only assigned
   // addresses, "::" and "::1", are handled above, so no legitimate public
   // global-unicast address canonicalizes into this range).
@@ -226,11 +235,18 @@ function isPrivateIPv6(ip: string): boolean {
   // encapsulates and delivers such traffic to that IPv4, exactly like the
   // NAT64 case above.
   if (g0 === 0x2002) return isPrivateIPv4(ipv4FromGroups(g1, g2));
-  // 2001::/32 Teredo (RFC 4380) carries the client's IPv4 in the last 32
-  // bits, obfuscated by XOR with all-ones. Same reachability argument as
-  // 6to4: a host with Teredo configured (Windows enables it by default in
-  // some configurations) will tunnel to the decoded address.
-  if (g0 === 0x2001 && g1 === 0) return isPrivateIPv4(ipv4FromGroups(g6 ^ 0xffff, g7 ^ 0xffff));
+  // 2001::/32 Teredo (RFC 4380), rejected wholesale rather than decoded.
+  // A Teredo address carries *two* IPv4 addresses: the server's in bits
+  // 32-63 (g2:g3) and the client's in bits 96-127 (g6:g7), the latter
+  // obfuscated by XOR with all-ones. Decoding only the client field left
+  // the server field unchecked, so e.g. "2001:0:a9fe:a9fe::f7f7:f7f7"
+  // names the 169.254.169.254 metadata endpoint as its server while
+  // presenting a public client address, and was allowed through. Rather
+  // than decode both, reject the range outright: all of 2001::/32 is IANA
+  // special-purpose and is never ordinary global unicast, so nothing
+  // legitimate is lost - the same reasoning already applied to the NAT64
+  // local-use prefix above.
+  if (g0 === 0x2001 && g1 === 0) return true;
   if ((g0 & 0xffc0) === 0xfe80) return true; // fe80::/10 link-local
   if ((g0 & 0xffc0) === 0xfec0) return true; // fec0::/10 site-local (deprecated by RFC 3879, but still a syntactically valid, potentially-still-configured non-public range - a DNS-rebinding attacker controls the *resolved address*, not whether a target network happens to still use it)
   if ((g0 & 0xfe00) === 0xfc00) return true; // fc00::/7 unique local

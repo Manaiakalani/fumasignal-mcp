@@ -150,6 +150,39 @@ describe('stripChrome', () => {
     expect(stripChrome('<P>keep</P><NAV>gone</NAV>')).toBe('<P>keep</P>');
   });
 
+  it('keeps stripping chrome after a custom element whose name merely starts with a strip tag', () => {
+    // Regression: the opener pattern used `<nav\b`, and `\b` fires between
+    // "v" and "-", so `<nav-bar>` was read as an opening <nav>. Its closer
+    // `</nav-bar>` matched nothing, leaving that phantom opener on the
+    // stack forever - so every later, properly-formed <nav> was reported
+    // at a non-zero depth and skipped, silently disabling chrome-stripping
+    // for the rest of the page. A tag name ends at whitespace, "/" or ">".
+    const out = stripChrome('<nav-bar>x</nav-bar><nav>CHROME</nav>keep');
+    expect(out).not.toContain('CHROME');
+    expect(out).toContain('keep');
+  });
+
+  it('does not treat a longer tag name as a strip tag', () => {
+    expect(stripChrome('<navigation>keep me</navigation>')).toContain('keep me');
+  });
+
+  it('removes a block whose end tag carries whitespace before the ">"', () => {
+    // HTML5 allows `</nav >`; missing it stranded the opener on the stack
+    // with the same knock-on effect as above.
+    const out = stripChrome('<nav >CHROME</nav >keep');
+    expect(out).not.toContain('CHROME');
+    expect(out).toContain('keep');
+  });
+
+  it('still removes later blocks when an earlier opener is never closed', () => {
+    // Depth is only meaningful when the stack actually balances. An opener
+    // with no closer is never popped, so a depth-based filter treated every
+    // subsequent block as nested and skipped it.
+    const out = stripChrome('<nav>UNCLOSED<footer>CHROME</footer>keep');
+    expect(out).not.toContain('CHROME');
+    expect(out).toContain('keep');
+  });
+
   it('leaves an unclosed chrome tag untouched', () => {
     const html = '<p>keep</p><nav>unclosed forever';
     expect(stripChrome(html)).toBe(html);
