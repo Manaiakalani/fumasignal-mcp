@@ -48,3 +48,23 @@ jobs:
       - run: npm run lint
       - run: npm test
       - run: npm run build
+
+  # Kept out of the test matrix deliberately: this is the only step that
+  # depends on the advisory registry being reachable, and there is nothing
+  # OS- or Node-specific about it, so running it once avoids multiplying a
+  # network dependency across every cell.
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 22
+          cache: npm
+      # The lockfile is now the only thing holding transitive packages at
+      # patched versions: the brace-expansion `overrides` were removed once
+      # they proved to be no-ops, so nothing forces a version floor any
+      # more. Without this check, a transitive dependency pinning an exact
+      # vulnerable release would land silently and only surface later as a
+      # Dependabot alert against the default branch.
+      - run: npm audit --audit-level=high

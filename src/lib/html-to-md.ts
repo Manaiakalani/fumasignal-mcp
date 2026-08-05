@@ -126,14 +126,19 @@ interface TagBlock {
  *
  * The O(n) guarantee the previous implementation was carefully built for
  * (see {@link findLargestTagBlock}'s comment for the quadratic-blowup
- * history) is preserved: `openRe`/`closeRe` are *bounded* patterns with
- * no unbounded quantifier, each is driven by `exec()` over its own
- * monotonically advancing `lastIndex`, `nextAngle` only ever moves
- * forward (openers are consumed in increasing index order), and every
- * loop iteration consumes exactly one opener or one closer. Total work is
- * therefore proportional to the number of tag occurrences plus the
- * distance scanned for `>` - linear in `html.length` regardless of how
- * the tags nest, or whether they are closed at all.
+ * history) is preserved: each of `openRe`/`closeRe` is driven by `exec()`
+ * over its own monotonically advancing `lastIndex`, `nextAngle` only ever
+ * moves forward (openers are consumed in increasing index order), and
+ * every loop iteration consumes exactly one opener or one closer. Total
+ * work is therefore proportional to the number of tag occurrences plus
+ * the distance scanned for `>` - linear in `html.length` regardless of
+ * how the tags nest, or whether they are closed at all.
+ *
+ * `closeRe`'s `\s*` is the one unbounded quantifier here, and it is safe
+ * because it is bounded *in aggregate* rather than per-match: `</tag`
+ * occurrences cannot overlap, so the whitespace runs any two matches can
+ * backtrack over are disjoint, and their total length is bounded by
+ * `html.length`. Do not add a quantifier that lacks that property.
  */
 function* eachTagBlock(html: string, tag: string): Generator<TagBlock> {
   // Cheap existence pre-check before doing any real work below. This
@@ -252,31 +257,50 @@ export function stripChrome(html: string): string {
 /**
  * Remove every outermost `<tag ...>...</tag>` block from `html`.
  *
- * Selection is by *span overlap*, not by reported nesting depth. Depth
- * looks like the natural filter, but it is only meaningful when every
- * opener eventually gets a closer: an opener that never closes is never
- * popped, so it inflates the depth of every block that follows it and
- * those blocks are then skipped entirely. Real pages hit that constantly
- * (a stray `<nav>`, a tag closed by an ancestor rather than its own
- * closer), and the failure is silent - chrome simply stops being removed
- * from that point on.
+ * Selection is by *span overlap*, not by reported nesting depth alone.
+ * Depth looks like the natural filter, but it is only meaningful when
+ * every opener eventually gets a closer: an opener that never closes is
+ * never popped, so it inflates the depth of every block that follows it
+ * and those blocks are then skipped entirely. Real pages hit that
+ * constantly (a stray `<nav>`, a tag closed by an ancestor rather than
+ * its own closer), and the failure is silent - chrome simply stops being
+ * removed from that point on.
  *
- * Sorting by start and walking left-to-right, skipping anything that
- * begins inside a span already removed, keeps the "remove the outermost,
+ * Blocks arrive innermost-first, so they are buffered until they can be
+ * ordered, then emitted left-to-right skipping anything that begins
+ * inside a span already removed. That keeps the "remove the outermost,
  * never double-count a nested one" guarantee without depending on the
- * stack ever being balanced. `k` is the number of paired blocks of this
- * tag, so the sort is negligible against the O(n) scan that produced it.
+ * stack ever being balanced.
+ *
+ * The buffer is flushed every time a `depth === 0` block arrives, which
+ * is what keeps memory bounded: with the stack empty, no later block can
+ * turn out to be an ancestor of anything already buffered, so the batch
+ * is final and can be written out. Without that flush, a hostile page
+ * near the 10MB response cap (~870k blocks) retained the whole block
+ * array at once - measured at ~106MB of peak heap, multiplied by the
+ * concurrent-fetch limit. Note this genuinely needs the buffer: a single
+ * "pending block" variant is wrong, because one ancestor can supersede
+ * several already-emitted siblings.
+ *
  * See {@link eachTagBlock} for the pairing rules and the O(n) argument.
  */
 function removeTagBlocks(html: string, tag: string): string {
-  const blocks = [...eachTagBlock(html, tag)].sort((a, b) => a.start - b.start);
   let result = '';
   let cursor = 0;
-  for (const block of blocks) {
-    if (block.start < cursor) continue; // nested inside a span already removed
-    result += html.slice(cursor, block.start);
-    cursor = block.end;
+  const batch: TagBlock[] = [];
+  const flush = (): void => {
+    batch.sort((a, b) => a.start - b.start);
+    for (const block of batch) {
+      if (block.start < cursor) continue; // nested inside a span already removed
+      result += html.slice(cursor, block.start);
+      cursor = block.end;
+    }
+    batch.length = 0;
+  };
+  for (const block of eachTagBlock(html, tag)) {
+    batch.push(block);
+    if (block.depth === 0) flush();
   }
-  result += html.slice(cursor);
-  return result;
+  flush(); // anything left is under a stranded opener that never closed
+  return result + html.slice(cursor);
 }
