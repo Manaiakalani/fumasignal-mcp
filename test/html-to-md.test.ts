@@ -267,3 +267,32 @@ describe('htmlToMarkdown', () => {
     expect(md).not.toContain('footer');
   });
 });
+
+describe('adversarial nesting is bounded', () => {
+  it('still strips chrome nested far deeper than any real page', () => {
+    expect(stripChrome('<nav>'.repeat(50) + 'MENU' + '</nav>'.repeat(50) + 'keep')).toBe('keep');
+  });
+
+  it('leaves input untouched rather than growing the stack without bound', () => {
+    // Past the depth ceiling the tag is abandoned, so the text survives
+    // verbatim. Degrading to "chrome not stripped" is the safe direction:
+    // the alternative is stripping inner blocks whose ancestors are no
+    // longer tracked, which could remove real content.
+    const hostile = '<nav>'.repeat(1500) + 'MENU' + '</nav>'.repeat(1500) + 'keep';
+    expect(stripChrome(hostile)).toBe(hostile);
+  });
+
+  it('bounds a stranded opener holding every later block at depth > 0', () => {
+    const hostile = '<nav>' + '<nav>y</nav>'.repeat(60_000);
+    // Exceeds the buffered-block ceiling, so the input comes back as-is
+    // rather than accumulating one record per block.
+    expect(stripChrome(hostile)).toBe(hostile);
+  });
+
+  it('keeps hostile shapes within a sane time budget', () => {
+    const t = performance.now();
+    stripChrome('<nav>'.repeat(900_000) + 'x' + '</nav>'.repeat(900_000));
+    stripChrome('<nav>x</nav>'.repeat(400_000));
+    expect(performance.now() - t).toBeLessThan(5_000);
+  });
+});

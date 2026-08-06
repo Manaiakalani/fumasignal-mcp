@@ -99,6 +99,22 @@ interface TagBlock {
 }
 
 /**
+ * Ceiling on how deep chrome tags may nest before the tag is abandoned.
+ * Real documents nest `<nav>`/`<article>` single digits deep; this exists
+ * solely so that adversarial input cannot make the opener stack grow with
+ * the tag count. See {@link removeTagBlocks} for the measurements.
+ */
+const MAX_TAG_NESTING_DEPTH = 1_000;
+
+/**
+ * Ceiling on how many blocks may sit un-flushed in {@link removeTagBlocks}.
+ * Reached only when a stranded opener keeps everything at depth > 0, since
+ * anything else flushes as soon as the stack empties. Sized well above any
+ * plausible real page while still bounding the array to a few MB.
+ */
+const MAX_BUFFERED_TAG_BLOCKS = 50_000;
+
+/**
  * Yield every `<tag ...>...</tag>` block in `html`, pairing each opening
  * tag with its *properly nested* closing tag.
  *
@@ -175,6 +191,15 @@ function* eachTagBlock(html: string, tag: string): Generator<TagBlock> {
       // equivalent to what an `[^>]*>` suffix would have matched.
       const angle = nextAngle(opener.index + opener[0].length);
       if (angle === -1) return; // this (and every later) opening tag never terminates
+      // Uniformly-deepening input never pops, so the stack grows with the
+      // tag count rather than with anything the response cap bounds:
+      // ~900k `<nav>` in 10MB held ~144MB. Real documents nest chrome tags
+      // single digits deep, so a four-figure ceiling only ever fires on
+      // input that is pathological by construction. Abandoning the tag
+      // entirely (rather than truncating) keeps the "remove outermost"
+      // guarantee honest - a partial stack would strip inner blocks whose
+      // ancestors we have stopped tracking.
+      if (open.length >= MAX_TAG_NESTING_DEPTH) return;
       open.push({ start: opener.index, contentStart: angle + 1 });
       opener = openRe.exec(html);
       continue;
@@ -280,12 +305,12 @@ export function stripChrome(html: string): string {
  * blocks) retained the whole block array at once - ~88MB of peak heap,
  * multiplied by the concurrent-fetch limit. With it, ~10MB.
  *
- * This bounds the *sibling* case, not every case. A page that is 10MB of
- * uniformly deepening nesting never reaches `depth === 0` until its last
- * block, so the batch still grows to full size (~140MB measured). That
- * shape is no worse than it was before the flush, and most of its cost
- * is `eachTagBlock`'s own opener stack, which is inherent to pairing and
- * cannot be flushed early. Bounding it would take a real depth cap.
+ * This bounds the *sibling* case directly. Uniformly-nested input never
+ * reaches `depth === 0` until its last block, so the flush alone does
+ * nothing for it; that shape is bounded instead by
+ * {@link MAX_TAG_NESTING_DEPTH} and {@link MAX_BUFFERED_TAG_BLOCKS},
+ * which cap the opener stack and this buffer respectively and fall back
+ * to returning the input untouched.
  *
  * Note this genuinely needs the buffer: a single "pending block" variant
  * is wrong, because one ancestor can supersede several already-emitted
@@ -308,6 +333,13 @@ function removeTagBlocks(html: string, tag: string): string {
   };
   for (const block of eachTagBlock(html, tag)) {
     batch.push(block);
+    // The depth cap bounds the opener stack but not this buffer: one
+    // unclosed outer tag keeps every later block at depth > 0, so nothing
+    // flushes and the batch grows with the tag count. Bail out to the
+    // untouched input rather than flushing early - a partial flush would
+    // emit blocks that a later ancestor was still entitled to supersede,
+    // which is the exact bug the buffer exists to prevent.
+    if (batch.length >= MAX_BUFFERED_TAG_BLOCKS) return html;
     if (block.depth === 0) flush();
   }
   flush(); // anything left is under a stranded opener that never closed

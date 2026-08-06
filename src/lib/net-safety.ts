@@ -12,56 +12,53 @@
  * 169.254.169.254) instead, and still carry any configured `Authorization`
  * header.
  *
- * `assertPublicResolution()` resolves a hostname and rejects if *any*
- * returned address is private/loopback/link-local/otherwise non-public -
- * unless the hostname itself is a literal reference to the local machine
- * (an IP literal, or the name "localhost"), which is treated as explicit
- * operator intent (e.g. testing against a local dev server) rather than an
- * attack, and left unchecked.
+ * The policy: reject if *any* returned address is
+ * private/loopback/link-local/otherwise non-public - unless the hostname
+ * itself is a literal reference to the local machine (an IP literal, or the
+ * name "localhost"), which is treated as explicit operator intent (e.g.
+ * testing against a local dev server) rather than an attack.
  *
- * This is a best-effort, per-request check, not a fully airtight
- * DNS-pinning defense: a sufficiently fast attacker who controls
- * authoritative DNS for the target hostname in real time could still
- * theoretically swap the resolved address between this lookup and the
- * connection `fetch()` makes immediately after (classic TOCTOU). Fully
- * closing that would require intercepting the actual low-level connect
- * (a custom dispatcher), which is invasive and disproportionate to this
- * tool's threat model. This check is aimed at the realistic threat - a
- * hijacked, dangling, or misconfigured DNS record persistently pointing at
- * an internal address - not a theoretical microsecond-precision race.
+ * That policy is enforced in two places, and the distinction matters:
  *
- * That residual race is accepted deliberately, and the reasoning depends on
- * one deployment assumption worth stating plainly:
+ *   - {@link createGuardedLookup} is the *enforcement* point. It runs inside
+ *     the connector, so the address it approves is the address the socket
+ *     connects to.
+ *   - {@link assertPublicResolution} is a *pre-flight* check. It runs before
+ *     any socket is opened and produces a far better error message, but it
+ *     resolves independently of the connection and so cannot be relied on
+ *     alone.
  *
- *   **The base URL is operator-supplied configuration, not attacker-supplied
- *   input.** It is chosen once at startup (`--url` / config) and points at a
- *   documentation site the operator already trusts enough to read content
- *   from and to send any configured `Authorization` header to. Nothing in
- *   the MCP tool surface lets a caller redirect requests to an arbitrary
- *   host - refs are resolved against that fixed base, and cross-origin
- *   redirects are refused.
+ * Earlier revisions shipped only the pre-flight check and documented the
+ * resulting TOCTOU as an accepted risk, on the reasoning that the base URL
+ * is operator-supplied configuration rather than attacker-supplied input.
+ * That reasoning does not survive contact with the very threat named at the
+ * top of this comment: a hijacked or claimed-dangling record means the
+ * attacker holds authority over a domain the operator already configured,
+ * so "the operator chose this host" stops being a mitigation at exactly the
+ * moment the guard is needed. And the gap was never a microsecond race to
+ * be won - validation and connection issue two separate queries, and
+ * whoever controls the zone answers both, so alternating responses defeat a
+ * lookup-only check deterministically. Verified: with connect-time
+ * validation removed, a resolver returning a public address to the check
+ * and loopback to the connection reads local content; with it in place the
+ * connection is refused.
  *
- * So winning the race requires already holding authoritative, real-time
- * control of DNS for a domain the operator trusts - at which point the
- * attacker can simply return an internal address on *every* lookup, which
- * this check does catch and reject. The race only buys an attacker the
- * ability to be inconsistent, not the ability to be believed.
+ * Both checks share one resolution seam (`DnsLookupFn`) so they cannot
+ * disagree about policy, and both fail closed - an unparseable, empty, or
+ * failed answer is treated as unsafe rather than assumed harmless.
  *
- * If you point this server at a hostname you do *not* control or trust -
- * for example one whose DNS is delegated to an untrusted third party, or a
- * user-provided URL in a multi-tenant deployment - that assumption no
- * longer holds and this guard should not be relied on as the only network
- * boundary. Put egress filtering in front of it instead.
- *
- * Closing the race properly means routing `fetch()` through an undici
- * `Agent` with a custom `connect.lookup` that pins the vetted address, so
- * validation and connection share one resolution. That was evaluated and
- * rejected for now: it would replace the injectable `fetchImpl` seam the
- * remote source's test suite is built on, trading a large, well-covered
- * behavioral safety net for a theoretical gain under a threat model where
- * the attacker already has an easier winning move.
+ * Remaining limitation worth stating: an operator-specific NAT64 prefix
+ * (RFC 6052 network-specific prefixes, as opposed to the well-known
+ * `64:ff9b::/96` and `64:ff9b:1::/48` handled below) is ordinary global
+ * IPv6 space whose low bits embed an IPv4 address. Such a prefix is
+ * indistinguishable from a normal public address without knowing the
+ * deployment's configuration, so on a NAT64 network it can reach internal
+ * IPv4 space. Closing that requires operator-supplied prefixes or egress
+ * filtering; it is not something this module can infer.
  */
 import net from 'node:net';
+import dns from 'node:dns';
+import type { LookupAddress, LookupOptions } from 'node:dns';
 
 export interface ResolvedAddress {
   address: string;
@@ -377,4 +374,133 @@ export async function assertPublicResolution(
         'This may indicate DNS rebinding, a hijacked or dangling DNS record, or a misconfigured docs host.',
     );
   }
+}
+
+/** Shape of the `lookup` hook undici's connector accepts (Node's `dns.lookup`). */
+export type ConnectLookupFn = (
+  hostname: string,
+  options: LookupOptions,
+  callback: (
+    err: NodeJS.ErrnoException | null,
+    address: string | LookupAddress[],
+    family?: number,
+  ) => void,
+) => void;
+
+/**
+ * Builds the `connect.lookup` hook that actually *enforces* this module's
+ * address policy, for use as `new Agent({ connect: { lookup } })`.
+ *
+ * This is the answer to the rebinding gap described at the top of this
+ * file, and it closes it by construction rather than by narrowing the
+ * window. {@link assertPublicResolution} performs its own resolution and
+ * then hands the *hostname* to `fetch()`, which resolves independently -
+ * so the address that was checked and the address that gets connected to
+ * are two different answers to two different queries. Whoever controls
+ * the zone chooses both, and a short-TTL record that alternates public
+ * and private answers defeats the check outright: it is not a narrow race
+ * that an attacker has to win, it is two questions they get to answer
+ * separately.
+ *
+ * Undici calls this hook while establishing the socket, and connects to
+ * exactly the address it returns. Validating here therefore makes the
+ * address that was checked and the address that is connected to the same
+ * value, with no second query in between. There is no window left to
+ * rebind in, so this holds even against an adversary with full authority
+ * over the zone - which is the realistic post-takeover case, and exactly
+ * the one an "the operator configured this URL" argument does not cover.
+ *
+ * `assertPublicResolution()` is deliberately kept as a pre-flight check
+ * rather than replaced. It runs before any socket is opened and can name
+ * the offending address in its error, which is a far better diagnostic
+ * for the overwhelmingly common cause (a misconfigured docs host) than a
+ * connect-time failure. Enforcement lives here; that one is triage.
+ */
+export function createGuardedLookup(
+  lookup: DnsLookupFn,
+  timeoutMs?: number,
+  onBlocked?: (hostname: string, address: string) => void,
+): ConnectLookupFn {
+  return (hostname, options, callback) => {
+    // Undici hands us the host from the URL, so an IPv6 literal arrives
+    // bracketed for the same reason it does in `assertPublicResolution`.
+    const bareHost =
+      hostname.length > 2 && hostname.startsWith('[') && hostname.endsWith(']')
+        ? hostname.slice(1, -1)
+        : hostname;
+
+    // A literal IP never had a DNS step, so there is nothing to rebind;
+    // it was already judged by the pre-flight check (and by the URL
+    // validation before that). Hand it straight back so loopback dev
+    // URLs keep working exactly as they do today.
+    if (net.isIP(bareHost) !== 0) {
+      const family = net.isIP(bareHost);
+      callback(null, options.all === true ? [{ address: bareHost, family }] : bareHost, family);
+      return;
+    }
+    const normalizedHost = hostname.toLowerCase().replace(/\.$/, '');
+    if (EXPLICIT_LOOPBACK_HOSTNAMES.has(normalizedHost)) {
+      // Same carve-out as the pre-flight check: the operator named the
+      // local machine directly, so defer to the system resolver.
+      dns.lookup(hostname, options, callback);
+      return;
+    }
+
+    withDnsTimeout(lookup(hostname), timeoutMs, hostname).then(
+      (resolved) => {
+        if (resolved.length === 0) {
+          callback(
+            enoent(`Refusing to connect to "${hostname}": DNS resolution returned no addresses.`),
+            '',
+          );
+          return;
+        }
+        const unsafe = resolved.find((r) => isPrivateOrReservedAddress(r.address));
+        if (unsafe) {
+          // Reject the whole answer rather than filtering to the safe
+          // subset. A response mixing public and private addresses is
+          // already anomalous, and connecting to the "good" one would
+          // let a hostile zone keep retrying until a pooled connection
+          // happened to land where it wanted.
+          onBlocked?.(hostname, unsafe.address);
+          callback(
+            enoent(
+              `Refusing to connect to "${hostname}": it resolves to ${unsafe.address}, a private/internal address. ` +
+                'This may indicate DNS rebinding, a hijacked or dangling DNS record, or a misconfigured docs host.',
+            ),
+            '',
+          );
+          return;
+        }
+        const addresses: LookupAddress[] = resolved.map((r) => ({
+          address: r.address,
+          family: net.isIP(r.address),
+        }));
+        const first = addresses[0] as LookupAddress;
+        callback(null, options.all === true ? addresses : first.address, first.family);
+      },
+      (err: unknown) => {
+        // Fail closed, for the reasons spelled out in
+        // `assertPublicResolution`'s catch block.
+        callback(
+          enoent(
+            `Refusing to connect to "${hostname}": DNS resolution failed (${err instanceof Error ? err.message : String(err)}), so it cannot be verified as a public address.`,
+          ),
+          '',
+        );
+      },
+    );
+  };
+}
+
+/**
+ * Undici surfaces a connector error to the caller wrapped in a generic
+ * "fetch failed", keeping only `err.cause`. Giving these a DNS-shaped
+ * `code` means the reason still reads correctly there instead of being
+ * mistaken for a transport fault.
+ */
+function enoent(message: string): NodeJS.ErrnoException {
+  const err: NodeJS.ErrnoException = new Error(message);
+  err.code = 'ENOTFOUND';
+  return err;
 }

@@ -16,7 +16,8 @@ import {
   isSitemapIndex,
   parseSitemap,
 } from '../lib/sitemap.js';
-import { assertPublicResolution, type DnsLookupFn } from '../lib/net-safety.js';
+import { assertPublicResolution, createGuardedLookup, type DnsLookupFn } from '../lib/net-safety.js';
+import { Agent } from 'undici';
 import { lookup as dnsLookupPromise } from 'node:dns/promises';
 import {
   type FumadocsSource,
@@ -219,6 +220,8 @@ export class RemoteFumadocsSource implements FumadocsSource {
   // duplicate requests for the *same* key.
   private fetchSemaphore: Semaphore;
   private dnsLookup: DnsLookupFn;
+  /** Undici dispatcher enforcing the address policy at connect time. */
+  private dispatcher: Agent | undefined;
 
   constructor(opts: RemoteSourceOptions) {
     this.base = new URL(opts.baseUrl);
@@ -258,6 +261,20 @@ export class RemoteFumadocsSource implements FumadocsSource {
       opts.maxFetchQueueLength ?? 1000,
     );
     this.dnsLookup = opts.dnsLookup ?? defaultDnsLookup;
+    // Enforcement point for the address policy. Built only when using the
+    // real `fetch`: an injected `fetchImpl` is a test double that never
+    // opens a socket, so a dispatcher would do nothing there, and building
+    // one per source across hundreds of unit tests would leak undici
+    // resources. The guard's own logic is covered directly against
+    // `createGuardedLookup` rather than through this seam - see
+    // net-safety.ts for why validating inside the connector (rather than
+    // only before it) is what actually closes the rebinding gap.
+    this.dispatcher =
+      opts.fetchImpl === undefined
+        ? new Agent({
+            connect: { lookup: createGuardedLookup(this.dnsLookup, this.fetchTimeoutMs) },
+          })
+        : undefined;
     const ttl = opts.cacheTtlMs ?? 5 * 60 * 1000;
     this.pageCache = new TtlCache(ttl, 500, {
       maxTotalSize: maxPageCacheBytes,
@@ -402,7 +419,9 @@ export class RemoteFumadocsSource implements FumadocsSource {
         headers: init.headers,
         redirect: 'manual',
         signal: AbortSignal.timeout(this.fetchTimeoutMs),
-      });
+        // Non-standard undici option; ignored by an injected `fetchImpl`.
+        ...(this.dispatcher ? { dispatcher: this.dispatcher } : {}),
+      } as RequestInit);
       if (res.status >= 300 && res.status < 400) {
         const location = res.headers.get('location');
         if (!location) return res;
