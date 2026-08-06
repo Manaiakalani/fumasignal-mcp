@@ -441,6 +441,14 @@ describe('render budget bypasses', () => {
     ['an end tag blocked by a special element', '<b><div></b>'.repeat(3_000)],
     ['abrupt closing of an empty comment', `<!-->${'<div>'.repeat(1_500)}`],
     ['self-closing abused via foreignObject', `<svg>${'<foreignObject><div/>'.repeat(1_500)}`],
+    ['a "/" in an unquoted attribute inside svg', `<svg>${'<g a=b/>'.repeat(1_500)}`],
+    ['an html element self-closed inside svg', `<svg>${'<div a=b/>'.repeat(1_500)}`],
+    ['a breakout tag self-closed inside svg', `<svg>${'<span a=b/>'.repeat(1_500)}`],
+    ['a breakout tag self-closed inside math', `<math>${'<div a=b/>'.repeat(1_500)}`],
+    ['svg <title> treated as raw text', `<svg><title>${'<div>'.repeat(1_500)}`],
+    ['svg <textarea> treated as raw text', `<svg><textarea>${'<div>'.repeat(1_500)}`],
+    ['svg <style> treated as raw text', `<svg><style>${'<div>'.repeat(1_500)}`],
+    ['a stray slash between attributes in svg', `<svg>${'<g / >'.repeat(1_500)}`],
     ['an element that merely looks void', '<brx>'.repeat(1_500)],
     ['sheer width rather than depth', '<b>x</b>'.repeat(200_000)],
   ])('refuses %s', (_label, html) => {
@@ -452,10 +460,14 @@ describe('render budget bypasses', () => {
 
   // Inline SVG is everywhere in documentation. In foreign content a trailing
   // '/' really does self-close, so refusing to honour it there would burn a
-  // level per icon and downgrade ordinary pages to plain text.
+  // level per icon and downgrade ordinary pages to plain text. The marker is
+  // therefore honoured only where the tokenizer would set it: still inside
+  // foreign content, and not part of an unquoted attribute value.
   it.each([
     ['inline svg icons', `<div>${'<svg><circle/><path/></svg>'.repeat(300)}</div>`],
     ['svg with attributes', `<div>${'<svg viewBox="0 0 24 24"><path d="M0 0"/></svg>'.repeat(300)}</div>`],
+    ['svg carrying a title', `<div>${'<svg><title>icon</title><path d="M0"/></svg>'.repeat(300)}</div>`],
+    ['a self-closed svg root', `<div>${'<svg/>'.repeat(300)}</div>`],
     ['mathml', `<div>${'<math><mi>x</mi><mo>+</mo></math>'.repeat(300)}</div>`],
     ['stray closing tags', '<div>a</span></p></b>b</div>'.repeat(500)],
     ['">" inside an attribute on a normal page', '<div title="a > b">ok</div>'.repeat(500)],

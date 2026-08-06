@@ -175,9 +175,12 @@ const DROPPED_SUBTREES = new Set(['script', 'style', 'noscript', 'iframe']);
 const FOREIGN_ROOTS = new Set(['svg', 'math']);
 
 /**
- * Points inside foreign content where HTML parsing resumes. Seeing one drops
- * us back to the strict HTML reading (a trailing `/` is ignored again), so
- * `<foreignObject><div/>...` cannot be talked out of counting its nesting.
+ * Points inside foreign content where HTML parsing resumes, so a trailing
+ * `/` stops being meaningful again. `HTML_INTEGRATION_POINTS` are the
+ * container elements; `FOREIGN_BREAKOUT_TAGS` is HTML5's list of start tags
+ * that force the parser out of foreign content wherever they appear. Without
+ * the second list, one `<svg>` before the payload would exempt the whole rest
+ * of the document from the depth limit.
  */
 const HTML_INTEGRATION_POINTS = new Set([
   'foreignobject',
@@ -188,6 +191,54 @@ const HTML_INTEGRATION_POINTS = new Set([
   'mo',
   'mn',
   'ms',
+]);
+
+const FOREIGN_BREAKOUT_TAGS = new Set([
+  'b',
+  'big',
+  'blockquote',
+  'body',
+  'br',
+  'center',
+  'code',
+  'dd',
+  'div',
+  'dl',
+  'dt',
+  'em',
+  'embed',
+  'font',
+  'h1',
+  'h2',
+  'h3',
+  'h4',
+  'h5',
+  'h6',
+  'head',
+  'hr',
+  'i',
+  'img',
+  'li',
+  'listing',
+  'menu',
+  'meta',
+  'nobr',
+  'ol',
+  'p',
+  'pre',
+  'ruby',
+  's',
+  'small',
+  'span',
+  'strong',
+  'strike',
+  'sub',
+  'sup',
+  'table',
+  'tt',
+  'u',
+  'ul',
+  'var',
 ]);
 
 /** Elements that never have children, so they must not push a level. */
@@ -541,8 +592,19 @@ function isSpaceCode(code: number): boolean {
 }
 
 /**
- * Index of the `>` that ends the tag whose name ended at `from`, or -1 when
- * the tag never ends.
+ * Result of {@link tagEnd}, reused across a scan so the hot path allocates
+ * nothing per tag.
+ */
+interface TagEnd {
+  /** Index of the `>` that ends the tag, or -1 when it never ends. */
+  end: number;
+  /** True only for a genuine self-closing marker, per the tokenizer. */
+  selfClosing: boolean;
+}
+
+/**
+ * Locate the `>` that ends the tag whose name ended at `from`, and decide
+ * whether the tag is genuinely self-closing, writing both into `out`.
  *
  * This walks attributes the way the tokenizer does instead of reaching for
  * the next `>`, because a quoted attribute value may contain one:
@@ -551,16 +613,32 @@ function isSpaceCode(code: number): boolean {
  * tag that resets the depth stack and spills the attribute's text into the
  * {@link htmlToText} output. Quotes only open a value straight after `=`, so
  * an unquoted `x=a"b` cannot swallow the rest of the document either.
+ *
+ * The self-closing flag is set only when `/` appears where an attribute name
+ * could start and is immediately followed by `>`. A `/` inside an unquoted
+ * value is part of that value: `<g a=b/>` is **not** self-closing, and
+ * reading it as such is what let `<svg>` + `<g a=b/>` nest unbounded.
  */
-function tagEnd(html: string, from: number): number {
+function tagEnd(html: string, from: number, out: TagEnd): void {
+  out.selfClosing = false;
   let i = from;
   while (i < html.length) {
     while (i < html.length && isSpaceCode(html.charCodeAt(i))) i++;
-    if (i >= html.length) return -1;
+    if (i >= html.length) break;
     const c = html.charCodeAt(i);
-    if (c === 62) return i; // >
+    if (c === 62) {
+      out.end = i; // >
+      return;
+    }
     if (c === 47) {
-      i++; // stray '/' between attributes
+      // Self-closing start tag state: only a `>` straight after the slash
+      // sets the flag; anything else is a stray slash between attributes.
+      if (html.charCodeAt(i + 1) === 62) {
+        out.selfClosing = true;
+        out.end = i + 1;
+        return;
+      }
+      i++;
       continue;
     }
     // Attribute name.
@@ -570,25 +648,26 @@ function tagEnd(html: string, from: number): number {
       i++;
     }
     while (i < html.length && isSpaceCode(html.charCodeAt(i))) i++;
-    if (i >= html.length) return -1;
+    if (i >= html.length) break;
     if (html.charCodeAt(i) !== 61) continue; // no '=': valueless attribute
     i++; // past '='
     while (i < html.length && isSpaceCode(html.charCodeAt(i))) i++;
-    if (i >= html.length) return -1;
+    if (i >= html.length) break;
     const quote = html.charCodeAt(i);
     if (quote === 34 || quote === 39) {
       const close = html.indexOf(String.fromCharCode(quote), i + 1);
-      if (close === -1) return -1; // value never closes, so the tag never does
+      if (close === -1) break; // value never closes, so the tag never does
       i = close + 1;
       continue;
     }
+    // Unquoted value: `/` is an ordinary character here, not a marker.
     while (i < html.length) {
       const v = html.charCodeAt(i);
       if (v === 62 || isSpaceCode(v)) break;
       i++;
     }
   }
-  return -1;
+  out.end = -1;
 }
 
 /**
@@ -655,6 +734,7 @@ function scanElements(
   onText?: (chunk: string) => void,
 ): boolean {
   const open: string[] = [];
+  const tag: TagEnd = { end: -1, selfClosing: false };
   let elements = 0;
   // Stack height at which the nearest Turndown-dropped ancestor opened, or
   // -1 when there is none.
@@ -722,10 +802,11 @@ function scanElements(
     }
     let nameEnd = nameStart;
     while (nameEnd < html.length && isNameChar(html.charCodeAt(nameEnd))) nameEnd++;
-    const gt = tagEnd(html, nameEnd);
-    if (gt === -1) break; // unterminated tag: nothing further is markup
+    tagEnd(html, nameEnd, tag);
+    if (tag.end === -1) break; // unterminated tag: nothing further is markup
     const name = html.slice(nameStart, nameEnd).toLowerCase();
-    i = gt + 1;
+    const selfClosing = tag.selfClosing;
+    i = tag.end + 1;
 
     if (isClosing) {
       // Only ever pop an exact match for the innermost element. Popping to a
@@ -740,7 +821,12 @@ function scanElements(
     elements++;
     if (elements > maxElements) return true;
 
-    if (RAW_TEXT_ELEMENTS.has(name)) {
+    // Raw text is an HTML-namespace rule only. Inside `<svg>`/`<math>`,
+    // `<title>`, `<style>` and `<textarea>` are ordinary containers, and
+    // markup inside them really does nest - skipping it there reported
+    // `<svg><title>` + 3,000 `<div>` as depth 1 and two elements, escaping
+    // the depth *and* element caps at once.
+    if (foreignDepth === -1 && RAW_TEXT_ELEMENTS.has(name)) {
       // Content is character data: it creates no nodes, must not be scanned
       // as markup, and is not part of the page's prose.
       const end = rawTextElementEnd(html, name, i);
@@ -748,9 +834,26 @@ function scanElements(
       continue;
     }
 
-    // Optional end tags resolve first, so a void `<hr>` still closes an open
-    // `<p>`. They are an HTML-only rule: inside `<svg>`/`<math>` the stack
-    // must be left alone, since popping there would under-report depth.
+    // Foreign content is the only place a trailing `/` self-closes. HTML5
+    // leaves foreign content on any of ~45 start tags, so this has to be
+    // checked on every element: without it, a single `<svg>` before the
+    // payload would exempt the rest of the document from the limit.
+    let honourSelfClosing = false;
+    if (foreignDepth !== -1) {
+      if (FOREIGN_BREAKOUT_TAGS.has(name) || HTML_INTEGRATION_POINTS.has(name)) {
+        foreignDepth = -1; // HTML resumes here; back to the strict reading
+      } else {
+        honourSelfClosing = selfClosing;
+      }
+    } else if (FOREIGN_ROOTS.has(name)) {
+      if (selfClosing) continue; // `<svg/>` opens nothing
+      foreignDepth = open.length;
+    }
+
+    // Optional end tags resolve before the void check, so a void `<hr>` still
+    // closes an open `<p>`. They are an HTML-only rule: inside `<svg>`/
+    // `<math>` the stack must be left alone, since popping there would
+    // under-report depth.
     if (foreignDepth === -1) {
       const implied = IMPLIED_END_TAGS.get(name);
       if (implied) {
@@ -760,17 +863,10 @@ function scanElements(
 
     // A `/` before the `>` is ignored on ordinary HTML elements, so `<div/>`
     // opens a `<div>` like any other. Only genuinely void elements stay
-    // flat - and, inside `<svg>`/`<math>`, genuinely self-closed ones.
+    // flat - and, in foreign content, genuinely self-closed ones.
     if (VOID_ELEMENTS.has(name)) continue;
-    if (foreignDepth !== -1) {
-      if (HTML_INTEGRATION_POINTS.has(name)) {
-        foreignDepth = -1; // HTML resumes here; back to the strict reading
-      } else if (html.charCodeAt(gt - 1) === 47) {
-        continue; // `<path/>` really is self-closing in foreign content
-      }
-    } else if (FOREIGN_ROOTS.has(name)) {
-      foreignDepth = open.length;
-    }
+    if (honourSelfClosing) continue;
+
     if (dropDepth === -1 && DROPPED_SUBTREES.has(name)) dropDepth = open.length;
     open.push(name);
     if (open.length > maxDepth) return true;

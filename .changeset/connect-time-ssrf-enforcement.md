@@ -35,7 +35,7 @@ floor. Every other dependency still allows `>=18`; this is the only constraint
 raising it. The excluded releases (20.0.0–20.18.0) are superseded patch versions
 of a Node line that is itself past end-of-life.
 
-**HTML conversion is now bounded end to end.** Pathological markup could grow
+**HTML conversion is now bounded.** Pathological markup could grow
 `eachTagBlock`'s opener stack and `removeTagBlocks`'s pending buffer without
 bound. Depth is capped at 1,000 and buffered blocks at 50,000; past either cap
 the input is returned unmodified rather than stripped. Peak heap on an
@@ -68,15 +68,33 @@ adoption agency algorithm re-opens formatting elements, so the real tree gets
 an empty comment, read as one that never ends, discarding the rest of the
 document). Each of these reached Turndown and threw after seconds of
 synchronous work. Over-estimating only costs one page its Markdown formatting;
-under-estimating is a stalled process, so the scanner now pops only an exact
-innermost match and never honours a self-closing marker it is not certain of.
+under-estimating is a stalled process, so the scanner pops only an exact
+innermost match and treats a trailing `/` as self-closing only where the
+tokenizer would.
 
 It counts unknown elements too, since the HTML parser nests `<x-widget>` like
 anything else, and it applies HTML5's optional-end-tag rules — including `</p>`
 before a block element — so ordinary markup that omits `</li>`, `</td>` or
-`</p>` is not mistaken for deep nesting. Inline `<svg>` and `<math>` keep the
-foreign-content rule, where a trailing `/` genuinely does self-close, so
-icon-heavy pages are not downgraded.
+`</p>` is not mistaken for deep nesting.
+
+Inline `<svg>` and `<math>` are the one place a trailing `/` genuinely does
+self-close, and honouring it there is what keeps icon-heavy pages from being
+downgraded. That exemption is narrow, because each way of widening it was a
+bypass in its own right: the marker is read from the tokenizer's attribute
+states rather than from the character before `>` (so `<g a=b/>`, where the `/`
+belongs to an unquoted value, is *not* self-closing), foreign content ends at
+any of HTML5's ~45 breakout tags (so one `<svg>` cannot exempt the rest of the
+document via `<div a=b/>` or `<span a=b/>`), and the raw-text rule for
+`<title>`, `<style>` and `<textarea>` is suppressed inside foreign content,
+where those are ordinary containers that really do nest. Each shape above
+reported depth 1 for a document domino parses at ~3,000, and the last escaped
+the element cap as well; measured through `getPage()`, 1 MB of it blocked for
+8.8 minutes.
+
+Residual imprecision is bounded rather than eliminated: against domino as the
+oracle, the scanner under-counts by at most a single-digit number of levels,
+and that gap does not grow with document size — it stays under 10 as inputs
+scale 256×, against a limit of 500.
 
 The plain-text fallback is bounded as well, and no longer spills attribute
 values into the text, mistakes `</script-x>` for the end of a `<script>`, keeps
