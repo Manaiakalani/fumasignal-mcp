@@ -79,22 +79,35 @@ before a block element — so ordinary markup that omits `</li>`, `</td>` or
 
 Inline `<svg>` and `<math>` are the one place a trailing `/` genuinely does
 self-close, and honouring it there is what keeps icon-heavy pages from being
-downgraded. That exemption is narrow, because each way of widening it was a
-bypass in its own right: the marker is read from the tokenizer's attribute
-states rather than from the character before `>` (so `<g a=b/>`, where the `/`
-belongs to an unquoted value, is *not* self-closing), foreign content ends at
-any of HTML5's ~45 breakout tags (so one `<svg>` cannot exempt the rest of the
-document via `<div a=b/>` or `<span a=b/>`), and the raw-text rule for
-`<title>`, `<style>` and `<textarea>` is suppressed inside foreign content,
-where those are ordinary containers that really do nest. Each shape above
-reported depth 1 for a document domino parses at ~3,000, and the last escaped
-the element cap as well; measured through `getPage()`, 1 MB of it blocked for
-8.8 minutes.
+downgraded — 300 icons is ordinary for a docs sidebar, and refusing the marker
+outright costs two levels each. That exemption is narrow, because every way of
+widening it was a bypass in its own right, each reporting depth 1 or 2 for a
+document the parser nests ~3,000 deep:
 
-Residual imprecision is bounded rather than eliminated: against domino as the
-oracle, the scanner under-counts by at most a single-digit number of levels,
-and that gap does not grow with document size — it stays under 10 as inputs
-scale 256×, against a limit of 500.
+- The marker is read from the tokenizer's attribute states rather than from
+  the character before `>`, so `<g a=b/>` — where the `/` belongs to an
+  unquoted value — is not self-closing.
+- Foreign content ends at any of HTML5's ~45 breakout start tags and at the
+  integration points, `<title>` included, so one `<svg>` cannot exempt what
+  follows via `<div a=b/>` or `<span a=b/>`.
+- A `</svg>` that matches nothing on the scanner's stack still returns the
+  real parser to HTML. Since there is no way to tell which elements it closed,
+  self-closing markers stop being honoured from that point on rather than
+  being honoured in the wrong namespace.
+- Which elements are foreign is tracked per open element rather than as a
+  single depth, so leaving an HTML island — `</title>` inside `<svg>` —
+  restores foreign content instead of losing it for the rest of the document.
+
+The raw-text rule for `<title>`, `<style>` and `<textarea>` is suppressed
+while any `<svg>`/`<math>` is open, since those are ordinary containers there
+and their contents really do nest. That test deliberately uses a separate,
+stickier signal than the one driving the self-closing decision: the two have
+to be wrong in opposite directions. Guessing "not foreign" only ever counts
+more depth, but guessing it for raw text skips an unbounded amount of markup —
+`<svg><font><title>` followed by any number of `<div>` reported three
+elements, escaping the element cap as well as the depth cap. Measured through
+`getPage()`, 15 KB of that shape threw `RangeError` after 3 s and 1 MB had not
+finished after 7 minutes.
 
 The plain-text fallback is bounded as well, and no longer spills attribute
 values into the text, mistakes `</script-x>` for the end of a `<script>`, keeps

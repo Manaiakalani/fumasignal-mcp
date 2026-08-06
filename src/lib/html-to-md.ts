@@ -186,6 +186,10 @@ const HTML_INTEGRATION_POINTS = new Set([
   'foreignobject',
   'annotation-xml',
   'desc',
+  // SVG's `<title>` is an integration point alongside `foreignObject` and
+  // `desc`, so HTML resumes inside it. Omitting it kept `<svg><title>` in
+  // foreign content, where a trailing `/` is honoured.
+  'title',
   'mtext',
   'mi',
   'mo',
@@ -741,14 +745,27 @@ function scanElements(
   let dropDepth = -1;
   // Stack height at which the nearest `<svg>`/`<math>` opened, or -1 when
   // ordinary HTML rules apply.
-  let foreignDepth = -1;
+  // Whether each open element sits in foreign content, kept parallel to
+  // `open` so that leaving an HTML island - `</title>` inside `<svg>` -
+  // restores foreign mode instead of losing it for the rest of the document.
+  const foreign: boolean[] = [];
+  // Count of `<svg>`/`<math>` roots opened and not explicitly closed. Unlike
+  // the per-element flag this is never cleared on a guess, so it can only
+  // over-state how much of the document is foreign - the safe direction for
+  // the one decision that would otherwise skip unbounded markup.
+  let foreignOpen = 0;
+  // Cleared for good by a `</svg>`/`</math>` that matches nothing, which
+  // returns the real parser to HTML from a nesting level this scanner cannot
+  // identify. From then on no trailing `/` is honoured anywhere, which can
+  // only over-count.
+  let foreignTrusted = true;
   const emit = (chunk: string): void => {
     if (dropDepth === -1) onText?.(chunk);
   };
   const popOne = (): void => {
     open.pop();
+    foreign.pop();
     if (dropDepth !== -1 && open.length <= dropDepth) dropDepth = -1;
-    if (foreignDepth !== -1 && open.length <= foreignDepth) foreignDepth = -1;
   };
 
   let i = 0;
@@ -809,6 +826,16 @@ function scanElements(
     i = tag.end + 1;
 
     if (isClosing) {
+      // A foreign root's end tag returns the real parser to HTML even when it
+      // matches nothing on this stack, so `<svg><g></svg>` must not leave the
+      // scanner in foreign content. Where it matches nothing there is no way
+      // to tell which open elements it closed, so self-closing markers stop
+      // being honoured entirely rather than being honoured in the wrong
+      // namespace.
+      if (FOREIGN_ROOTS.has(name)) {
+        if (foreignOpen > 0) foreignOpen--;
+        if (!(open.length > 0 && open[open.length - 1] === name)) foreignTrusted = false;
+      }
       // Only ever pop an exact match for the innermost element. Popping to a
       // match deeper in the stack is what the parser does for ordinary
       // elements, but for mis-nested formatting elements it re-opens them
@@ -822,11 +849,20 @@ function scanElements(
     if (elements > maxElements) return true;
 
     // Raw text is an HTML-namespace rule only. Inside `<svg>`/`<math>`,
-    // `<title>`, `<style>` and `<textarea>` are ordinary containers, and
-    // markup inside them really does nest - skipping it there reported
+    // `<title>`, `<style>` and `<textarea>` are ordinary containers whose
+    // markup really does nest, so skipping their contents there reported
     // `<svg><title>` + 3,000 `<div>` as depth 1 and two elements, escaping
     // the depth *and* element caps at once.
-    if (foreignDepth === -1 && RAW_TEXT_ELEMENTS.has(name)) {
+    //
+    // This deliberately tests `foreignOpen` rather than the per-element flag.
+    // The two have to be wrong in opposite directions: the flag tracks where
+    // HTML resumes and is cleared on more tags than the spec strictly
+    // requires, which is safe for the self-closing decision below - guessing
+    // "not foreign" only ever counts more depth - but is exactly backwards
+    // here, where believing HTML has resumed skips an unbounded amount of
+    // markup. `foreignOpen` counts only roots and is never cleared
+    // optimistically, so it can only ever suppress the skip.
+    if (foreignOpen === 0 && RAW_TEXT_ELEMENTS.has(name)) {
       // Content is character data: it creates no nodes, must not be scanned
       // as markup, and is not part of the page's prose.
       const end = rawTextElementEnd(html, name, i);
@@ -835,26 +871,30 @@ function scanElements(
     }
 
     // Foreign content is the only place a trailing `/` self-closes. HTML5
-    // leaves foreign content on any of ~45 start tags, so this has to be
-    // checked on every element: without it, a single `<svg>` before the
-    // payload would exempt the rest of the document from the limit.
+    // leaves foreign content on any of ~45 start tags as well as at the
+    // integration points, so this has to be checked on every element: without
+    // it, a single `<svg>` before the payload would exempt the whole rest of
+    // the document from the limit.
+    const inForeign = open.length > 0 && foreign[open.length - 1] === true;
     let honourSelfClosing = false;
-    if (foreignDepth !== -1) {
+    let opensForeign = inForeign;
+    if (inForeign) {
       if (FOREIGN_BREAKOUT_TAGS.has(name) || HTML_INTEGRATION_POINTS.has(name)) {
-        foreignDepth = -1; // HTML resumes here; back to the strict reading
-      } else {
+        opensForeign = false; // HTML resumes here; back to the strict reading
+      } else if (foreignTrusted) {
         honourSelfClosing = selfClosing;
       }
     } else if (FOREIGN_ROOTS.has(name)) {
-      if (selfClosing) continue; // `<svg/>` opens nothing
-      foreignDepth = open.length;
+      if (selfClosing && foreignTrusted) continue; // `<svg/>` opens nothing
+      opensForeign = true;
+      foreignOpen++;
     }
 
     // Optional end tags resolve before the void check, so a void `<hr>` still
     // closes an open `<p>`. They are an HTML-only rule: inside `<svg>`/
     // `<math>` the stack must be left alone, since popping there would
     // under-report depth.
-    if (foreignDepth === -1) {
+    if (!inForeign) {
       const implied = IMPLIED_END_TAGS.get(name);
       if (implied) {
         while (open.length > 0 && implied.has(open[open.length - 1] as string)) popOne();
@@ -869,6 +909,7 @@ function scanElements(
 
     if (dropDepth === -1 && DROPPED_SUBTREES.has(name)) dropDepth = open.length;
     open.push(name);
+    foreign.push(opensForeign);
     if (open.length > maxDepth) return true;
   }
   return false;
