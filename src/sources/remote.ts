@@ -17,7 +17,7 @@ import {
   parseSitemap,
 } from '../lib/sitemap.js';
 import { assertPublicResolution, createGuardedLookup, type DnsLookupFn } from '../lib/net-safety.js';
-import { Agent } from 'undici';
+import { Agent, fetch as undiciFetch } from 'undici';
 import { lookup as dnsLookupPromise } from 'node:dns/promises';
 import {
   type FumadocsSource,
@@ -250,7 +250,15 @@ export class RemoteFumadocsSource implements FumadocsSource {
     this.searchPath = opts.searchPath ?? '/api/search';
     this.docsPrefix = opts.docsPrefix ?? '/docs';
     this.authHeader = opts.authHeader;
-    this.fetchImpl = opts.fetchImpl ?? fetch;
+    // Undici's own `fetch`, not the global one, so that it and the
+    // dispatcher below come from the same undici instance. Node's global
+    // `fetch` is backed by a *separate*, internal copy of undici and
+    // validates `init.dispatcher` against its own `Dispatcher` class, so
+    // handing it an `Agent` from this package fails with
+    // `UND_ERR_INVALID_ARG` on Node 20 and 22 - which would break every
+    // real request, not just the guard. Using undici's `fetch` keeps the
+    // dispatcher honoured identically on every supported Node version.
+    this.fetchImpl = opts.fetchImpl ?? (undiciFetch as unknown as typeof fetch);
     this.ua = opts.userAgent ?? DEFAULT_UA;
     this.fetchTimeoutMs = opts.fetchTimeoutMs ?? 15_000;
     this.maxRedirects = opts.maxRedirects ?? 5;
@@ -419,7 +427,9 @@ export class RemoteFumadocsSource implements FumadocsSource {
         headers: init.headers,
         redirect: 'manual',
         signal: AbortSignal.timeout(this.fetchTimeoutMs),
-        // Non-standard undici option; ignored by an injected `fetchImpl`.
+        // Undici-specific option, absent from the standard `RequestInit`.
+        // Only set when `fetchImpl` is undici's own `fetch`; an injected
+        // `fetchImpl` gets no dispatcher and simply ignores the key.
         ...(this.dispatcher ? { dispatcher: this.dispatcher } : {}),
       } as RequestInit);
       if (res.status >= 300 && res.status < 400) {

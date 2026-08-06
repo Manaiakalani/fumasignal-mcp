@@ -1,7 +1,8 @@
 import { describe, it, expect, vi } from 'vitest';
 import http from 'node:http';
 import type { AddressInfo } from 'node:net';
-import { Agent } from 'undici';
+import { Agent, fetch as undiciFetch } from 'undici';
+import { RemoteFumadocsSource } from '../src/sources/remote.js';
 import {
   isPrivateOrReservedAddress,
   assertPublicResolution,
@@ -475,9 +476,9 @@ describe('DNS rebinding is closed at connect time', () => {
         // `.toThrow()` would also be satisfied by an unrelated connect
         // timeout, which is exactly what happens if the guard lets the
         // rebound address through.
-        const err = await fetch(`http://docs.example.com:${port}/`, {
+        const err = await undiciFetch(`http://docs.example.com:${port}/`, {
           dispatcher: agent,
-        } as RequestInit).then(
+        }).then(
           () => null,
           (e: Error & { cause?: NodeJS.ErrnoException }) => e,
         );
@@ -494,7 +495,7 @@ describe('DNS rebinding is closed at connect time', () => {
         connect: { lookup: createGuardedLookup(async () => [{ address: '127.0.0.1' }]) },
       });
       try {
-        const res = await fetch(`http://127.0.0.1:${port}/`, { dispatcher: honest } as RequestInit);
+        const res = await undiciFetch(`http://127.0.0.1:${port}/`, { dispatcher: honest });
         expect(await res.text()).toBe('INTERNAL-ONLY');
       } finally {
         await honest.close();
@@ -502,5 +503,34 @@ describe('DNS rebinding is closed at connect time', () => {
     } finally {
       await new Promise<void>((r) => server.close(() => r()));
     }
+  });
+
+  // Regression guard for a bug CI caught and local runs did not. The
+  // dispatcher is only honoured by the undici instance that created it:
+  // Node's global `fetch` is backed by a separate, internal copy of undici
+  // and validates `init.dispatcher` against its own `Dispatcher` class, so
+  // an `Agent` from this package is rejected outright with
+  // `UND_ERR_INVALID_ARG` on Node 20 and 22. Newer Node happens to accept
+  // it, which is precisely why this needs asserting rather than trusting a
+  // passing dev-machine run - regressing to `globalThis.fetch` would break
+  // every real request on the oldest supported Node, while looking fine
+  // locally.
+  it('pairs the dispatcher with undici fetch rather than the global fetch', () => {
+    const source = new RemoteFumadocsSource({ baseUrl: 'https://docs.example.com' });
+    const internals = source as unknown as { fetchImpl: unknown; dispatcher: unknown };
+    expect(internals.dispatcher).toBeInstanceOf(Agent);
+    expect(internals.fetchImpl).not.toBe(globalThis.fetch);
+    expect(internals.fetchImpl).toBe(undiciFetch);
+  });
+
+  it('attaches no dispatcher when the caller injects its own fetchImpl', () => {
+    const injected = vi.fn();
+    const source = new RemoteFumadocsSource({
+      baseUrl: 'https://docs.example.com',
+      fetchImpl: injected as unknown as typeof fetch,
+    });
+    const internals = source as unknown as { fetchImpl: unknown; dispatcher: unknown };
+    expect(internals.fetchImpl).toBe(injected);
+    expect(internals.dispatcher).toBeUndefined();
   });
 });
