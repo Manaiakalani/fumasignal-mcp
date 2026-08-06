@@ -1,6 +1,6 @@
 import { logger, redactUrlForLogging } from '../lib/logger.js';
 import { TtlCache, Coalescer, Semaphore } from '../lib/cache.js';
-import { htmlToMarkdown } from '../lib/html-to-md.js';
+import { htmlToMarkdown, htmlToText } from '../lib/html-to-md.js';
 import {
   type HeadingIndex,
   FenceTracker,
@@ -916,7 +916,21 @@ export class RemoteFumadocsSource implements FumadocsSource {
     }
     const html = await this.readCappedText(res);
     const meta = extractHtmlMeta(html);
-    const markdown = htmlToMarkdown(html);
+    // The render budget is meant to keep pathological markup away from
+    // Turndown, but it approximates the parser and has been wrong before.
+    // A stack overflow here would otherwise escape as a raw RangeError and
+    // fail the whole tool call; downgrading to text costs one page its
+    // formatting instead.
+    let markdown: string;
+    try {
+      markdown = htmlToMarkdown(html);
+    } catch (err) {
+      logger.warn(
+        { err, url: redactUrlForLogging(target.toString()) },
+        'remote: failed to convert html, falling back to text',
+      );
+      markdown = htmlToText(html);
+    }
     return { markdown, meta };
   }
 }

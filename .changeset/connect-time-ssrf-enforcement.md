@@ -59,8 +59,9 @@ stack, but they still cost ~15 s and ~750 MB to parse — they are now refused i
 46 ms.
 
 The pre-check does not reproduce HTML5 tree construction; it approximates it,
-and where the two differ it is built to guess *high*, because every place an
-earlier version guessed low was a bypass: `<div/>` and `<div class=x/>` (HTML
+and it is *designed* to guess high — though getting that right took several
+attempts, and every place an earlier version guessed low was a bypass: `<div/>`
+and `<div class=x/>` (HTML
 ignores a trailing `/` on non-void elements), `<div title="></div>">` (a `>`
 inside a quoted attribute value ended the tag scan early, and the fake closer
 then reset the stack), `<b><i></b>` (the adoption agency algorithm re-opens
@@ -70,14 +71,25 @@ never ends, discarding the rest of the document). Each of these reached
 Turndown and threw after seconds of synchronous work. Over-estimating only
 costs one page its Markdown formatting; under-estimating is a stalled process,
 so the scanner treats a trailing `/` as self-closing only where the tokenizer
-would, and lets an end tag pop only past elements whose end tag was optional.
+would, and adds depth freely while removing it only under narrow conditions.
 
 It counts unknown elements too, since the HTML parser nests `<x-widget>` like
 anything else, and it applies HTML5's optional-end-tag rules — both on the
 start tags that imply them, including `</p>` before a block element, and on
-close tags, which pop past any implicitly-closed elements to reach their own
-match. Without the second half, `<ul><li>a<li>b</ul>` grew the stack by two
-per list and refused an ordinary minified page at under 5 KB.
+close tags, which pop past them to reach their own match. Without the second
+half, `<ul><li>a<li>b</ul>` grew the stack by two per list and refused an
+ordinary minified page at under 5 KB.
+
+Which elements those are is decided by measuring against the parser, not by
+reading the spec's "Optional tags" section: that section is authoring
+conformance, while tree construction is insertion-mode gated. `<optgroup>`,
+`<rt>` and `<rp>` appear there but nest like any other element outside
+`<select>` and `<ruby>`, and taking them on trust cost depth 1 for a tree
+nested 1,000 deep. Every element either rule can pop is now held against the
+real parser by a test. The same gap applies to raw text: "in select" ignores a
+`<style>` or `<title>` start tag outright, so the skip that drops a raw-text
+element's contents is disabled inside a `<select>` — otherwise it searched for
+a `</style>` that never comes and discarded the rest of the document.
 
 Inline `<svg>` and `<math>` are the one place a trailing `/` genuinely does
 self-close, and honouring it there is what keeps icon-heavy pages from being
@@ -110,11 +122,11 @@ Three operations *remove* work rather than adding it: the raw-text skip, which
 drops a whole element's contents, and the optional-end-tag rules and the
 foreign end-tag rule, which pop. The first two are HTML-only, and both are
 therefore gated on a count of open `<svg>`/`<math>` roots that is maintained
-symmetrically with the element stack — incremented at the push, decremented
-only when that same entry is popped — rather than on the per-element namespace
-flag; while that count is non-zero the optional-end-tag rules are disabled
-entirely. The third is foreign-only and is gated on the flag for the current
-node. The flag is deliberately
+symmetrically — incremented at the push, decremented only when that entry is
+popped or when a breakout tag returns it to HTML — rather than on the
+per-element namespace flag; while that count is non-zero the optional-end-tag
+rules are disabled entirely. The third is foreign-only and is gated on the flag
+for the current node. The flag is deliberately
 cleared on more tags than the spec requires, which is safe for deciding
 whether a trailing `/` self-closes because that only ever adds depth, but is
 exactly backwards for these. Each was a distinct unbounded bypass:

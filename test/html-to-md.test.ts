@@ -6,6 +6,7 @@ import {
   exceedsNestingDepth,
   exceedsRenderBudget,
   htmlToText,
+  DEPTH_REMOVING_ELEMENTS,
 } from '../src/lib/html-to-md.js';
 
 describe('pickArticle', () => {
@@ -472,6 +473,22 @@ describe('render budget bypasses', () => {
     ['</math> arriving inside annotation-xml', '<math><annotation-xml><p></math>'.repeat(1_000)],
     ['</svg> arriving after a breakout tag', '<svg><p><div></svg>'.repeat(1_000)],
     ['</svg> arriving after a void breakout tag', '<svg><br><div></svg>'.repeat(1_000)],
+    // The spec's "Optional tags" section is an authoring conformance list,
+    // not a parsing rule: outside `<select>` the parser nests `<optgroup>`
+    // like anything else, so treating it as implicitly closed reported depth
+    // 1 for a tree nested 1,000 deep.
+    ['optgroup treated as implicitly closed', '<optgroup>'.repeat(1_000)],
+    ['optgroup below the element cap', '<optgroup>'.repeat(49_000)],
+    // `rt`/`rp` genuinely nest outside `<ruby>`, so an end tag that matches
+    // nothing in reality must not pop through them.
+    ['an end tag popping through rp', '<rp></td><td>'.repeat(3_000)],
+    ['an end tag popping through rt', '<rt></tr><tr>'.repeat(3_000)],
+    ['an end tag popping through optgroup', '<optgroup></th><th>'.repeat(3_000)],
+    // "in select" ignores these start tags outright, so no raw text begins
+    // and the skip would swallow the rest of the document.
+    ['raw text suppressed by select', '<select><style></select><div>'.repeat(3_000)],
+    ['a title suppressed by select', '<select><title></select><div>'.repeat(3_000)],
+    ['a textarea suppressed by select', '<select><textarea></select><div>'.repeat(3_000)],
     ['sheer width rather than depth', '<b>x</b>'.repeat(200_000)],
   ])('refuses %s', (_label, html) => {
     const started = Date.now();
@@ -511,8 +528,26 @@ describe('render budget bypasses', () => {
     ['paragraphs omitting </p>', '<div><p>a<p>b</div>'.repeat(600)],
     ['a table with sections omitting end tags', '<table><thead><tr><th>h<tbody><tr><td>d</table>'.repeat(200)],
     ['a select omitting </option>', '<select><optgroup><option>a<option>b</select>'.repeat(300)],
+    // `<script>` really is processed inside a select, via "in head", so
+    // suppressing raw text there must not cost an ordinary page its markup.
+    ['a script following a select', '<select><option>a</select><script>var s="<div><div>";</script>'.repeat(300)],
+    ['ruby annotations', '<ruby>A<rp>(</rp><rt>a</rt><rp>)</rp></ruby>'.repeat(300)],
   ])('still renders %s through turndown', (_label, html) => {
     expect(exceedsRenderBudget(html as string)).toBe(false);
+  });
+
+  // An accepted over-count, recorded because the obvious fix is wrong. A
+  // breakout tag returns the parser to HTML, but `foreignOpen` is not
+  // decremented there, so an `<svg>` that broke out keeps the raw-text skip
+  // disabled for the rest of the document and a later `<script>` has its
+  // contents counted as markup. Draining the counter on breakout instead
+  // re-opens `<svg><font><title>` + any number of `<div>`, which is unbounded
+  // - the stickiness is the safety property, and costing a rare page its
+  // formatting is the cheaper side.
+  it('over-counts after a breakout rather than trusting the namespace', () => {
+    const html = `<svg><br><g></svg><script>var a="${'<div>'.repeat(600)}";</script>`;
+    expect(exceedsRenderBudget(html)).toBe(true);
+    expect(exceedsRenderBudget(`<script>var a="${'<div>'.repeat(600)}";</script>`)).toBe(false);
   });
 });
 
@@ -527,14 +562,16 @@ describe('render budget bypasses', () => {
 // formatting; guessing too shallow hands turndown a document that stalls the
 // process for minutes.
 describe('render budget differential search', () => {
+  const NAMES = [
+    'p', 'li', 'dt', 'dd', 'option', 'optgroup', 'tr', 'td', 'th', 'thead', 'tbody',
+    'tfoot', 'caption', 'colgroup', 'rt', 'rp', 'select', 'ruby', 'table', 'ul', 'dl',
+    'div', 'span', 'b', 'i', 'a', 'section', 'svg', 'math', 'g', 'mrow', 'mi', 'mtext',
+    'foreignObject', 'desc', 'title', 'annotation-xml', 'style', 'script', 'textarea',
+    'xmp', 'template', 'br', 'hr', 'img', 'font', 'embed', 'use', 'path', 'h2',
+  ];
   const TOKENS = [
-    '<svg>', '<math>', '</svg>', '</math>', '<g>', '<g/>', '<mrow>', '<title>',
-    '</title>', '<textarea>', '<style>', '<script>', '<font>', '<annotation-xml>',
-    '<foreignObject>', '<desc>', '<mtext>', '<mi>', '<div>', '<span>', '<b>',
-    '<p>', '<table>', '<template>', '<mglyph>', '<xmp>', '<br>', '<hr>', '<img>',
-    '<li>', '<td>', '<tr>', '<ul>', '<i>', '<a>', '<section>', '<path d="M0"/>',
-    '</div>', '</p>', '</b>', '</foreignObject>', '</desc>', '</mi>', '</g>',
-    '</li>', '</td>', '</ul>', '</table>', '</a>', '</span>',
+    ...NAMES.flatMap((n) => [`<${n}>`, `</${n}>`]),
+    '<g/>', '<div a=b/>', '<path d="M0"/>', '<b><i></b>', 'text ', '<!-->',
   ];
 
   it('never reports a document as safe when the real tree is not', () => {
@@ -575,5 +612,26 @@ describe('render budget differential search', () => {
       if (!exceedsRenderBudget(html) && realDepth(html) > 500) missed.push(unit);
     }
     expect(missed).toEqual([]);
+  });
+
+  // The check that would have caught every under-counting bug this guard has
+  // had, all of which were an element assumed to close implicitly that the
+  // parser actually nests. The spec's "Optional tags" section is authoring
+  // conformance and does not answer this; the parser does.
+  it('only ever pops elements the real parser closes implicitly', () => {
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const domino = require('@mixmark-io/domino') as {
+      createDocument: (html: string, force: boolean) => Document;
+    };
+    const nests: Array<[string, number]> = [];
+    for (const name of DEPTH_REMOVING_ELEMENTS) {
+      const doc = domino.createDocument(`<${name}>`.repeat(100), true);
+      let depth = 0;
+      for (let n = doc.body?.firstChild ?? null; n; n = n.firstChild) {
+        if (n.nodeType === 1) depth++;
+      }
+      if (depth > 2) nests.push([name, depth]);
+    }
+    expect(nests).toEqual([]);
   });
 });

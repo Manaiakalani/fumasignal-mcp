@@ -269,6 +269,13 @@ const VOID_ELEMENTS = new Set([
  * omits `</td>`/`</li>` - which is legal and common - would appear to nest
  * one level per row or item and trip the depth limit on a perfectly
  * innocent page.
+ *
+ * Membership is checked against the real parser, not against the spec's
+ * "Optional tags" section: that section is an *authoring conformance* list,
+ * while tree construction is insertion-mode gated. `<optgroup>` was taken
+ * from it and is wrong here - outside a `<select>` the parser nests
+ * `<optgroup>` like any other element, so 10 KB of them reported depth 1
+ * against a real depth of 1,000. See the test that measures every member.
  */
 const IMPLIED_END_TAGS = new Map<string, Set<string>>([
   ['p', new Set(['p'])],
@@ -276,7 +283,6 @@ const IMPLIED_END_TAGS = new Map<string, Set<string>>([
   ['dt', new Set(['dt', 'dd'])],
   ['dd', new Set(['dt', 'dd'])],
   ['option', new Set(['option'])],
-  ['optgroup', new Set(['option', 'optgroup'])],
   ['tr', new Set(['td', 'th', 'tr'])],
   ['td', new Set(['td', 'th'])],
   ['th', new Set(['td', 'th'])],
@@ -335,15 +341,18 @@ for (const tag of [
  * Without this, `</ul>` arriving with an `<li>` still open closed nothing, so
  * ordinary minified markup like `<ul><li>a<li>b</ul>` grew the stack by two
  * per list and tripped the limit at under 5 KB.
+ *
+ * Every member has to be an element the parser really does close implicitly:
+ * this pops, so a member that actually nests is an under-count. `rt`, `rp`
+ * and `optgroup` are on the spec's authoring list but nest outside `<ruby>`
+ * and `<select>`, and letting an unrelated `</td>` pop through them reported
+ * depth 3 for a tree nested 100 deep.
  */
 const OPTIONAL_END_TAGS = new Set([
   'li',
   'dt',
   'dd',
   'p',
-  'rt',
-  'rp',
-  'optgroup',
   'option',
   'caption',
   'colgroup',
@@ -356,12 +365,27 @@ const OPTIONAL_END_TAGS = new Set([
 ]);
 
 /**
+ * What `<optgroup>` closes, but only while a `<select>` is open - see the
+ * call site. Outside one it is an ordinary nesting element.
+ */
+const OPTGROUP_IMPLIED_ENDS = new Set(['option', 'optgroup']);
+
+/**
  * How far an end tag may look down the stack for its match. See the closing
  * branch of `scanElements` - this keeps an unmatched closer from rescanning a
  * long run on every occurrence.
  */
 const MAX_END_TAG_POP_SCAN = 64;
 
+/**
+ * Every element either of the rules above will pop. Exported so a test can
+ * hold each one against the real parser: all three under-counting bugs in
+ * this guard's history were a member that actually nests, and the spec's
+ * authoring list does not tell you which those are.
+ */
+export const DEPTH_REMOVING_ELEMENTS: readonly string[] = [
+  ...new Set([...OPTIONAL_END_TAGS, ...[...IMPLIED_END_TAGS.values()].flatMap((s) => [...s])]),
+];
 /**
  * Yield every `<tag ...>...</tag>` block in `html`, pairing each opening
  * tag with its *properly nested* closing tag.
@@ -783,19 +807,35 @@ function scanElements(
   // `open` so that leaving an HTML island - `</title>` inside `<svg>` -
   // restores foreign mode instead of losing it for the rest of the document.
   const foreign: boolean[] = [];
-  // How many `<svg>`/`<math>` roots are on `open` right now. Maintained
-  // symmetrically with the stack - incremented at the push, decremented only
-  // when that same entry is popped - so a closing tag that pops nothing can
-  // never drain it. That makes it safe to be the strict half of the split
-  // below: it can only ever over-state how much of the document is foreign.
+  // How many `<svg>`/`<math>` roots on `open` are *still flagged foreign*.
+  // Maintained symmetrically with the flags - incremented at the push,
+  // decremented when that entry is popped or when a breakout tag clears its
+  // flag - so a closing tag that pops nothing can never drain it. That makes
+  // it safe to be the strict half of the split below: it can only ever
+  // over-state how much of the document is foreign.
   let foreignOpen = 0;
+  // How many `<select>` elements are open. HTML5's "in select" insertion mode
+  // ignores most start tags outright, including the ones that would otherwise
+  // begin raw text, so the skip below has to be gated on this the same way.
+  let selectOpen = 0;
+  // How many times each name appears on `open`, so an end tag that matches
+  // nothing can skip the scan entirely instead of walking the stack.
+  const openCounts = new Map<string, number>();
   const emit = (chunk: string): void => {
     if (dropDepth === -1) onText?.(chunk);
   };
   const popOne = (): void => {
     const name = open.pop();
-    foreign.pop();
-    if (name !== undefined && FOREIGN_ROOTS.has(name) && foreignOpen > 0) foreignOpen--;
+    const wasForeign = foreign.pop();
+    if (name !== undefined) {
+      const n = openCounts.get(name);
+      if (n !== undefined) {
+        if (n <= 1) openCounts.delete(name);
+        else openCounts.set(name, n - 1);
+      }
+      if (wasForeign !== undefined && FOREIGN_ROOTS.has(name) && foreignOpen > 0) foreignOpen--;
+      if (name === 'select' && selectOpen > 0) selectOpen--;
+    }
     if (dropDepth !== -1 && open.length <= dropDepth) dropDepth = -1;
   };
 
@@ -882,22 +922,31 @@ function scanElements(
       // the parser closes implicitly. Anything else stops the search: for
       // mis-nested formatting elements the adoption agency re-opens them, so
       // `<b><i></b>` leaves a *deeper* tree than a pop-to-match stack would
-      // suggest, and assuming the shallower reading is what made it a bypass.
+      // suggest. That conservatism is weakened where the adoption agency's
+      // furthest block is itself an optional-end element, which raises the
+      // real depth of a shape like `<table><b><td></b>` to ~4 levels per unit
+      // against 1 counted - bounded, and well inside the limit, but no longer
+      // the margin the rest of this guard keeps.
       //
-      // The search is also windowed. Legal markup stacks a handful of these
-      // at most (`table > tbody > tr > td`), while an unmatched closer sitting
-      // below a long synthetic run would otherwise rescan it every time and
-      // pop nothing - 10 MB of that cost 2.5s against ~300ms for every other
-      // shape. Giving up early only leaves the stack deeper, which is the
-      // side to be wrong on.
+      // The search is also windowed, and skipped entirely when the name is not
+      // open at all. Legal markup stacks a handful of these at most
+      // (`table > tbody > tr > td`), while a closer sitting below a long
+      // synthetic run would otherwise rescan it every time and pop nothing.
+      // Giving up early only leaves the stack deeper, which is the side to be
+      // wrong on.
       let at = -1;
       const floor = Math.max(0, open.length - MAX_END_TAG_POP_SCAN);
-      for (let k = open.length - 1; k >= floor; k--) {
-        if (open[k] === name) {
-          at = k;
-          break;
+      if (openCounts.has(name)) {
+        for (let k = open.length - 1; k >= floor; k--) {
+          if (open[k] === name) {
+            at = k;
+            break;
+          }
+          if (!OPTIONAL_END_TAGS.has(open[k] as string)) {
+            // `<optgroup>` is only implicitly closed inside a `<select>`.
+            if (!(open[k] === 'optgroup' && selectOpen > 0)) break;
+          }
         }
-        if (!OPTIONAL_END_TAGS.has(open[k] as string)) break;
       }
       if (at !== -1) {
         while (open.length > at) popOne();
@@ -924,7 +973,15 @@ function scanElements(
     // tags, which pop. Those use the count of open foreign roots, which is
     // maintained symmetrically with the stack and so never opens either
     // shortcut on a guess.
-    if (foreignOpen === 0 && RAW_TEXT_ELEMENTS.has(name)) {
+    // HTML5's "in select" mode ignores a `<style>` or `<title>` start tag
+    // outright, so no raw text begins and the skip would swallow the rest of
+    // the document looking for a `</style>` that never comes -
+    // `<select><style></select><div>` reported depth 1 against a real 100.
+    // `<script>` and `<template>` really are processed there, via "in head",
+    // so they keep the skip and an ordinary select followed by a script is
+    // not downgraded.
+    const rawTextAllowed = selectOpen === 0 || name === 'script' || name === 'template';
+    if (foreignOpen === 0 && rawTextAllowed && RAW_TEXT_ELEMENTS.has(name)) {
       // Content is character data: it creates no nodes, must not be scanned
       // as markup, and is not part of the page's prose.
       const end = rawTextElementEnd(html, name, i);
@@ -953,6 +1010,12 @@ function scanElements(
         // than through `opensForeign` alone is what makes the void breakout
         // tags - `<br>`, `<hr>`, `<img>`, `<embed>`, `<meta>` - take effect,
         // since those never reach the push.
+        //
+        // `foreignOpen` is deliberately *not* decremented here. Letting a
+        // breakout drain it would re-enable the raw-text skip on a guess,
+        // which is exactly the `<svg><font><title>` bypass. The cost is that
+        // an unclosed or broken-out `<svg>` keeps the skip disabled for the
+        // rest of the document - an over-count, and the side to be wrong on.
         for (let k = open.length - 1; k >= 0 && foreign[k] === true; k--) foreign[k] = false;
         opensForeign = false;
       } else {
@@ -964,10 +1027,6 @@ function scanElements(
     }
 
     // Optional end tags resolve before the void check, so a void `<hr>` still
-    // closes an open `<p>`. They are an HTML-only rule: inside `<svg>`/
-    // `<math>` the stack must be left alone, since popping there would
-    // under-report depth.
-    // Optional end tags resolve before the void check, so a void `<hr>` still
     // closes an open `<p>`. This pops, so like the raw-text skip it uses the
     // strict signal: inside `<svg>`/`<math>` these HTML-only rules must not
     // fire, and `<svg><mi>` + `<td>` popped its way to depth 1 while the real
@@ -976,6 +1035,13 @@ function scanElements(
       const implied = IMPLIED_END_TAGS.get(name);
       if (implied) {
         while (open.length > 0 && implied.has(open[open.length - 1] as string)) popOne();
+      } else if (name === 'optgroup' && selectOpen > 0) {
+        // Only inside a `<select>`. Elsewhere the parser nests `<optgroup>`
+        // like any other element, and closing it implicitly there reported
+        // depth 1 for a tree nested 1,000 deep.
+        while (open.length > 0 && OPTGROUP_IMPLIED_ENDS.has(open[open.length - 1] as string)) {
+          popOne();
+        }
       }
     }
 
@@ -988,7 +1054,9 @@ function scanElements(
     if (dropDepth === -1 && DROPPED_SUBTREES.has(name)) dropDepth = open.length;
     open.push(name);
     foreign.push(opensForeign);
-    if (FOREIGN_ROOTS.has(name)) foreignOpen++;
+    openCounts.set(name, (openCounts.get(name) ?? 0) + 1);
+    if (opensForeign && FOREIGN_ROOTS.has(name)) foreignOpen++;
+    if (name === 'select') selectOpen++;
     if (open.length > maxDepth) return true;
   }
   return false;
