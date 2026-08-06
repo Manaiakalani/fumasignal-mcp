@@ -461,6 +461,17 @@ describe('render budget bypasses', () => {
     ['a void breakout tag inside svg', `<svg><br>${'<g/>'.repeat(1_500)}`],
     ['a void breakout tag inside math', `<math><img>${'<mrow/>'.repeat(1_500)}`],
     ['an element that merely looks void', '<brx>'.repeat(1_500)],
+    // HTML5 only applies the foreign end-tag rule while the current node is
+    // foreign. Inside an integration point or after a breakout tag the parser
+    // is back in HTML and ignores `</svg>` entirely, so honouring it there
+    // let each repeat leave a level behind.
+    ['</svg> arriving inside foreignObject', '<svg><foreignObject><div></svg>'.repeat(1_000)],
+    ['</svg> arriving inside desc', '<svg><desc><b></svg>'.repeat(1_000)],
+    ['</svg> arriving inside an svg title', '<svg><title><section></svg>'.repeat(1_000)],
+    ['</math> arriving inside mi', '<math><mi><div></math>'.repeat(1_000)],
+    ['</math> arriving inside annotation-xml', '<math><annotation-xml><p></math>'.repeat(1_000)],
+    ['</svg> arriving after a breakout tag', '<svg><p><div></svg>'.repeat(1_000)],
+    ['</svg> arriving after a void breakout tag', '<svg><br><div></svg>'.repeat(1_000)],
     ['sheer width rather than depth', '<b>x</b>'.repeat(200_000)],
   ])('refuses %s', (_label, html) => {
     const started = Date.now();
@@ -490,6 +501,16 @@ describe('render budget bypasses', () => {
     ['paragraphs closed by a heading', '<p>text<h2>head</h2>'.repeat(1_200)],
     // A tag name has to start with an ASCII letter, so these are text.
     ['digits and punctuation after "<"', '1<2 and a<_b and x<-y '.repeat(1_000)],
+    // Omitted end tags are legal and minifiers emit them deliberately. A
+    // closing tag has to pop past the elements the parser closes implicitly,
+    // or an ordinary list grows the stack by two per item: these are all
+    // 3-5 levels deep and used to be refused at under 6 KB.
+    ['a list omitting </li>', '<ul><li>a<li>b</ul>'.repeat(251)],
+    ['a table omitting </td>', '<table><tr><td>a<td>b</tr></table>'.repeat(167)],
+    ['a definition list omitting </dt>', '<dl><dt>a<dd>b</dl>'.repeat(300)],
+    ['paragraphs omitting </p>', '<div><p>a<p>b</div>'.repeat(600)],
+    ['a table with sections omitting end tags', '<table><thead><tr><th>h<tbody><tr><td>d</table>'.repeat(200)],
+    ['a select omitting </option>', '<select><optgroup><option>a<option>b</select>'.repeat(300)],
   ])('still renders %s through turndown', (_label, html) => {
     expect(exceedsRenderBudget(html as string)).toBe(false);
   });
@@ -497,24 +518,23 @@ describe('render budget bypasses', () => {
 
 // The tables above only ever test shapes someone already thought of, and
 // every round of this guard's history was a shape nobody had. This searches
-// instead: a short random run of namespace-transition tags, then one payload
-// tag repeated far past the limit. The oracle is the parser turndown actually
-// uses, so a disagreement is measured against the real tree rather than
-// against a second hand-written model.
+// instead: a short random unit of tags - openers, closers and namespace
+// transitions alike - repeated far past the limit. The oracle is the parser
+// turndown actually uses, so a disagreement is measured against the real tree
+// rather than against a second hand-written model.
 //
 // Only under-estimation is a bug. Guessing too deep costs a page its
 // formatting; guessing too shallow hands turndown a document that stalls the
 // process for minutes.
 describe('render budget differential search', () => {
-  const TRANSITIONS = [
+  const TOKENS = [
     '<svg>', '<math>', '</svg>', '</math>', '<g>', '<g/>', '<mrow>', '<title>',
     '</title>', '<textarea>', '<style>', '<script>', '<font>', '<annotation-xml>',
     '<foreignObject>', '<desc>', '<mtext>', '<mi>', '<div>', '<span>', '<b>',
     '<p>', '<table>', '<template>', '<mglyph>', '<xmp>', '<br>', '<hr>', '<img>',
-  ];
-  const PAYLOADS = [
-    '<div>', '<g/>', '<g a=b/>', '<div a=b/>', '<span/>', '<mrow/>', '<b><i></b>',
-    '<path d="M0"/>', '<p>', '<li>', '<td>', '<option>',
+    '<li>', '<td>', '<tr>', '<ul>', '<i>', '<a>', '<section>', '<path d="M0"/>',
+    '</div>', '</p>', '</b>', '</foreignObject>', '</desc>', '</mi>', '</g>',
+    '</li>', '</td>', '</ul>', '</table>', '</a>', '</span>',
   ];
 
   it('never reports a document as safe when the real tree is not', () => {
@@ -542,13 +562,17 @@ describe('render budget differential search', () => {
     const rnd = (): number => (seed = (seed * 1103515245 + 12345) & 0x7fffffff) / 0x7fffffff;
     const pick = <T,>(xs: readonly T[]): T => xs[Math.floor(rnd() * xs.length)] as T;
 
+    // The *whole* random unit repeats, closers included. An earlier version
+    // built a one-shot prefix and then repeated a single fixed token, which
+    // structurally cannot grow a stack that a closing tag mishandles - it
+    // reported clean while `<svg><foreignObject><div></svg>` was unbounded.
     const missed: string[] = [];
     for (let trial = 0; trial < 400; trial++) {
-      let prefix = '';
-      const runLength = 1 + Math.floor(rnd() * 4);
-      for (let k = 0; k < runLength; k++) prefix += pick(TRANSITIONS);
-      const html = prefix + pick(PAYLOADS).repeat(1_200);
-      if (!exceedsRenderBudget(html) && realDepth(html) > 500) missed.push(prefix);
+      let unit = '';
+      const unitLength = 2 + Math.floor(rnd() * 5);
+      for (let k = 0; k < unitLength; k++) unit += pick(TOKENS);
+      const html = unit.repeat(700);
+      if (!exceedsRenderBudget(html) && realDepth(html) > 500) missed.push(unit);
     }
     expect(missed).toEqual([]);
   });

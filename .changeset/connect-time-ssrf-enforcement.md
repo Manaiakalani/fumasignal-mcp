@@ -69,13 +69,15 @@ empties) and `<!-->` (an abrupt closing of an empty comment, read as one that
 never ends, discarding the rest of the document). Each of these reached
 Turndown and threw after seconds of synchronous work. Over-estimating only
 costs one page its Markdown formatting; under-estimating is a stalled process,
-so the scanner pops only an exact innermost match and treats a trailing `/` as
-self-closing only where the tokenizer would.
+so the scanner treats a trailing `/` as self-closing only where the tokenizer
+would, and lets an end tag pop only past elements whose end tag was optional.
 
 It counts unknown elements too, since the HTML parser nests `<x-widget>` like
-anything else, and it applies HTML5's optional-end-tag rules — including `</p>`
-before a block element — so ordinary markup that omits `</li>`, `</td>` or
-`</p>` is not mistaken for deep nesting.
+anything else, and it applies HTML5's optional-end-tag rules — both on the
+start tags that imply them, including `</p>` before a block element, and on
+close tags, which pop past any implicitly-closed elements to reach their own
+match. Without the second half, `<ul><li>a<li>b</ul>` grew the stack by two
+per list and refused an ordinary minified page at under 5 KB.
 
 Inline `<svg>` and `<math>` are the one place a trailing `/` genuinely does
 self-close, and honouring it there is what keeps icon-heavy pages from being
@@ -94,22 +96,28 @@ document the parser nests ~3,000 deep:
   open an element; the namespace change is applied to the elements already
   open rather than carried by the new one, which is what makes them count.
 - A `</svg>` follows HTML5's foreign end-tag rule and pops to the nearest
-  match. That rule is unambiguous — the adoption agency that makes popping
-  unsafe for HTML elements is not involved — so `<svg><g></svg>` returns to
-  HTML exactly, with no need to distrust later markup.
+  foreign match, but only while the current node is itself foreign. That
+  precondition is the whole rule: inside an integration point, or after a
+  breakout tag has already returned the parser to HTML, `</svg>` hits a
+  special element and is ignored. Honouring it unconditionally meant
+  `<svg><foreignObject><div></svg>` left a level behind on every repeat —
+  56 KB of it spent 19s in Turndown before throwing.
 - Which elements are foreign is tracked per open element rather than as a
   single depth, so leaving an HTML island — `</title>` inside `<svg>` —
   restores foreign content instead of losing it for the rest of the document.
 
-Two operations *remove* work rather than adding it: the raw-text skip, which
-drops a whole element's contents, and the optional-end-tag rules, which pop.
-Both are HTML-only, and both are therefore gated on a count of open
-`<svg>`/`<math>` roots that is maintained symmetrically with the element stack
-— incremented at the push, decremented only when that same entry is popped —
-rather than on the per-element namespace flag. The flag is deliberately
+Three operations *remove* work rather than adding it: the raw-text skip, which
+drops a whole element's contents, and the optional-end-tag rules and the
+foreign end-tag rule, which pop. The first two are HTML-only, and both are
+therefore gated on a count of open `<svg>`/`<math>` roots that is maintained
+symmetrically with the element stack — incremented at the push, decremented
+only when that same entry is popped — rather than on the per-element namespace
+flag; while that count is non-zero the optional-end-tag rules are disabled
+entirely. The third is foreign-only and is gated on the flag for the current
+node. The flag is deliberately
 cleared on more tags than the spec requires, which is safe for deciding
 whether a trailing `/` self-closes because that only ever adds depth, but is
-exactly backwards for these two. Each was a distinct unbounded bypass:
+exactly backwards for these. Each was a distinct unbounded bypass:
 `<svg><font><title>` followed by any number of `<div>` reported three
 elements, escaping the element cap as well as the depth cap, and `<svg><mi>`
 followed by `<td>` popped its way back to depth 1. Measured through

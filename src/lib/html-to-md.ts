@@ -327,6 +327,42 @@ for (const tag of [
 }
 
 /**
+ * Elements whose end tag HTML5 allows to be omitted. A closing tag may pop
+ * past these to reach its own match - that is what the parser does - but must
+ * not pop past anything else, because for formatting elements the adoption
+ * agency re-opens them and the real tree ends up *deeper*.
+ *
+ * Without this, `</ul>` arriving with an `<li>` still open closed nothing, so
+ * ordinary minified markup like `<ul><li>a<li>b</ul>` grew the stack by two
+ * per list and tripped the limit at under 5 KB.
+ */
+const OPTIONAL_END_TAGS = new Set([
+  'li',
+  'dt',
+  'dd',
+  'p',
+  'rt',
+  'rp',
+  'optgroup',
+  'option',
+  'caption',
+  'colgroup',
+  'thead',
+  'tbody',
+  'tfoot',
+  'tr',
+  'td',
+  'th',
+]);
+
+/**
+ * How far an end tag may look down the stack for its match. See the closing
+ * branch of `scanElements` - this keeps an unmatched closer from rescanning a
+ * long run on every occurrence.
+ */
+const MAX_END_TAG_POP_SCAN = 64;
+
+/**
  * Yield every `<tag ...>...</tag>` block in `html`, pairing each opening
  * tag with its *properly nested* closing tag.
  *
@@ -821,17 +857,17 @@ function scanElements(
     i = tag.end + 1;
 
     if (isClosing) {
-      // A foreign root's end tag is not ambiguous: HTML5 pops elements until
-      // it has popped one with this name, and the adoption agency that makes
-      // popping unsafe for HTML is not involved. Following that exactly keeps
-      // `<svg><g></svg>` from stranding the scanner in foreign content
-      // without the blunter alternative of distrusting every later `/`, which
-      // a single stray closer would have turned into a document-wide
-      // downgrade.
-      if (FOREIGN_ROOTS.has(name)) {
+      // HTML5's foreign end-tag rule pops to the nearest match, and unlike
+      // the HTML rule it is unambiguous - the adoption agency is not
+      // involved. But the spec applies it *only* while the current node is
+      // itself foreign. After an integration point or a breakout tag the
+      // parser is back in HTML, where `</svg>` hits a special element and is
+      // simply ignored; popping there instead let
+      // `<svg><foreignObject><div></svg>` repeat unboundedly.
+      if (FOREIGN_ROOTS.has(name) && open.length > 0 && foreign[open.length - 1] === true) {
         let at = -1;
         for (let k = open.length - 1; k >= 0; k--) {
-          if (open[k] === name) {
+          if (open[k] === name && foreign[k] === true) {
             at = k;
             break;
           }
@@ -841,12 +877,31 @@ function scanElements(
         }
         continue;
       }
-      // Only ever pop an exact match for the innermost element. Popping to a
-      // match deeper in the stack is what the parser does for ordinary
-      // elements, but for mis-nested formatting elements it re-opens them
-      // instead, so assuming the shallower reading is unsafe. Leaving the
-      // stack alone over-reports depth, which is the side to be wrong on.
-      if (open.length > 0 && open[open.length - 1] === name) popOne();
+      // An HTML end tag may close elements above its match, but only ones
+      // whose end tag was optional to begin with - those are exactly the ones
+      // the parser closes implicitly. Anything else stops the search: for
+      // mis-nested formatting elements the adoption agency re-opens them, so
+      // `<b><i></b>` leaves a *deeper* tree than a pop-to-match stack would
+      // suggest, and assuming the shallower reading is what made it a bypass.
+      //
+      // The search is also windowed. Legal markup stacks a handful of these
+      // at most (`table > tbody > tr > td`), while an unmatched closer sitting
+      // below a long synthetic run would otherwise rescan it every time and
+      // pop nothing - 10 MB of that cost 2.5s against ~300ms for every other
+      // shape. Giving up early only leaves the stack deeper, which is the
+      // side to be wrong on.
+      let at = -1;
+      const floor = Math.max(0, open.length - MAX_END_TAG_POP_SCAN);
+      for (let k = open.length - 1; k >= floor; k--) {
+        if (open[k] === name) {
+          at = k;
+          break;
+        }
+        if (!OPTIONAL_END_TAGS.has(open[k] as string)) break;
+      }
+      if (at !== -1) {
+        while (open.length > at) popOne();
+      }
       continue;
     }
 
