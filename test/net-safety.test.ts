@@ -3,6 +3,7 @@ import http from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { Agent, fetch as undiciFetch } from 'undici';
 import { RemoteFumadocsSource } from '../src/sources/remote.js';
+import { logger } from '../src/lib/logger.js';
 import {
   isPrivateOrReservedAddress,
   assertPublicResolution,
@@ -501,6 +502,38 @@ describe('DNS rebinding is closed at connect time', () => {
         await honest.close();
       }
     } finally {
+      await new Promise<void>((r) => server.close(() => r()));
+    }
+  });
+
+  // The hook itself is unit-tested above; this covers the *wiring*, which is
+  // what actually regressed. `createGuardedLookup` was being constructed
+  // without an `onBlocked`, so the single highest-signal security event this
+  // module can produce was silently discarded: undici reports the refusal to
+  // the caller as a bare `fetch failed` and nothing unwraps `err.cause`.
+  it('logs the refusal when a real source is rebound', async () => {
+    const server = http.createServer((_req, res) => res.end('INTERNAL-ONLY'));
+    await new Promise<void>((r) => server.listen(0, '127.0.0.1', () => r()));
+    const { port } = server.address() as AddressInfo;
+    const warn = vi.spyOn(logger, 'warn').mockImplementation((() => undefined) as never);
+    try {
+      let calls = 0;
+      const source = new RemoteFumadocsSource({
+        baseUrl: `http://docs.example.com:${port}`,
+        dnsLookup: async () => [{ address: ++calls === 1 ? '93.184.216.34' : '127.0.0.1' }],
+      });
+      await expect(source.getPage('/docs/x')).rejects.toThrow();
+
+      const logged = warn.mock.calls.find(
+        (args) => typeof args[1] === 'string' && args[1].includes('rebinding'),
+      );
+      expect(logged, 'a refused connection must leave an operator-visible record').toBeDefined();
+      expect(logged?.[0]).toMatchObject({
+        hostname: 'docs.example.com',
+        address: '127.0.0.1',
+      });
+    } finally {
+      warn.mockRestore();
       await new Promise<void>((r) => server.close(() => r()));
     }
   });

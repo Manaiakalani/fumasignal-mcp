@@ -38,7 +38,7 @@ export function htmlToMarkdown(html: string): string {
   const stripped = stripChrome(article);
   // Cheap O(n) pre-check, so the expensive parse is never reached with input
   // that would blow the stack or stall the loop.
-  if (exceedsNestingDepth(stripped, MAX_DOCUMENT_NESTING_DEPTH)) {
+  if (exceedsRenderBudget(stripped)) {
     return htmlToText(stripped);
   }
   return getTurndown().turndown(stripped).trim();
@@ -137,6 +137,59 @@ const MAX_BUFFERED_TAG_BLOCKS = 50_000;
  */
 const MAX_DOCUMENT_NESTING_DEPTH = 500;
 
+/**
+ * Ceiling on how many elements may be handed to Turndown. Depth is not the
+ * only way to make the parse expensive: a flat document never recurses, but
+ * 100k siblings still cost ~3.7s and ~195MB, and the whole DOM is built
+ * before Turndown's `remove()` list can discard any of it. 50k measures at
+ * ~600ms/~97MB, which is the most we are willing to spend on one page.
+ */
+const MAX_DOCUMENT_ELEMENT_COUNT = 50_000;
+
+/**
+ * Ceiling on {@link htmlToText} output, so the fallback for a document we
+ * already deemed abusive cannot itself grow without bound.
+ */
+const MAX_TEXT_OUTPUT_CHARS = 2_000_000;
+
+/**
+ * Elements whose content is not markup, so nothing inside them becomes a
+ * node and nothing inside them may be scanned as if it were.
+ */
+const RAW_TEXT_ELEMENTS = new Set(['script', 'style', 'textarea', 'title']);
+
+/**
+ * Elements Turndown drops wholesale (see {@link getTurndown}). Their content
+ * still *parses* into nodes, so they count towards the limits, but their text
+ * must not surface in the {@link htmlToText} fallback or the two paths would
+ * disagree about what the page says.
+ */
+const DROPPED_SUBTREES = new Set(['script', 'style', 'noscript', 'iframe']);
+
+/**
+ * Elements that switch the parser into foreign content, where - unlike in
+ * HTML - a trailing `/` really does self-close a tag. Inline `<svg>` icons
+ * are everywhere in documentation, and refusing to honour `<path/>` there
+ * would count one wasted level per icon and degrade ordinary pages.
+ */
+const FOREIGN_ROOTS = new Set(['svg', 'math']);
+
+/**
+ * Points inside foreign content where HTML parsing resumes. Seeing one drops
+ * us back to the strict HTML reading (a trailing `/` is ignored again), so
+ * `<foreignObject><div/>...` cannot be talked out of counting its nesting.
+ */
+const HTML_INTEGRATION_POINTS = new Set([
+  'foreignobject',
+  'annotation-xml',
+  'desc',
+  'mtext',
+  'mi',
+  'mo',
+  'mn',
+  'ms',
+]);
+
 /** Elements that never have children, so they must not push a level. */
 const VOID_ELEMENTS = new Set([
   'area',
@@ -176,6 +229,47 @@ const IMPLIED_END_TAGS = new Map<string, Set<string>>([
   ['tbody', new Set(['td', 'th', 'tr', 'thead', 'tbody'])],
   ['tfoot', new Set(['td', 'th', 'tr', 'thead', 'tbody'])],
 ]);
+
+/**
+ * `</p>` is optional before any of these, so `<p>intro<div>...` closes the
+ * paragraph rather than nesting inside it. Counting it as nesting inflates
+ * an ordinary page by one level per paragraph.
+ */
+for (const tag of [
+  'address',
+  'article',
+  'aside',
+  'blockquote',
+  'details',
+  'div',
+  'dl',
+  'fieldset',
+  'figcaption',
+  'figure',
+  'footer',
+  'form',
+  'h1',
+  'h2',
+  'h3',
+  'h4',
+  'h5',
+  'h6',
+  'header',
+  'hgroup',
+  'hr',
+  'main',
+  'menu',
+  'nav',
+  'ol',
+  'pre',
+  'section',
+  'table',
+  'ul',
+]) {
+  const closes = IMPLIED_END_TAGS.get(tag);
+  if (closes) closes.add('p');
+  else IMPLIED_END_TAGS.set(tag, new Set(['p']));
+}
 
 /**
  * Yield every `<tag ...>...</tag>` block in `html`, pairing each opening
@@ -424,10 +518,83 @@ function isNameChar(code: number): boolean {
   );
 }
 
+/** A tag name must begin with an ASCII letter; `<2`, `<-` and `<_` do not. */
+function isNameStartChar(code: number): boolean {
+  return (code >= 97 && code <= 122) || (code >= 65 && code <= 90);
+}
+
+/** Characters that terminate a tag name: whitespace, `/`, or `>`. */
+function isNameBoundary(code: number): boolean {
+  return (
+    code === 62 || // >
+    code === 47 || // /
+    code === 32 ||
+    code === 9 ||
+    code === 10 ||
+    code === 12 ||
+    code === 13
+  );
+}
+
+function isSpaceCode(code: number): boolean {
+  return code === 32 || code === 9 || code === 10 || code === 12 || code === 13;
+}
+
 /**
- * End of a raw-text element (`<script>`/`<style>`), whose contents are not
- * markup and must not be scanned as if they were. Returns the index just
- * past the closing tag, or -1 when it never closes.
+ * Index of the `>` that ends the tag whose name ended at `from`, or -1 when
+ * the tag never ends.
+ *
+ * This walks attributes the way the tokenizer does instead of reaching for
+ * the next `>`, because a quoted attribute value may contain one:
+ * `<div title="></div>">` is a single tag, and stopping at the inner `>`
+ * leaves `</div>">` to be rescanned as markup - which both invents a closing
+ * tag that resets the depth stack and spills the attribute's text into the
+ * {@link htmlToText} output. Quotes only open a value straight after `=`, so
+ * an unquoted `x=a"b` cannot swallow the rest of the document either.
+ */
+function tagEnd(html: string, from: number): number {
+  let i = from;
+  while (i < html.length) {
+    while (i < html.length && isSpaceCode(html.charCodeAt(i))) i++;
+    if (i >= html.length) return -1;
+    const c = html.charCodeAt(i);
+    if (c === 62) return i; // >
+    if (c === 47) {
+      i++; // stray '/' between attributes
+      continue;
+    }
+    // Attribute name.
+    while (i < html.length) {
+      const n = html.charCodeAt(i);
+      if (n === 61 || n === 62 || n === 47 || isSpaceCode(n)) break;
+      i++;
+    }
+    while (i < html.length && isSpaceCode(html.charCodeAt(i))) i++;
+    if (i >= html.length) return -1;
+    if (html.charCodeAt(i) !== 61) continue; // no '=': valueless attribute
+    i++; // past '='
+    while (i < html.length && isSpaceCode(html.charCodeAt(i))) i++;
+    if (i >= html.length) return -1;
+    const quote = html.charCodeAt(i);
+    if (quote === 34 || quote === 39) {
+      const close = html.indexOf(String.fromCharCode(quote), i + 1);
+      if (close === -1) return -1; // value never closes, so the tag never does
+      i = close + 1;
+      continue;
+    }
+    while (i < html.length) {
+      const v = html.charCodeAt(i);
+      if (v === 62 || isSpaceCode(v)) break;
+      i++;
+    }
+  }
+  return -1;
+}
+
+/**
+ * End of a raw-text element (`<script>`/`<style>`/`<textarea>`/`<title>`),
+ * whose contents are not markup and must not be scanned as if they were.
+ * Returns the index just past the closing tag, or -1 when it never closes.
  */
 function rawTextElementEnd(html: string, name: string, from: number): number {
   let cursor = from;
@@ -443,7 +610,12 @@ function rawTextElementEnd(html: string, name: string, from: number): number {
       i++;
       matched++;
     }
-    if (matched === name.length) {
+    // The name only closes the element when a boundary follows it, so
+    // `</script-x>` leaves `<script>` open exactly as the tokenizer does.
+    if (
+      matched === name.length &&
+      (i >= html.length || isNameBoundary(html.charCodeAt(i)))
+    ) {
       const gt = html.indexOf('>', i);
       return gt === -1 ? -1 : gt + 1;
     }
@@ -452,9 +624,9 @@ function rawTextElementEnd(html: string, name: string, from: number): number {
 }
 
 /**
- * Walk `html` once, calling `onText` with each run of character data and
- * tracking element nesting depth. Returns true if `limit` was ever
- * exceeded, stopping early when it is.
+ * Walk `html` once, calling `onText` with each run of character data while
+ * tracking element nesting depth and element count. Returns true as soon as
+ * either limit is exceeded, stopping there.
  *
  * Deliberately a hand-rolled scanner rather than a parse: it is O(n) in the
  * input with no backtracking, allocates only the open-element stack, and is
@@ -462,23 +634,65 @@ function rawTextElementEnd(html: string, name: string, from: number): number {
  * Unknown elements count towards depth, because the HTML parser nests them
  * like any other - a limit that only knew about known tag names would miss
  * `<x-a><x-a>...` entirely.
+ *
+ * It is a deliberately *conservative approximation*, and the direction of the
+ * error is the whole point: it may report more depth than the DOM will really
+ * have, never less. An earlier version tried to mirror HTML5 tree
+ * construction, and every place it guessed low was a bypass - `<div/>` (HTML
+ * ignores self-closing on non-void elements), `<div title=">">` (a `>` inside
+ * a quoted value ended the tag early), `<b><i></b>` (the adoption agency
+ * algorithm re-opens formatting elements, so the real tree gets *deeper*
+ * while a pop-to-match stack empties) and `<!-->` (an abrupt closing of an
+ * empty comment, read as one that never ends). Each let a document nesting
+ * thousands deep slip past a limit of 500. Over-reporting only costs one page
+ * its Markdown formatting; under-reporting hands this process a multi-second
+ * synchronous stall or a `RangeError`.
  */
 function scanElements(
   html: string,
-  limit: number,
+  maxDepth: number,
+  maxElements: number,
   onText?: (chunk: string) => void,
 ): boolean {
   const open: string[] = [];
+  let elements = 0;
+  // Stack height at which the nearest Turndown-dropped ancestor opened, or
+  // -1 when there is none.
+  let dropDepth = -1;
+  // Stack height at which the nearest `<svg>`/`<math>` opened, or -1 when
+  // ordinary HTML rules apply.
+  let foreignDepth = -1;
+  const emit = (chunk: string): void => {
+    if (dropDepth === -1) onText?.(chunk);
+  };
+  const popOne = (): void => {
+    open.pop();
+    if (dropDepth !== -1 && open.length <= dropDepth) dropDepth = -1;
+    if (foreignDepth !== -1 && open.length <= foreignDepth) foreignDepth = -1;
+  };
+
   let i = 0;
   while (i < html.length) {
     const lt = html.indexOf('<', i);
     if (lt === -1) {
-      onText?.(html.slice(i));
+      emit(html.slice(i));
       break;
     }
-    if (lt > i) onText?.(html.slice(i, lt));
+    if (lt > i) emit(html.slice(i, lt));
 
     if (html.startsWith('<!--', lt)) {
+      // `<!-->` and `<!--->` are complete comments ("abrupt closing of empty
+      // comment"), not the start of one that never ends. Reading them as
+      // unterminated swallows the rest of the document, and everything the
+      // scanner then fails to see is depth it fails to count.
+      if (html.startsWith('<!-->', lt)) {
+        i = lt + 5;
+        continue;
+      }
+      if (html.startsWith('<!--->', lt)) {
+        i = lt + 6;
+        continue;
+      }
       const end = html.indexOf('-->', lt + 4);
       i = end === -1 ? html.length : end + 3;
       continue;
@@ -492,41 +706,74 @@ function scanElements(
 
     const isClosing = html.charCodeAt(lt + 1) === 47; // '/'
     const nameStart = lt + (isClosing ? 2 : 1);
-    let nameEnd = nameStart;
-    while (nameEnd < html.length && isNameChar(html.charCodeAt(nameEnd))) nameEnd++;
-    if (nameEnd === nameStart) {
-      // A bare '<' that starts no tag is literal text.
-      onText?.('<');
+    if (!isNameStartChar(html.charCodeAt(nameStart))) {
+      // HTML5 only opens a tag when an ASCII letter follows the `<`, so
+      // `1<2` keeps its text and `<1>` is not an element. An end tag that
+      // starts with anything else is a bogus comment: consumed to the next
+      // `>` rather than emitted as text.
+      if (isClosing) {
+        const end = html.indexOf('>', nameStart);
+        i = end === -1 ? html.length : end + 1;
+        continue;
+      }
+      emit('<');
       i = lt + 1;
       continue;
     }
-    const gt = html.indexOf('>', nameEnd);
+    let nameEnd = nameStart;
+    while (nameEnd < html.length && isNameChar(html.charCodeAt(nameEnd))) nameEnd++;
+    const gt = tagEnd(html, nameEnd);
     if (gt === -1) break; // unterminated tag: nothing further is markup
     const name = html.slice(nameStart, nameEnd).toLowerCase();
-    const selfClosing = html.charCodeAt(gt - 1) === 47; // '/'
     i = gt + 1;
 
     if (isClosing) {
-      // Pop to the nearest matching opener, discarding anything left
-      // stranded inside it. An unmatched closer is ignored, which is what
-      // the HTML parser does too.
-      const at = open.lastIndexOf(name);
-      if (at !== -1) open.length = at;
+      // Only ever pop an exact match for the innermost element. Popping to a
+      // match deeper in the stack is what the parser does for ordinary
+      // elements, but for mis-nested formatting elements it re-opens them
+      // instead, so assuming the shallower reading is unsafe. Leaving the
+      // stack alone over-reports depth, which is the side to be wrong on.
+      if (open.length > 0 && open[open.length - 1] === name) popOne();
       continue;
     }
-    if (name === 'script' || name === 'style') {
+
+    elements++;
+    if (elements > maxElements) return true;
+
+    if (RAW_TEXT_ELEMENTS.has(name)) {
+      // Content is character data: it creates no nodes, must not be scanned
+      // as markup, and is not part of the page's prose.
       const end = rawTextElementEnd(html, name, i);
       i = end === -1 ? html.length : end;
       continue;
     }
-    if (selfClosing || VOID_ELEMENTS.has(name)) continue;
 
-    const implied = IMPLIED_END_TAGS.get(name);
-    if (implied) {
-      while (open.length > 0 && implied.has(open[open.length - 1] as string)) open.pop();
+    // Optional end tags resolve first, so a void `<hr>` still closes an open
+    // `<p>`. They are an HTML-only rule: inside `<svg>`/`<math>` the stack
+    // must be left alone, since popping there would under-report depth.
+    if (foreignDepth === -1) {
+      const implied = IMPLIED_END_TAGS.get(name);
+      if (implied) {
+        while (open.length > 0 && implied.has(open[open.length - 1] as string)) popOne();
+      }
     }
+
+    // A `/` before the `>` is ignored on ordinary HTML elements, so `<div/>`
+    // opens a `<div>` like any other. Only genuinely void elements stay
+    // flat - and, inside `<svg>`/`<math>`, genuinely self-closed ones.
+    if (VOID_ELEMENTS.has(name)) continue;
+    if (foreignDepth !== -1) {
+      if (HTML_INTEGRATION_POINTS.has(name)) {
+        foreignDepth = -1; // HTML resumes here; back to the strict reading
+      } else if (html.charCodeAt(gt - 1) === 47) {
+        continue; // `<path/>` really is self-closing in foreign content
+      }
+    } else if (FOREIGN_ROOTS.has(name)) {
+      foreignDepth = open.length;
+    }
+    if (dropDepth === -1 && DROPPED_SUBTREES.has(name)) dropDepth = open.length;
     open.push(name);
-    if (open.length > limit) return true;
+    if (open.length > maxDepth) return true;
   }
   return false;
 }
@@ -537,7 +784,16 @@ function scanElements(
  * `<td>`, stray `<`) that must *not* trip it.
  */
 export function exceedsNestingDepth(html: string, limit: number): boolean {
-  return scanElements(html, limit);
+  return scanElements(html, limit, Number.POSITIVE_INFINITY);
+}
+
+/**
+ * True when `html` is too deep or too large to hand to Turndown. Both limits
+ * matter: depth becomes call-stack depth in Turndown's recursive walk, and
+ * sheer element count becomes parse time and heap before Turndown runs at all.
+ */
+export function exceedsRenderBudget(html: string): boolean {
+  return scanElements(html, MAX_DOCUMENT_NESTING_DEPTH, MAX_DOCUMENT_ELEMENT_COUNT);
 }
 
 const NAMED_ENTITIES = new Map<string, string>([
@@ -558,10 +814,18 @@ const NAMED_ENTITIES = new Map<string, string>([
  * better.
  */
 export function htmlToText(html: string): string {
-  const parts: string[] = [];
-  scanElements(html, Number.POSITIVE_INFINITY, (chunk) => parts.push(chunk));
-  return parts
-    .join(' ')
+  // Accumulated as one rope rather than an array of fragments: a document
+  // that reaches this path is already adversarial, and `<b>x</b>` repeated a
+  // million times would otherwise cost far more in per-string overhead than
+  // in text. The cap bounds the fallback for a page we have already judged
+  // abusive.
+  let out = '';
+  scanElements(html, Number.POSITIVE_INFINITY, Number.POSITIVE_INFINITY, (chunk) => {
+    if (out.length >= MAX_TEXT_OUTPUT_CHARS) return;
+    out = out.length === 0 ? chunk : `${out} ${chunk}`;
+  });
+  return out
+    .slice(0, MAX_TEXT_OUTPUT_CHARS)
     .replace(/&(?:amp|lt|gt|quot|#39|apos|nbsp);/g, (m) => NAMED_ENTITIES.get(m) ?? m)
     .replace(/\s+/g, ' ')
     .trim();

@@ -429,10 +429,11 @@ export function createGuardedLookup(
         ? hostname.slice(1, -1)
         : hostname;
 
-    // A literal IP never had a DNS step, so there is nothing to rebind;
-    // it was already judged by the pre-flight check (and by the URL
-    // validation before that). Hand it straight back so loopback dev
-    // URLs keep working exactly as they do today.
+    // A literal IP never had a DNS step, so there is nothing to rebind and
+    // nothing for this guard to re-check - `assertPublicResolution` returns
+    // early for literals too, rather than judging them. Naming one on the
+    // command line is an explicit, unfiltered choice by the operator, and
+    // that carve-out is what keeps loopback dev URLs working.
     if (net.isIP(bareHost) !== 0) {
       const family = net.isIP(bareHost);
       callback(null, options.all === true ? [{ address: bareHost, family }] : bareHost, family);
@@ -495,9 +496,11 @@ export function createGuardedLookup(
 
 /**
  * Undici surfaces a connector error to the caller wrapped in a generic
- * "fetch failed", keeping only `err.cause`. Giving these a DNS-shaped
- * `code` means the reason still reads correctly there instead of being
- * mistaken for a transport fault.
+ * "fetch failed", keeping only `err.cause`. Giving these a DNS-shaped `code`
+ * means the reason still reads correctly *at that boundary* - but nothing
+ * between here and the MCP client unwraps `cause`, so the operator-visible
+ * record of a refusal is the `onBlocked` log wired up in remote.ts, not this
+ * message.
  */
 function enoent(message: string): NodeJS.ErrnoException {
   const err: NodeJS.ErrnoException = new Error(message);

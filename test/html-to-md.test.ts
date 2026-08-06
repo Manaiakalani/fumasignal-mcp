@@ -4,6 +4,7 @@ import {
   pickArticle,
   stripChrome,
   exceedsNestingDepth,
+  exceedsRenderBudget,
   htmlToText,
 } from '../src/lib/html-to-md.js';
 
@@ -374,5 +375,96 @@ describe('htmlToText', () => {
 
   it('ignores comments and doctype', () => {
     expect(htmlToText('<!doctype html><!-- note --><p>body</p>')).toBe('body');
+  });
+
+  it('treats <!--> as a closed comment, not one that runs to EOF', () => {
+    expect(htmlToText(`<!-->${'<p>body</p>'}`)).toBe('body');
+    expect(htmlToText(`<!--->${'<p>body</p>'}`)).toBe('body');
+  });
+
+  // The tag scanner used to stop at the first '>', so everything after a '>'
+  // inside a quoted attribute value was re-read as character data.
+  it('does not spill attribute values into the text', () => {
+    expect(htmlToText('<div title="></div>SECRET">visible</div>')).toBe('visible');
+    expect(htmlToText('<p data-x="a > b">text</p>')).toBe('text');
+  });
+
+  it('only ends a raw-text element on a real end tag', () => {
+    expect(htmlToText('<p>keep</p><script>a</script-x>DROP</script><p>after</p>')).toBe(
+      'keep after',
+    );
+  });
+
+  // Turndown drops these outright, so the fallback has to agree or the two
+  // paths would report different page content.
+  it.each([
+    ['noscript', '<p>keep</p><noscript><p>hidden</p></noscript>'],
+    ['iframe', '<p>keep</p><iframe><p>framed</p></iframe>'],
+    ['style', '<style>.a{color:red}</style><p>keep</p>'],
+  ])('drops %s content the way turndown does', (_label, html) => {
+    expect(htmlToText(html as string)).toBe('keep');
+  });
+
+  it('keeps text after a "<" that starts no tag', () => {
+    // HTML5 needs an ASCII letter after `<`; treating `<2` as a tag name
+    // silently dropped everything that followed it.
+    expect(htmlToText('a < b and 1<2')).toContain('2');
+    expect(htmlToText('<p>1<2 and 3<4</p>')).toContain('4');
+  });
+
+  it('stays linear on unmatched closing tags', () => {
+    // Previously popped with lastIndexOf, which is O(n^2) when nothing matches.
+    const started = Date.now();
+    expect(htmlToText(`${'<div>'.repeat(100_000)}x${'</span>'.repeat(100_000)}`)).toBe('x');
+    expect(Date.now() - started).toBeLessThan(5_000);
+  });
+
+  it('bounds its own output', () => {
+    const out = htmlToText('<b>xxxxxxxx</b>'.repeat(600_000));
+    expect(out.length).toBeLessThanOrEqual(2_000_000);
+  });
+});
+
+// Every one of these nests far deeper than the limit, yet an earlier version
+// of the scanner reported them as shallow because it tried to reproduce HTML5
+// tree construction and guessed low. A guard may over-report depth; guessing
+// low is a bypass, and each of these reached turndown and threw RangeError
+// after seconds of synchronous work.
+describe('render budget bypasses', () => {
+  it.each([
+    ['self-closing on a non-void element', '<div/>'.repeat(1_500)],
+    ['a trailing "/" in an unquoted attribute value', '<div class=x/>'.repeat(1_500)],
+    ['">" inside a quoted attribute value', '<div title="></div>">'.repeat(1_500)],
+    ["'>' inside a single-quoted attribute value", "<div title='></div>'>".repeat(1_500)],
+    ['unquoted attribute holding a quote', '<div x=a">'.repeat(1_500)],
+    ['mis-nested formatting elements', '<b><i></b>'.repeat(5_000)],
+    ['an end tag blocked by a special element', '<b><div></b>'.repeat(3_000)],
+    ['abrupt closing of an empty comment', `<!-->${'<div>'.repeat(1_500)}`],
+    ['self-closing abused via foreignObject', `<svg>${'<foreignObject><div/>'.repeat(1_500)}`],
+    ['an element that merely looks void', '<brx>'.repeat(1_500)],
+    ['sheer width rather than depth', '<b>x</b>'.repeat(200_000)],
+  ])('refuses %s', (_label, html) => {
+    const started = Date.now();
+    expect(exceedsRenderBudget(html as string)).toBe(true);
+    expect(() => htmlToMarkdown(html as string)).not.toThrow();
+    expect(Date.now() - started).toBeLessThan(5_000);
+  });
+
+  // Inline SVG is everywhere in documentation. In foreign content a trailing
+  // '/' really does self-close, so refusing to honour it there would burn a
+  // level per icon and downgrade ordinary pages to plain text.
+  it.each([
+    ['inline svg icons', `<div>${'<svg><circle/><path/></svg>'.repeat(300)}</div>`],
+    ['svg with attributes', `<div>${'<svg viewBox="0 0 24 24"><path d="M0 0"/></svg>'.repeat(300)}</div>`],
+    ['mathml', `<div>${'<math><mi>x</mi><mo>+</mo></math>'.repeat(300)}</div>`],
+    ['stray closing tags', '<div>a</span></p></b>b</div>'.repeat(500)],
+    ['">" inside an attribute on a normal page', '<div title="a > b">ok</div>'.repeat(500)],
+    // `</p>` is optional before a block element, so this is 2 levels, not 2400.
+    ['paragraphs closed by a block element', '<p>text<div>more</div>'.repeat(1_200)],
+    ['paragraphs closed by a heading', '<p>text<h2>head</h2>'.repeat(1_200)],
+    // A tag name has to start with an ASCII letter, so these are text.
+    ['digits and punctuation after "<"', '1<2 and a<_b and x<-y '.repeat(1_000)],
+  ])('still renders %s through turndown', (_label, html) => {
+    expect(exceedsRenderBudget(html as string)).toBe(false);
   });
 });

@@ -288,7 +288,25 @@ export class RemoteFumadocsSource implements FumadocsSource {
     this.dispatcher =
       opts.fetchImpl === undefined
         ? new Agent({
-            connect: { lookup: createGuardedLookup(this.dnsLookup, this.fetchTimeoutMs) },
+            connect: {
+              lookup: createGuardedLookup(
+                this.dnsLookup,
+                this.fetchTimeoutMs,
+                (hostname, address) => {
+                  // The highest-signal security event this module can raise:
+                  // a host that passed the pre-flight check resolved to an
+                  // internal address by the time we connected. undici
+                  // surfaces the refusal to the caller as a generic
+                  // `fetch failed` with the reason buried in `err.cause`, so
+                  // without this line a rebinding attempt is
+                  // indistinguishable from a transient network fault.
+                  logger.warn(
+                    { hostname, address, source: this.label },
+                    'remote: refused connection to a private address (possible DNS rebinding)',
+                  );
+                },
+              ),
+            },
           })
         : undefined;
     const ttl = opts.cacheTtlMs ?? 5 * 60 * 1000;

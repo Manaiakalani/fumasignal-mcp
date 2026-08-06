@@ -51,14 +51,46 @@ stalls every other request the process is serving. A `try/catch` would not help,
 since the stall is paid before the throw.
 
 `htmlToMarkdown()` now runs a linear pre-check and refuses to parse anything
-nested deeper than 500 levels, falling back to a plain-text extraction that keeps
-the page's prose. The same 100,000-level document now completes in **23 ms**. The
-check counts unknown elements too, since the HTML parser nests `<x-widget>` like
-anything else, and it implements HTML5's optional-end-tag rules so that ordinary
-markup which omits `</li>`, `</td>` or `</p>` is not mistaken for deep nesting.
+nested deeper than 500 levels or holding more than 50,000 elements, falling back
+to a plain-text extraction that keeps the page's prose. The same 100,000-level
+document now completes in **67 ms**. The element cap closes the other half of
+the same problem: 200,000 sibling elements are flat, so they never threaten the
+stack, but they still cost ~15 s and ~750 MB to parse — they are now refused in
+46 ms.
 
-Verified behaviour-preserving: 200,000 randomly generated documents and three
-real pages produce byte-identical output to the previous implementation.
+The pre-check deliberately *over*-estimates depth instead of reproducing HTML5
+tree construction, because every place an earlier version guessed low was a
+bypass: `<div/>` and `<div class=x/>` (HTML ignores a trailing `/` on non-void
+elements), `<div title="></div>">` (a `>` inside a quoted attribute value ended
+the tag scan early, and the fake closer then reset the stack), `<b><i></b>` (the
+adoption agency algorithm re-opens formatting elements, so the real tree gets
+*deeper* while a pop-to-match stack empties) and `<!-->` (an abrupt closing of
+an empty comment, read as one that never ends, discarding the rest of the
+document). Each of these reached Turndown and threw after seconds of
+synchronous work. Over-estimating only costs one page its Markdown formatting;
+under-estimating is a stalled process, so the scanner now pops only an exact
+innermost match and never honours a self-closing marker it is not certain of.
+
+It counts unknown elements too, since the HTML parser nests `<x-widget>` like
+anything else, and it applies HTML5's optional-end-tag rules — including `</p>`
+before a block element — so ordinary markup that omits `</li>`, `</td>` or
+`</p>` is not mistaken for deep nesting. Inline `<svg>` and `<math>` keep the
+foreign-content rule, where a trailing `/` genuinely does self-close, so
+icon-heavy pages are not downgraded.
+
+The plain-text fallback is bounded as well, and no longer spills attribute
+values into the text, mistakes `</script-x>` for the end of a `<script>`, keeps
+`<noscript>`/`<iframe>` bodies that Turndown discards, or degrades
+quadratically on unmatched closing tags (100,000 of them: 3 s → 17 ms).
+
+**A refused connection is now logged** with the hostname and the address it
+resolved to. undici reports the refusal to the caller as a generic
+`fetch failed` with the reason buried in `err.cause`, and nothing unwraps it, so
+this log is the only operator-visible signal that a rebinding attempt was
+stopped.
+
+Verified behaviour-preserving: 300,000 randomly generated documents and real
+pages produce byte-identical output to the previous implementation.
 
 Also documents the one case the guard cannot decide on its own: operator-specific
 NAT64 prefixes, which are indistinguishable from public addresses without knowing
