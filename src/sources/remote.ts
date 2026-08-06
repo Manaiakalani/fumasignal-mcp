@@ -40,7 +40,15 @@ export interface RemoteSourceOptions {
   authHeader?: string;
   /** TTL for fetched pages and sitemap. Default 5 min. */
   cacheTtlMs?: number;
-  /** Override fetch (used by tests). */
+  /**
+   * Override fetch (used by tests).
+   *
+   * Supplying this **disables connect-time SSRF enforcement**: the guarded
+   * dispatcher is only attached to the transport this class builds itself,
+   * so an injected transport - including `globalThis.fetch` - is trusted to
+   * enforce the address policy itself. The shipped CLI never sets this; it
+   * exists so tests can run without sockets.
+   */
   fetchImpl?: typeof fetch;
   userAgent?: string;
   /** Per-request fetch timeout in ms. Default 15s. */

@@ -22,10 +22,25 @@ const STRIP_TAGS = ['nav', 'aside', 'header', 'footer', 'script', 'style', 'nosc
  * Best-effort extraction of the main article HTML from a Fumadocs (or any)
  * documentation page. We pick the largest <article> or <main>, then strip
  * navigation / sidebar chrome, then convert to Markdown.
+ *
+ * Deeply nested input skips Turndown entirely. Turndown parses to a DOM and
+ * walks it recursively, so nesting depth becomes call-stack depth: ~3k nested
+ * elements throw `RangeError: Maximum call stack size exceeded` (lower on
+ * runtimes with a smaller stack), and getting there is not cheap - 20k levels
+ * blocks for ~4s and 100k for ~113s, all of it synchronous, which stalls every
+ * other request this process is serving. Neither the tag-block caps below nor
+ * a `try/catch` help: the caps hand the untouched input straight to Turndown,
+ * and catching the `RangeError` still pays the stall. The only fix is to
+ * refuse the document before it is parsed.
  */
 export function htmlToMarkdown(html: string): string {
   const article = pickArticle(html);
   const stripped = stripChrome(article);
+  // Cheap O(n) pre-check, so the expensive parse is never reached with input
+  // that would blow the stack or stall the loop.
+  if (exceedsNestingDepth(stripped, MAX_DOCUMENT_NESTING_DEPTH)) {
+    return htmlToText(stripped);
+  }
   return getTurndown().turndown(stripped).trim();
 }
 
@@ -113,6 +128,54 @@ const MAX_TAG_NESTING_DEPTH = 1_000;
  * plausible real page while still bounding the array to a few MB.
  */
 const MAX_BUFFERED_TAG_BLOCKS = 50_000;
+
+/**
+ * Ceiling on element nesting depth handed to Turndown. Real documentation
+ * pages sit comfortably under 50; this leaves a wide margin while staying
+ * far below the depth at which the recursive DOM walk becomes either slow
+ * or fatal. See {@link htmlToMarkdown} for the measurements.
+ */
+const MAX_DOCUMENT_NESTING_DEPTH = 500;
+
+/** Elements that never have children, so they must not push a level. */
+const VOID_ELEMENTS = new Set([
+  'area',
+  'base',
+  'br',
+  'col',
+  'embed',
+  'hr',
+  'img',
+  'input',
+  'link',
+  'meta',
+  'param',
+  'source',
+  'track',
+  'wbr',
+]);
+
+/**
+ * HTML5's optional-end-tag rules, as "opening X implicitly closes any of
+ * these still-open elements". Without this an ordinary table or list that
+ * omits `</td>`/`</li>` - which is legal and common - would appear to nest
+ * one level per row or item and trip the depth limit on a perfectly
+ * innocent page.
+ */
+const IMPLIED_END_TAGS = new Map<string, Set<string>>([
+  ['p', new Set(['p'])],
+  ['li', new Set(['li'])],
+  ['dt', new Set(['dt', 'dd'])],
+  ['dd', new Set(['dt', 'dd'])],
+  ['option', new Set(['option'])],
+  ['optgroup', new Set(['option', 'optgroup'])],
+  ['tr', new Set(['td', 'th', 'tr'])],
+  ['td', new Set(['td', 'th'])],
+  ['th', new Set(['td', 'th'])],
+  ['thead', new Set(['td', 'th', 'tr'])],
+  ['tbody', new Set(['td', 'th', 'tr', 'thead', 'tbody'])],
+  ['tfoot', new Set(['td', 'th', 'tr', 'thead', 'tbody'])],
+]);
 
 /**
  * Yield every `<tag ...>...</tag>` block in `html`, pairing each opening
@@ -310,7 +373,10 @@ export function stripChrome(html: string): string {
  * nothing for it; that shape is bounded instead by
  * {@link MAX_TAG_NESTING_DEPTH} and {@link MAX_BUFFERED_TAG_BLOCKS},
  * which cap the opener stack and this buffer respectively and fall back
- * to returning the input untouched.
+ * to returning the input untouched. Returning it untouched is safe only
+ * because {@link htmlToMarkdown} re-checks nesting depth afterwards and
+ * refuses to hand a pathological document to Turndown - on its own, this
+ * bail-out just moved the blow-up downstream.
  *
  * Note this genuinely needs the buffer: a single "pending block" variant
  * is wrong, because one ancestor can supersede several already-emitted
@@ -344,4 +410,159 @@ function removeTagBlocks(html: string, tag: string): string {
   }
   flush(); // anything left is under a stranded opener that never closed
   return result + html.slice(cursor);
+}
+
+/** Tag-name characters, per the subset any real document uses. */
+function isNameChar(code: number): boolean {
+  return (
+    (code >= 97 && code <= 122) || // a-z
+    (code >= 65 && code <= 90) || // A-Z
+    (code >= 48 && code <= 57) || // 0-9
+    code === 45 || // -
+    code === 95 || // _
+    code === 58 // :
+  );
+}
+
+/**
+ * End of a raw-text element (`<script>`/`<style>`), whose contents are not
+ * markup and must not be scanned as if they were. Returns the index just
+ * past the closing tag, or -1 when it never closes.
+ */
+function rawTextElementEnd(html: string, name: string, from: number): number {
+  let cursor = from;
+  for (;;) {
+    const lt = html.indexOf('</', cursor);
+    if (lt === -1) return -1;
+    let i = lt + 2;
+    let matched = 0;
+    while (matched < name.length && i < html.length) {
+      const c = html.charCodeAt(i);
+      const lower = c >= 65 && c <= 90 ? c + 32 : c;
+      if (lower !== name.charCodeAt(matched)) break;
+      i++;
+      matched++;
+    }
+    if (matched === name.length) {
+      const gt = html.indexOf('>', i);
+      return gt === -1 ? -1 : gt + 1;
+    }
+    cursor = lt + 2;
+  }
+}
+
+/**
+ * Walk `html` once, calling `onText` with each run of character data and
+ * tracking element nesting depth. Returns true if `limit` was ever
+ * exceeded, stopping early when it is.
+ *
+ * Deliberately a hand-rolled scanner rather than a parse: it is O(n) in the
+ * input with no backtracking, allocates only the open-element stack, and is
+ * the thing that runs *before* we are willing to pay for a real parse.
+ * Unknown elements count towards depth, because the HTML parser nests them
+ * like any other - a limit that only knew about known tag names would miss
+ * `<x-a><x-a>...` entirely.
+ */
+function scanElements(
+  html: string,
+  limit: number,
+  onText?: (chunk: string) => void,
+): boolean {
+  const open: string[] = [];
+  let i = 0;
+  while (i < html.length) {
+    const lt = html.indexOf('<', i);
+    if (lt === -1) {
+      onText?.(html.slice(i));
+      break;
+    }
+    if (lt > i) onText?.(html.slice(i, lt));
+
+    if (html.startsWith('<!--', lt)) {
+      const end = html.indexOf('-->', lt + 4);
+      i = end === -1 ? html.length : end + 3;
+      continue;
+    }
+    // Doctype, CDATA and processing instructions: skip to the next '>'.
+    if (html.startsWith('<!', lt) || html.startsWith('<?', lt)) {
+      const end = html.indexOf('>', lt + 2);
+      i = end === -1 ? html.length : end + 1;
+      continue;
+    }
+
+    const isClosing = html.charCodeAt(lt + 1) === 47; // '/'
+    const nameStart = lt + (isClosing ? 2 : 1);
+    let nameEnd = nameStart;
+    while (nameEnd < html.length && isNameChar(html.charCodeAt(nameEnd))) nameEnd++;
+    if (nameEnd === nameStart) {
+      // A bare '<' that starts no tag is literal text.
+      onText?.('<');
+      i = lt + 1;
+      continue;
+    }
+    const gt = html.indexOf('>', nameEnd);
+    if (gt === -1) break; // unterminated tag: nothing further is markup
+    const name = html.slice(nameStart, nameEnd).toLowerCase();
+    const selfClosing = html.charCodeAt(gt - 1) === 47; // '/'
+    i = gt + 1;
+
+    if (isClosing) {
+      // Pop to the nearest matching opener, discarding anything left
+      // stranded inside it. An unmatched closer is ignored, which is what
+      // the HTML parser does too.
+      const at = open.lastIndexOf(name);
+      if (at !== -1) open.length = at;
+      continue;
+    }
+    if (name === 'script' || name === 'style') {
+      const end = rawTextElementEnd(html, name, i);
+      i = end === -1 ? html.length : end;
+      continue;
+    }
+    if (selfClosing || VOID_ELEMENTS.has(name)) continue;
+
+    const implied = IMPLIED_END_TAGS.get(name);
+    if (implied) {
+      while (open.length > 0 && implied.has(open[open.length - 1] as string)) open.pop();
+    }
+    open.push(name);
+    if (open.length > limit) return true;
+  }
+  return false;
+}
+
+/**
+ * True when `html` nests elements deeper than `limit`. Exported so the
+ * limit can be tested directly, including on shapes (unclosed `<li>`,
+ * `<td>`, stray `<`) that must *not* trip it.
+ */
+export function exceedsNestingDepth(html: string, limit: number): boolean {
+  return scanElements(html, limit);
+}
+
+const NAMED_ENTITIES = new Map<string, string>([
+  ['&amp;', '&'],
+  ['&lt;', '<'],
+  ['&gt;', '>'],
+  ['&quot;', '"'],
+  ['&#39;', "'"],
+  ['&apos;', "'"],
+  ['&nbsp;', ' '],
+]);
+
+/**
+ * Last-resort conversion for documents too deep to parse: keep the
+ * character data, drop the markup. The result is poor Markdown but it is
+ * bounded, linear, and preserves whatever prose the page held, which beats
+ * both throwing the page away and stalling the process trying to do
+ * better.
+ */
+export function htmlToText(html: string): string {
+  const parts: string[] = [];
+  scanElements(html, Number.POSITIVE_INFINITY, (chunk) => parts.push(chunk));
+  return parts
+    .join(' ')
+    .replace(/&(?:amp|lt|gt|quot|#39|apos|nbsp);/g, (m) => NAMED_ENTITIES.get(m) ?? m)
+    .replace(/\s+/g, ' ')
+    .trim();
 }

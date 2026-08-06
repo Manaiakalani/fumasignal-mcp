@@ -35,12 +35,30 @@ floor. Every other dependency still allows `>=18`; this is the only constraint
 raising it. The excluded releases (20.0.0–20.18.0) are superseded patch versions
 of a Node line that is itself past end-of-life.
 
-**HTML parser memory is now bounded.** Deeply nested or pathological markup could
-make the tag-block scanner accumulate an unbounded opener stack and pending-block
-buffer. Nesting depth is capped at 1,000 and buffered blocks at 50,000; beyond
-either cap the input is returned unmodified rather than stripped. Peak heap on an
-adversarial nested document drops from ~144 MB to ~10 MB with no change in output
-for normal documents.
+**HTML conversion is now bounded end to end.** Pathological markup could grow
+`eachTagBlock`'s opener stack and `removeTagBlocks`'s pending buffer without
+bound. Depth is capped at 1,000 and buffered blocks at 50,000; past either cap
+the input is returned unmodified rather than stripped. Peak heap on an
+adversarial nested document: **144 MB → 10 MB** (243 ms → 11 ms).
+
+That bounds this module's own scanner, but on its own it just moved the failure
+downstream: the unmodified input still went to Turndown, which parses to a DOM
+and walks it recursively, so nesting depth becomes call-stack depth. Roughly
+3,000 nested elements throw `RangeError: Maximum call stack size exceeded`
+(fewer on runtimes with a smaller stack), and reaching that point is expensive —
+20,000 levels block for ~4 s and 100,000 for ~113 s, all of it synchronous, which
+stalls every other request the process is serving. A `try/catch` would not help,
+since the stall is paid before the throw.
+
+`htmlToMarkdown()` now runs a linear pre-check and refuses to parse anything
+nested deeper than 500 levels, falling back to a plain-text extraction that keeps
+the page's prose. The same 100,000-level document now completes in **23 ms**. The
+check counts unknown elements too, since the HTML parser nests `<x-widget>` like
+anything else, and it implements HTML5's optional-end-tag rules so that ordinary
+markup which omits `</li>`, `</td>` or `</p>` is not mistaken for deep nesting.
+
+Verified behaviour-preserving: 200,000 randomly generated documents and three
+real pages produce byte-identical output to the previous implementation.
 
 Also documents the one case the guard cannot decide on its own: operator-specific
 NAT64 prefixes, which are indistinguishable from public addresses without knowing

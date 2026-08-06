@@ -1,5 +1,11 @@
 import { describe, it, expect } from 'vitest';
-import { htmlToMarkdown, pickArticle, stripChrome } from '../src/lib/html-to-md.js';
+import {
+  htmlToMarkdown,
+  pickArticle,
+  stripChrome,
+  exceedsNestingDepth,
+  htmlToText,
+} from '../src/lib/html-to-md.js';
 
 describe('pickArticle', () => {
   it('extracts the content of an <article> tag', () => {
@@ -294,5 +300,79 @@ describe('adversarial nesting is bounded', () => {
     stripChrome('<nav>'.repeat(900_000) + 'x' + '</nav>'.repeat(900_000));
     stripChrome('<nav>x</nav>'.repeat(400_000));
     expect(performance.now() - t).toBeLessThan(5_000);
+  });
+});
+
+// These run end to end through `htmlToMarkdown`, not just `stripChrome`.
+// The earlier caps bounded this file's own scanner but then handed the
+// untouched input to Turndown, which parses to a DOM and walks it
+// recursively - so the process still died on depth. Asserting on
+// `stripChrome` alone could not see that.
+describe('nesting depth is bounded end to end', () => {
+  const deep = (tag: string, n: number): string =>
+    `<${tag}>`.repeat(n) + 'payload' + `</${tag}>`.repeat(n);
+
+  it.each([
+    ['nav', 3_000],
+    ['div', 3_000],
+    ['nav', 100_000],
+    ['div', 100_000],
+  ])('survives %s nested %i deep, and keeps the text', (tag, n) => {
+    const started = Date.now();
+    // Previously: RangeError at this depth, reached only after ~113s of
+    // synchronous work at 100k. Both are failure modes for a server
+    // sharing one event loop across requests.
+    expect(htmlToMarkdown(deep(tag as string, n as number))).toBe('payload');
+    expect(Date.now() - started).toBeLessThan(5_000);
+  });
+
+  it('counts unknown elements, which the HTML parser nests like any other', () => {
+    expect(htmlToMarkdown(deep('x-widget', 50_000))).toBe('payload');
+  });
+
+  it('reports depth for the shapes that trip it, and not for ordinary ones', () => {
+    expect(exceedsNestingDepth(deep('div', 600), 500)).toBe(true);
+    expect(exceedsNestingDepth(deep('div', 400), 500)).toBe(false);
+    expect(exceedsNestingDepth('<article><p>hi <b>there</b></p></article>', 500)).toBe(false);
+  });
+
+  // Optional end tags are legal and common. Counting them naively would
+  // make an ordinary table or list look thousands of levels deep and
+  // silently downgrade real pages to plain text.
+  it.each([
+    ['unclosed <li>', `<ul>${'<li>item'.repeat(5_000)}</ul>`],
+    ['unclosed <td>/<tr>', `<table>${'<tr><td>cell'.repeat(3_000)}</table>`],
+    ['unclosed <p>', '<p>para'.repeat(2_000)],
+    ['void <br>', `a${'<br>'.repeat(5_000)}b`],
+    ['self-closing', `<div>${'<img src="x"/>'.repeat(5_000)}</div>`],
+  ])('does not trip on %s', (_label, html) => {
+    expect(exceedsNestingDepth(html as string, 500)).toBe(false);
+  });
+
+  it('still converts a normal document through turndown', () => {
+    expect(
+      htmlToMarkdown('<article><h1>T</h1><p>Hello <b>world</b></p><ul><li>a</li></ul></article>'),
+    ).toBe('# T\n\nHello **world**\n\n-   a');
+  });
+});
+
+describe('htmlToText', () => {
+  it('keeps character data, drops markup, and decodes basic entities', () => {
+    expect(htmlToText('<div><p>Hello <b>world</b></p></div>')).toBe('Hello world');
+    expect(htmlToText('<p>5 &lt; 6 &amp;&nbsp;ok</p>')).toBe('5 < 6 & ok');
+  });
+
+  it('does not treat script or style bodies as text', () => {
+    expect(htmlToText('<p>keep</p><script>var x = "drop";</script><style>.a{color:red}</style>')).toBe(
+      'keep',
+    );
+  });
+
+  it('treats a bare "<" as text rather than the start of a tag', () => {
+    expect(htmlToText('<p>5 < 6</p>')).toBe('5 < 6');
+  });
+
+  it('ignores comments and doctype', () => {
+    expect(htmlToText('<!doctype html><!-- note --><p>body</p>')).toBe('body');
   });
 });
