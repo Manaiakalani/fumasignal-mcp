@@ -58,19 +58,19 @@ the same problem: 200,000 sibling elements are flat, so they never threaten the
 stack, but they still cost ~15 s and ~750 MB to parse — they are now refused in
 46 ms.
 
-The pre-check deliberately *over*-estimates depth instead of reproducing HTML5
-tree construction, because every place an earlier version guessed low was a
-bypass: `<div/>` and `<div class=x/>` (HTML ignores a trailing `/` on non-void
-elements), `<div title="></div>">` (a `>` inside a quoted attribute value ended
-the tag scan early, and the fake closer then reset the stack), `<b><i></b>` (the
-adoption agency algorithm re-opens formatting elements, so the real tree gets
-*deeper* while a pop-to-match stack empties) and `<!-->` (an abrupt closing of
-an empty comment, read as one that never ends, discarding the rest of the
-document). Each of these reached Turndown and threw after seconds of
-synchronous work. Over-estimating only costs one page its Markdown formatting;
-under-estimating is a stalled process, so the scanner pops only an exact
-innermost match and treats a trailing `/` as self-closing only where the
-tokenizer would.
+The pre-check does not reproduce HTML5 tree construction; it approximates it,
+and where the two differ it is built to guess *high*, because every place an
+earlier version guessed low was a bypass: `<div/>` and `<div class=x/>` (HTML
+ignores a trailing `/` on non-void elements), `<div title="></div>">` (a `>`
+inside a quoted attribute value ended the tag scan early, and the fake closer
+then reset the stack), `<b><i></b>` (the adoption agency algorithm re-opens
+formatting elements, so the real tree gets *deeper* while a pop-to-match stack
+empties) and `<!-->` (an abrupt closing of an empty comment, read as one that
+never ends, discarding the rest of the document). Each of these reached
+Turndown and threw after seconds of synchronous work. Over-estimating only
+costs one page its Markdown formatting; under-estimating is a stalled process,
+so the scanner pops only an exact innermost match and treats a trailing `/` as
+self-closing only where the tokenizer would.
 
 It counts unknown elements too, since the HTML parser nests `<x-widget>` like
 anything else, and it applies HTML5's optional-end-tag rules — including `</p>`
@@ -89,24 +89,31 @@ document the parser nests ~3,000 deep:
   unquoted value — is not self-closing.
 - Foreign content ends at any of HTML5's ~45 breakout start tags and at the
   integration points, `<title>` included, so one `<svg>` cannot exempt what
-  follows via `<div a=b/>` or `<span a=b/>`.
-- A `</svg>` that matches nothing on the scanner's stack still returns the
-  real parser to HTML. Since there is no way to tell which elements it closed,
-  self-closing markers stop being honoured from that point on rather than
-  being honoured in the wrong namespace.
+  follows via `<div a=b/>` or `<span a=b/>`. Five of those breakout tags —
+  `<br>`, `<hr>`, `<img>`, `<embed>`, `<meta>` — are also void, so they never
+  open an element; the namespace change is applied to the elements already
+  open rather than carried by the new one, which is what makes them count.
+- A `</svg>` follows HTML5's foreign end-tag rule and pops to the nearest
+  match. That rule is unambiguous — the adoption agency that makes popping
+  unsafe for HTML elements is not involved — so `<svg><g></svg>` returns to
+  HTML exactly, with no need to distrust later markup.
 - Which elements are foreign is tracked per open element rather than as a
   single depth, so leaving an HTML island — `</title>` inside `<svg>` —
   restores foreign content instead of losing it for the rest of the document.
 
-The raw-text rule for `<title>`, `<style>` and `<textarea>` is suppressed
-while any `<svg>`/`<math>` is open, since those are ordinary containers there
-and their contents really do nest. That test deliberately uses a separate,
-stickier signal than the one driving the self-closing decision: the two have
-to be wrong in opposite directions. Guessing "not foreign" only ever counts
-more depth, but guessing it for raw text skips an unbounded amount of markup —
+Two operations *remove* work rather than adding it: the raw-text skip, which
+drops a whole element's contents, and the optional-end-tag rules, which pop.
+Both are HTML-only, and both are therefore gated on a count of open
+`<svg>`/`<math>` roots that is maintained symmetrically with the element stack
+— incremented at the push, decremented only when that same entry is popped —
+rather than on the per-element namespace flag. The flag is deliberately
+cleared on more tags than the spec requires, which is safe for deciding
+whether a trailing `/` self-closes because that only ever adds depth, but is
+exactly backwards for these two. Each was a distinct unbounded bypass:
 `<svg><font><title>` followed by any number of `<div>` reported three
-elements, escaping the element cap as well as the depth cap. Measured through
-`getPage()`, 15 KB of that shape threw `RangeError` after 3 s and 1 MB had not
+elements, escaping the element cap as well as the depth cap, and `<svg><mi>`
+followed by `<td>` popped its way back to depth 1. Measured through
+`getPage()`, 15 KB of the first threw `RangeError` after 3 s, and 1 MB had not
 finished after 7 minutes.
 
 The plain-text fallback is bounded as well, and no longer spills attribute

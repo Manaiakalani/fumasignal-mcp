@@ -454,6 +454,12 @@ describe('render budget bypasses', () => {
     ['svg <title> keeping foreign self-closing', `<svg><title>${'<g/>'.repeat(1_500)}`],
     ['raw text re-enabled by an svg breakout', `<svg><font><title>${'<div>'.repeat(1_500)}`],
     ['raw text re-enabled inside math', `<math><annotation-xml><textarea>${'<div>'.repeat(1_500)}`],
+    ['a cross-namespace end tag draining the root count', `<svg></math><title>${'<div>'.repeat(1_500)}`],
+    ['a nested foreign root closing once', `<svg><svg></svg><title>${'<div>'.repeat(1_500)}`],
+    ['optional end tags popping inside svg', `<svg><mi>${'<td>'.repeat(1_500)}`],
+    ['optional end tags popping inside math', `<math><mtext>${'<option>'.repeat(1_500)}`],
+    ['a void breakout tag inside svg', `<svg><br>${'<g/>'.repeat(1_500)}`],
+    ['a void breakout tag inside math', `<math><img>${'<mrow/>'.repeat(1_500)}`],
     ['an element that merely looks void', '<brx>'.repeat(1_500)],
     ['sheer width rather than depth', '<b>x</b>'.repeat(200_000)],
   ])('refuses %s', (_label, html) => {
@@ -473,6 +479,8 @@ describe('render budget bypasses', () => {
     ['svg with attributes', `<div>${'<svg viewBox="0 0 24 24"><path d="M0 0"/></svg>'.repeat(300)}</div>`],
     ['svg carrying a title', `<div>${'<svg><title>icon</title><path d="M0"/></svg>'.repeat(300)}</div>`],
     ['svg carrying title and desc', `<div>${'<svg><title>i</title><desc>d</desc><path d="M0"/></svg>'.repeat(300)}</div>`],
+    ['the sprite pattern', `<div>${'<svg><use href="#i"></svg>'.repeat(300)}</div>`],
+    ['icons following a stray end tag', `<div></svg>${'<svg><path d="M0"/></svg>'.repeat(300)}</div>`],
     ['a self-closed svg root', `<div>${'<svg/>'.repeat(300)}</div>`],
     ['mathml', `<div>${'<math><mi>x</mi><mo>+</mo></math>'.repeat(300)}</div>`],
     ['stray closing tags', '<div>a</span></p></b>b</div>'.repeat(500)],
@@ -484,5 +492,64 @@ describe('render budget bypasses', () => {
     ['digits and punctuation after "<"', '1<2 and a<_b and x<-y '.repeat(1_000)],
   ])('still renders %s through turndown', (_label, html) => {
     expect(exceedsRenderBudget(html as string)).toBe(false);
+  });
+});
+
+// The tables above only ever test shapes someone already thought of, and
+// every round of this guard's history was a shape nobody had. This searches
+// instead: a short random run of namespace-transition tags, then one payload
+// tag repeated far past the limit. The oracle is the parser turndown actually
+// uses, so a disagreement is measured against the real tree rather than
+// against a second hand-written model.
+//
+// Only under-estimation is a bug. Guessing too deep costs a page its
+// formatting; guessing too shallow hands turndown a document that stalls the
+// process for minutes.
+describe('render budget differential search', () => {
+  const TRANSITIONS = [
+    '<svg>', '<math>', '</svg>', '</math>', '<g>', '<g/>', '<mrow>', '<title>',
+    '</title>', '<textarea>', '<style>', '<script>', '<font>', '<annotation-xml>',
+    '<foreignObject>', '<desc>', '<mtext>', '<mi>', '<div>', '<span>', '<b>',
+    '<p>', '<table>', '<template>', '<mglyph>', '<xmp>', '<br>', '<hr>', '<img>',
+  ];
+  const PAYLOADS = [
+    '<div>', '<g/>', '<g a=b/>', '<div a=b/>', '<span/>', '<mrow/>', '<b><i></b>',
+    '<path d="M0"/>', '<p>', '<li>', '<td>', '<option>',
+  ];
+
+  it('never reports a document as safe when the real tree is not', () => {
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const domino = require('@mixmark-io/domino') as {
+      createDocument: (html: string, force: boolean) => Document;
+    };
+    const realDepth = (html: string): number => {
+      const doc = domino.createDocument(html, true);
+      let max = 0;
+      const stack: Array<[Node | null, number]> = [[doc.body, 1]];
+      while (stack.length > 0) {
+        const [node, depth] = stack.pop() as [Node | null, number];
+        if (!node) continue;
+        if (depth > max) max = depth;
+        for (let c = node.firstChild; c; c = c.nextSibling) {
+          if (c.nodeType === 1) stack.push([c, depth + 1]);
+        }
+      }
+      return max;
+    };
+
+    // Deterministic so a failure is reproducible from the seed alone.
+    let seed = 5150;
+    const rnd = (): number => (seed = (seed * 1103515245 + 12345) & 0x7fffffff) / 0x7fffffff;
+    const pick = <T,>(xs: readonly T[]): T => xs[Math.floor(rnd() * xs.length)] as T;
+
+    const missed: string[] = [];
+    for (let trial = 0; trial < 400; trial++) {
+      let prefix = '';
+      const runLength = 1 + Math.floor(rnd() * 4);
+      for (let k = 0; k < runLength; k++) prefix += pick(TRANSITIONS);
+      const html = prefix + pick(PAYLOADS).repeat(1_200);
+      if (!exceedsRenderBudget(html) && realDepth(html) > 500) missed.push(prefix);
+    }
+    expect(missed).toEqual([]);
   });
 });
