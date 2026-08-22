@@ -1,5 +1,14 @@
 import { describe, it, expect, vi } from 'vitest';
-import { isPrivateOrReservedAddress, assertPublicResolution } from '../src/lib/net-safety.js';
+import http from 'node:http';
+import type { AddressInfo } from 'node:net';
+import { Agent, fetch as undiciFetch } from 'undici';
+import { RemoteFumadocsSource } from '../src/sources/remote.js';
+import { logger } from '../src/lib/logger.js';
+import {
+  isPrivateOrReservedAddress,
+  assertPublicResolution,
+  createGuardedLookup,
+} from '../src/lib/net-safety.js';
 
 describe('isPrivateOrReservedAddress', () => {
   it('flags private/reserved IPv4 ranges', () => {
@@ -356,5 +365,205 @@ describe('assertPublicResolution', () => {
     await expect(assertPublicResolution('docs.example.com', lookup)).rejects.toThrow(
       /no addresses/,
     );
+  });
+});
+
+describe('createGuardedLookup (connect-time enforcement)', () => {
+  const call = (
+    lookup: ReturnType<typeof createGuardedLookup>,
+    host: string,
+    options: Record<string, unknown> = { all: true },
+  ) =>
+    new Promise<{ err: NodeJS.ErrnoException | null; address: unknown; family?: number }>((resolve) =>
+      lookup(host, options as never, (err, address, family) => resolve({ err, address, family })),
+    );
+
+  it('rejects a hostname resolving to a private address', async () => {
+    const guarded = createGuardedLookup(async () => [{ address: '169.254.169.254' }]);
+    const { err } = await call(guarded, 'docs.example.com');
+    expect(err?.message).toMatch(/169\.254\.169\.254.*private\/internal/s);
+    expect(err?.code).toBe('ENOTFOUND');
+  });
+
+  it('rejects the whole answer when only one address is private', async () => {
+    const guarded = createGuardedLookup(async () => [
+      { address: '93.184.216.34' },
+      { address: '127.0.0.1' },
+    ]);
+    const { err } = await call(guarded, 'docs.example.com');
+    expect(err).toBeTruthy();
+    expect(err?.message).toContain('127.0.0.1');
+  });
+
+  it('returns public addresses, honouring the all flag', async () => {
+    const guarded = createGuardedLookup(async () => [
+      { address: '93.184.216.34' },
+      { address: '2606:2800:220:1:248:1893:25c8:1946' },
+    ]);
+    const all = await call(guarded, 'docs.example.com', { all: true });
+    expect(all.err).toBeNull();
+    expect(all.address).toEqual([
+      { address: '93.184.216.34', family: 4 },
+      { address: '2606:2800:220:1:248:1893:25c8:1946', family: 6 },
+    ]);
+
+    const one = await call(guarded, 'docs.example.com', { all: false });
+    expect(one.err).toBeNull();
+    expect(one.address).toBe('93.184.216.34');
+    expect(one.family).toBe(4);
+  });
+
+  it('passes IP literals straight through without resolving', async () => {
+    const lookup = vi.fn(async () => [{ address: '10.0.0.1' }]);
+    const guarded = createGuardedLookup(lookup);
+    const v4 = await call(guarded, '127.0.0.1');
+    expect(v4.err).toBeNull();
+    expect(v4.address).toEqual([{ address: '127.0.0.1', family: 4 }]);
+    // Bracketed IPv6 literals arrive from the URL parser in that form.
+    const v6 = await call(guarded, '[::1]');
+    expect(v6.err).toBeNull();
+    expect(v6.address).toEqual([{ address: '::1', family: 6 }]);
+    expect(lookup).not.toHaveBeenCalled();
+  });
+
+  it('fails closed when resolution fails or returns nothing', async () => {
+    const failing = createGuardedLookup(async () => {
+      throw new Error('SERVFAIL');
+    });
+    const failed = await call(failing, 'docs.example.com');
+    expect(failed.err?.message).toMatch(/DNS resolution failed \(SERVFAIL\)/);
+
+    const empty = createGuardedLookup(async () => []);
+    const none = await call(empty, 'docs.example.com');
+    expect(none.err?.message).toMatch(/returned no addresses/);
+  });
+
+  it('fails closed when the lookup exceeds its timeout', async () => {
+    const guarded = createGuardedLookup(() => new Promise(() => {}), 20);
+    const { err } = await call(guarded, 'docs.example.com');
+    expect(err?.message).toMatch(/timed out after 20ms/);
+  });
+
+  it('reports the blocked address to the callback hook', async () => {
+    const onBlocked = vi.fn();
+    const guarded = createGuardedLookup(async () => [{ address: '10.1.2.3' }], undefined, onBlocked);
+    await call(guarded, 'docs.example.com');
+    expect(onBlocked).toHaveBeenCalledWith('docs.example.com', '10.1.2.3');
+  });
+});
+
+// The regression test that matters: prove the rebinding attack this module
+// exists to stop is actually stopped end to end, through a real socket.
+// The pre-flight check alone cannot stop it, because validation and
+// connection issue two separate queries and the zone owner answers both.
+describe('DNS rebinding is closed at connect time', () => {
+  it('refuses to connect when the resolver rebinds after validation', async () => {
+    const server = http.createServer((_req, res) => res.end('INTERNAL-ONLY'));
+    await new Promise<void>((r) => server.listen(0, '127.0.0.1', () => r()));
+    const { port } = server.address() as AddressInfo;
+    try {
+      // Public on the first (validating) query, loopback on every one after.
+      let calls = 0;
+      const rebinding = async () => [
+        { address: ++calls === 1 ? '93.184.216.34' : '127.0.0.1' },
+      ];
+
+      // Pre-flight alone is satisfied - it only ever sees the first answer.
+      await expect(assertPublicResolution('docs.example.com', rebinding)).resolves.toBeUndefined();
+
+      const agent = new Agent({ connect: { lookup: createGuardedLookup(rebinding) } });
+      try {
+        // Assert on the specific cause, not merely that it threw: a bare
+        // `.toThrow()` would also be satisfied by an unrelated connect
+        // timeout, which is exactly what happens if the guard lets the
+        // rebound address through.
+        const err = await undiciFetch(`http://docs.example.com:${port}/`, {
+          dispatcher: agent,
+        }).then(
+          () => null,
+          (e: Error & { cause?: NodeJS.ErrnoException }) => e,
+        );
+        expect(err, 'rebound request should have been refused').not.toBeNull();
+        expect(err?.cause?.code).toBe('ENOTFOUND');
+        expect(err?.cause?.message).toContain('127.0.0.1');
+        expect(err?.cause?.message).toContain('private/internal address');
+      } finally {
+        await agent.close();
+      }
+
+      // Control: the same server is reachable when the address is legitimate.
+      const honest = new Agent({
+        connect: { lookup: createGuardedLookup(async () => [{ address: '127.0.0.1' }]) },
+      });
+      try {
+        const res = await undiciFetch(`http://127.0.0.1:${port}/`, { dispatcher: honest });
+        expect(await res.text()).toBe('INTERNAL-ONLY');
+      } finally {
+        await honest.close();
+      }
+    } finally {
+      await new Promise<void>((r) => server.close(() => r()));
+    }
+  });
+
+  // The hook itself is unit-tested above; this covers the *wiring*, which is
+  // what actually regressed. `createGuardedLookup` was being constructed
+  // without an `onBlocked`, so the single highest-signal security event this
+  // module can produce was silently discarded: undici reports the refusal to
+  // the caller as a bare `fetch failed` and nothing unwraps `err.cause`.
+  it('logs the refusal when a real source is rebound', async () => {
+    const server = http.createServer((_req, res) => res.end('INTERNAL-ONLY'));
+    await new Promise<void>((r) => server.listen(0, '127.0.0.1', () => r()));
+    const { port } = server.address() as AddressInfo;
+    const warn = vi.spyOn(logger, 'warn').mockImplementation((() => undefined) as never);
+    try {
+      let calls = 0;
+      const source = new RemoteFumadocsSource({
+        baseUrl: `http://docs.example.com:${port}`,
+        dnsLookup: async () => [{ address: ++calls === 1 ? '93.184.216.34' : '127.0.0.1' }],
+      });
+      await expect(source.getPage('/docs/x')).rejects.toThrow();
+
+      const logged = warn.mock.calls.find(
+        (args) => typeof args[1] === 'string' && args[1].includes('rebinding'),
+      );
+      expect(logged, 'a refused connection must leave an operator-visible record').toBeDefined();
+      expect(logged?.[0]).toMatchObject({
+        hostname: 'docs.example.com',
+        address: '127.0.0.1',
+      });
+    } finally {
+      warn.mockRestore();
+      await new Promise<void>((r) => server.close(() => r()));
+    }
+  });
+
+  // Regression guard for a bug CI caught and local runs did not. The
+  // dispatcher is only honoured by the undici instance that created it:
+  // Node's global `fetch` is backed by a separate, internal copy of undici
+  // and validates `init.dispatcher` against its own `Dispatcher` class, so
+  // an `Agent` from this package is rejected outright with
+  // `UND_ERR_INVALID_ARG` on Node 20 and 22. Newer Node happens to accept
+  // it, which is precisely why this needs asserting rather than trusting a
+  // passing dev-machine run - regressing to `globalThis.fetch` would break
+  // every real request on the oldest supported Node, while looking fine
+  // locally.
+  it('pairs the dispatcher with undici fetch rather than the global fetch', () => {
+    const source = new RemoteFumadocsSource({ baseUrl: 'https://docs.example.com' });
+    const internals = source as unknown as { fetchImpl: unknown; dispatcher: unknown };
+    expect(internals.dispatcher).toBeInstanceOf(Agent);
+    expect(internals.fetchImpl).not.toBe(globalThis.fetch);
+    expect(internals.fetchImpl).toBe(undiciFetch);
+  });
+
+  it('attaches no dispatcher when the caller injects its own fetchImpl', () => {
+    const injected = vi.fn();
+    const source = new RemoteFumadocsSource({
+      baseUrl: 'https://docs.example.com',
+      fetchImpl: injected as unknown as typeof fetch,
+    });
+    const internals = source as unknown as { fetchImpl: unknown; dispatcher: unknown };
+    expect(internals.fetchImpl).toBe(injected);
+    expect(internals.dispatcher).toBeUndefined();
   });
 });

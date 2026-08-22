@@ -1,6 +1,6 @@
 import { logger, redactUrlForLogging } from '../lib/logger.js';
 import { TtlCache, Coalescer, Semaphore } from '../lib/cache.js';
-import { htmlToMarkdown } from '../lib/html-to-md.js';
+import { htmlToMarkdown, htmlToText } from '../lib/html-to-md.js';
 import {
   type HeadingIndex,
   FenceTracker,
@@ -16,7 +16,8 @@ import {
   isSitemapIndex,
   parseSitemap,
 } from '../lib/sitemap.js';
-import { assertPublicResolution, type DnsLookupFn } from '../lib/net-safety.js';
+import { assertPublicResolution, createGuardedLookup, type DnsLookupFn } from '../lib/net-safety.js';
+import { Agent, fetch as undiciFetch } from 'undici';
 import { lookup as dnsLookupPromise } from 'node:dns/promises';
 import {
   type FumadocsSource,
@@ -39,7 +40,15 @@ export interface RemoteSourceOptions {
   authHeader?: string;
   /** TTL for fetched pages and sitemap. Default 5 min. */
   cacheTtlMs?: number;
-  /** Override fetch (used by tests). */
+  /**
+   * Override fetch (used by tests).
+   *
+   * Supplying this **disables connect-time SSRF enforcement**: the guarded
+   * dispatcher is only attached to the transport this class builds itself,
+   * so an injected transport - including `globalThis.fetch` - is trusted to
+   * enforce the address policy itself. The shipped CLI never sets this; it
+   * exists so tests can run without sockets.
+   */
   fetchImpl?: typeof fetch;
   userAgent?: string;
   /** Per-request fetch timeout in ms. Default 15s. */
@@ -219,6 +228,8 @@ export class RemoteFumadocsSource implements FumadocsSource {
   // duplicate requests for the *same* key.
   private fetchSemaphore: Semaphore;
   private dnsLookup: DnsLookupFn;
+  /** Undici dispatcher enforcing the address policy at connect time. */
+  private dispatcher: Agent | undefined;
 
   constructor(opts: RemoteSourceOptions) {
     this.base = new URL(opts.baseUrl);
@@ -247,7 +258,15 @@ export class RemoteFumadocsSource implements FumadocsSource {
     this.searchPath = opts.searchPath ?? '/api/search';
     this.docsPrefix = opts.docsPrefix ?? '/docs';
     this.authHeader = opts.authHeader;
-    this.fetchImpl = opts.fetchImpl ?? fetch;
+    // Undici's own `fetch`, not the global one, so that it and the
+    // dispatcher below come from the same undici instance. Node's global
+    // `fetch` is backed by a *separate*, internal copy of undici and
+    // validates `init.dispatcher` against its own `Dispatcher` class, so
+    // handing it an `Agent` from this package fails with
+    // `UND_ERR_INVALID_ARG` on Node 20 and 22 - which would break every
+    // real request, not just the guard. Using undici's `fetch` keeps the
+    // dispatcher honoured identically on every supported Node version.
+    this.fetchImpl = opts.fetchImpl ?? (undiciFetch as unknown as typeof fetch);
     this.ua = opts.userAgent ?? DEFAULT_UA;
     this.fetchTimeoutMs = opts.fetchTimeoutMs ?? 15_000;
     this.maxRedirects = opts.maxRedirects ?? 5;
@@ -258,6 +277,38 @@ export class RemoteFumadocsSource implements FumadocsSource {
       opts.maxFetchQueueLength ?? 1000,
     );
     this.dnsLookup = opts.dnsLookup ?? defaultDnsLookup;
+    // Enforcement point for the address policy. Built only when using the
+    // real `fetch`: an injected `fetchImpl` is a test double that never
+    // opens a socket, so a dispatcher would do nothing there, and building
+    // one per source across hundreds of unit tests would leak undici
+    // resources. The guard's own logic is covered directly against
+    // `createGuardedLookup` rather than through this seam - see
+    // net-safety.ts for why validating inside the connector (rather than
+    // only before it) is what actually closes the rebinding gap.
+    this.dispatcher =
+      opts.fetchImpl === undefined
+        ? new Agent({
+            connect: {
+              lookup: createGuardedLookup(
+                this.dnsLookup,
+                this.fetchTimeoutMs,
+                (hostname, address) => {
+                  // The highest-signal security event this module can raise:
+                  // a host that passed the pre-flight check resolved to an
+                  // internal address by the time we connected. undici
+                  // surfaces the refusal to the caller as a generic
+                  // `fetch failed` with the reason buried in `err.cause`, so
+                  // without this line a rebinding attempt is
+                  // indistinguishable from a transient network fault.
+                  logger.warn(
+                    { hostname, address, source: this.label },
+                    'remote: refused connection to a private address (possible DNS rebinding)',
+                  );
+                },
+              ),
+            },
+          })
+        : undefined;
     const ttl = opts.cacheTtlMs ?? 5 * 60 * 1000;
     this.pageCache = new TtlCache(ttl, 500, {
       maxTotalSize: maxPageCacheBytes,
@@ -402,7 +453,11 @@ export class RemoteFumadocsSource implements FumadocsSource {
         headers: init.headers,
         redirect: 'manual',
         signal: AbortSignal.timeout(this.fetchTimeoutMs),
-      });
+        // Undici-specific option, absent from the standard `RequestInit`.
+        // Only set when `fetchImpl` is undici's own `fetch`; an injected
+        // `fetchImpl` gets no dispatcher and simply ignores the key.
+        ...(this.dispatcher ? { dispatcher: this.dispatcher } : {}),
+      } as RequestInit);
       if (res.status >= 300 && res.status < 400) {
         const location = res.headers.get('location');
         if (!location) return res;
@@ -861,7 +916,21 @@ export class RemoteFumadocsSource implements FumadocsSource {
     }
     const html = await this.readCappedText(res);
     const meta = extractHtmlMeta(html);
-    const markdown = htmlToMarkdown(html);
+    // The render budget is meant to keep pathological markup away from
+    // Turndown, but it approximates the parser and has been wrong before.
+    // A stack overflow here would otherwise escape as a raw RangeError and
+    // fail the whole tool call; downgrading to text costs one page its
+    // formatting instead.
+    let markdown: string;
+    try {
+      markdown = htmlToMarkdown(html);
+    } catch (err) {
+      logger.warn(
+        { err, url: redactUrlForLogging(target.toString()) },
+        'remote: failed to convert html, falling back to text',
+      );
+      markdown = htmlToText(html);
+    }
     return { markdown, meta };
   }
 }
