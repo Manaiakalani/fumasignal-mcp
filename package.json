@@ -51,7 +51,7 @@
     "changeset-version": "changeset version && npm install --package-lock-only"
   },
   "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.30.0",
+    "@modelcontextprotocol/sdk": "^1.31.0",
     "commander": "^12.1.0",
     "gray-matter": "^4.0.3",
     "pino": "^9.5.0",
