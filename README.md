@@ -7,12 +7,12 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 Point it at a deployed Fumadocs URL (or a local Fumadocs repo) and your AI
-assistant gets seven tools to search, list, and read the docs — over the
+assistant gets seven tools to search, list, and read the docs: over the
 [Model Context Protocol](https://modelcontextprotocol.io).
 
 The name is a wink at Fumadocs author **fuma-nama** (*fuma* = 煙 = "smoke" in
 Japanese) and the fact that MCP servers exist to send signals between AI
-clients and external tools. Smoke signals carry messages over distance —
+clients and external tools. Smoke signals carry messages over distance,
 exactly what this server does for your docs.
 
 > ⚠️ This is an unofficial, third-party project. Not affiliated with the
@@ -22,13 +22,13 @@ exactly what this server does for your docs.
 
 ## Features
 
-- 🔌 **Zero-setup remote mode** — give it any deployed Fumadocs URL, done.
-- 💾 **Local mode** — point at a Fumadocs repo on disk for offline / pre-deploy use.
+- 🔌 **Zero-setup remote mode**: give it any deployed Fumadocs URL, done.
+- 💾 **Local mode**: point at a Fumadocs repo on disk for offline / pre-deploy use.
 - 🔎 **7 tools**: `search_docs`, `list_pages`, `get_page`, `get_section`,
   `get_toc`, `get_meta`, `get_llms_txt`.
 - 📦 **Single binary**: `npx -y fumasignal-mcp --url https://your-docs.com`.
-- 🔒 **Read-only** — never mutates your docs.
-- 🧪 **Well-tested** — 280+ unit tests, fixtures for the search/sitemap/HTML paths.
+- 🔒 **Read-only**: never mutates your docs.
+- 🧪 **Well-tested**: 280+ unit tests, fixtures for the search/sitemap/HTML paths.
 
 ---
 
@@ -94,7 +94,7 @@ Add to `.vscode/mcp.json`:
 
 Continue reads standalone MCP configs from a `.continue/mcpServers/` folder
 (create it at your workspace root, or under `~/.continue/mcpServers/` for a
-global config). Simplest option — reuse the same JSON shown above for Claude
+global config). Simplest option: reuse the same JSON shown above for Claude
 Desktop / Cursor, saved as `.continue/mcpServers/mcp.json`:
 
 ```json
@@ -219,7 +219,7 @@ maps to the docs root. Search uses heading-weighted token scoring.
 - **Fumadocs:** Tested against the default Orama search API and standard sitemap
   layout. Multi-docs sites with `tag` filtering are supported via the
   `tag` argument on `search_docs`.
-- **MCP clients:** Anything that speaks STDIO MCP — Claude Desktop, Claude Code,
+- **MCP clients:** Anything that speaks STDIO MCP: Claude Desktop, Claude Code,
   Cursor, VS Code (Copilot Chat / Continue), Zed, Cline, and others.
 
 ---
@@ -233,11 +233,11 @@ The site may not expose `/sitemap.xml`. You can still use `search_docs` and
 **"Search request failed: 404"**
 Pass `--search-path` if the site uses a non-default path
 (e.g. `--search-path /api/v2/search`). Also check that `--url` is the
-site's origin only (no path) — `/sitemap.xml` and `--search-path` are
+site's origin only (no path): `/sitemap.xml` and `--search-path` are
 always resolved from the origin root, not from a path in `--url`.
 
 **HTML scrape returns junk**
-Some Fumadocs sites already expose markdown via `<url>.md` — that's the
+Some Fumadocs sites already expose markdown via `<url>.md`: that's the
 preferred path. If yours doesn't, the HTML scrape strips `nav`/`aside`/
 `header`/`footer` and converts the largest `<article>` element. PRs welcome
 for site-specific adapters.
@@ -264,7 +264,7 @@ npm run check          # typecheck + lint + test + build, in one go
 npm run inspector -- --url https://fumadocs.dev   # MCP Inspector against dist/
 ```
 
-Contributions welcome — please open an issue first for non-trivial changes.
+Contributions welcome: please open an issue first for non-trivial changes.
 
 ---
 
