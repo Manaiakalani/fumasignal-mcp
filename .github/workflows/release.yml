@@ -43,12 +43,25 @@ jobs:
         # Pinned to a commit SHA rather than the "v1" ref: unlike
         # actions/* above (GitHub's own namespace), "v1" here is a mutable
         # branch (not even a tag) in a third-party repo, and this step
-        # runs with contents/pull-requests write plus GITHUB_TOKEN and
-        # NPM_TOKEN - a compromised "v1" would get arbitrary code
-        # execution with npm-publish and repo-write credentials.
+        # runs with contents/pull-requests write plus GITHUB_TOKEN and,
+        # when configured, NPM_TOKEN. A compromised "v1" would get
+        # arbitrary code execution with repo-write credentials and, if
+        # present, npm-publish credentials.
         uses: changesets/action@a45c4d594aa4e2c509dc14a9f2b3b67ba3780d0d # v1.9.0
         with:
-          publish: npx changeset publish
+          # The package has never been published, and this repo has no
+          # NPM_TOKEN secret, so a bare `npx changeset publish` fails
+          # every main push with npm ENEEDAUTH once there are no pending
+          # changesets (the action still attempts publish, and OIDC
+          # trusted publishing is not configured on npmjs.com either).
+          # `npm run changeset-publish` publishes to npm only when
+          # NPM_TOKEN is set (passed through as NPM_TOKEN and
+          # NODE_AUTH_TOKEN). Without the token it runs `npx changeset
+          # tag` instead, which is enough for this action to push a `v*`
+          # git tag and open a GitHub Release from CHANGELOG.md.
+          # Version PRs still open as before via the version input
+          # below. `npm run check` above is unchanged.
+          publish: npm run changeset-publish
           # `changeset version` only rewrites package.json/CHANGELOG.md; it
           # never touches package-lock.json, so a bare `npx changeset
           # version` silently leaves the lockfile's "version" field
