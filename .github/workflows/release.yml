@@ -47,7 +47,7 @@ jobs:
         # when configured, NPM_TOKEN. A compromised "v1" would get
         # arbitrary code execution with repo-write credentials and, if
         # present, npm-publish credentials.
-        uses: changesets/action@a45c4d594aa4e2c509dc14a9f2b3b67ba3780d0d # v1.9.0
+        uses: changesets/action@ae32849d5ba541f9ae29e40e22a623bc13562f51 # v2.1.2
         with:
           # The package has never been published, and this repo has no
           # NPM_TOKEN secret, so a bare `npx changeset publish` fails
