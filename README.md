@@ -215,7 +215,7 @@ maps to the docs root. Search uses heading-weighted token scoring.
 
 ## Compatibility
 
-- **Node.js:** 22.12 or newer (22, 24 and later LTS lines)
+- **Node.js:** 22.19 or newer (22, 24 and later LTS lines)
 - **Fumadocs:** Tested against the default Orama search API and standard sitemap
   layout. Multi-docs sites with `tag` filtering are supported via the
   `tag` argument on `search_docs`.

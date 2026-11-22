@@ -26,7 +26,7 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest]
-        # engines.node is >=22.12.0. Test the floor's major and the
+        # engines.node is >=22.19.0. Test the floor's major and the
         # current LTS line. The smoke-node22-floor job covers the exact
         # minimum patch version.
         node: [22, 24]
@@ -56,9 +56,9 @@ jobs:
       - run: npm run build
 
   # Release builds on the latest Node 22. Consumers can run the
-  # published bundle on the engines floor (22.12.0), which the test
+  # published bundle on the engines floor (22.19.0), which the test
   # matrix does not pin. Install and build with Node 22, then execute
-  # dist/index.js with Node 22.12.0. --version loads runtime
+  # dist/index.js with Node 22.19.0. --version loads runtime
   # dependencies and exits before the server starts. No native addons
   # in the production tree.
   smoke-node22-floor:
@@ -73,8 +73,8 @@ jobs:
       - run: npm run build
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
-          node-version: 22.12.0
-      - name: Run the built CLI on Node 22.12.0
+          node-version: 22.19.0
+      - name: Run the built CLI on Node 22.19.0
         run: |
           echo "node $(node -p process.version)"
           actual="$(node dist/index.js --version)"
