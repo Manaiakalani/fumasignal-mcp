@@ -4,9 +4,13 @@
 // fails every main push (once there are no pending changesets) with
 // ENEEDAUTH. Without a token we still tag the current version so
 // changesets/action can push a git tag and open a GitHub Release from
-// CHANGELOG.md. `changeset tag` is idempotent: it prints "New tag:" only
-// when it actually creates one, which is the line this action uses to
-// decide that a GitHub Release should be opened.
+// CHANGELOG.md.
+//
+// changesets/action v2 no longer parses "New tag:" from stdout. It sets
+// CHANGESETS_OUTPUT to an NDJSON file and reads `git-tag` events from it.
+// Inherit that env var when invoking the CLI. `changeset git-tag` is the
+// v3 name of the old `changeset tag` command; it is idempotent and only
+// emits a git-tag event when it actually creates a tag.
 
 import { execSync } from "node:child_process";
 
@@ -27,4 +31,7 @@ if (npmToken) {
 console.log(
   "NPM_TOKEN is not set; skipping npm publish and tagging the current version instead.",
 );
-execSync("npx changeset tag", { stdio: "inherit" });
+execSync("npx changeset git-tag", {
+  stdio: "inherit",
+  env: process.env,
+});

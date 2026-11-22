@@ -23,7 +23,11 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest]
-        node: [20, 22]
+        # Vitest 5 requires Node >=22.12.0, so the previous Node 20 cell
+        # cannot run the test suite. The published package still declares
+        # engines.node >=20.18.1; this matrix only covers the toolchain
+        # that actually runs here.
+        node: [22]
         # This package resolves filesystem paths, compares them against a
         # root prefix, and normalizes URL<->path separators - all behavior
         # that differs on Windows (backslashes, drive letters, case-

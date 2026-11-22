@@ -40,15 +40,20 @@ jobs:
       # own result.
       - run: npm run check
       - name: Create release PR or publish
-        # Pinned to a commit SHA rather than the "v1" ref: unlike
-        # actions/* above (GitHub's own namespace), "v1" here is a mutable
-        # branch (not even a tag) in a third-party repo, and this step
-        # runs with contents/pull-requests write plus GITHUB_TOKEN and,
-        # when configured, NPM_TOKEN. A compromised "v1" would get
-        # arbitrary code execution with repo-write credentials and, if
-        # present, npm-publish credentials.
+        # Pinned to a commit SHA rather than the "v2" ref: unlike
+        # actions/* above (GitHub's own namespace), "v2" here is a mutable
+        # major tag in a third-party repo, and this step runs with
+        # contents/pull-requests write plus GITHUB_TOKEN and, when
+        # configured, NPM_TOKEN. A compromised "v2" would get arbitrary
+        # code execution with repo-write credentials and, if present,
+        # npm-publish credentials.
         uses: changesets/action@ae32849d5ba541f9ae29e40e22a623bc13562f51 # v2.1.2
         with:
+          # changesets/action v2 renamed these inputs (publish ->
+          # publish-script, version -> version-script) and requires
+          # @changesets/cli v3. github-token is the supported way to pass
+          # the token; GITHUB_TOKEN in env is no longer read by the action.
+          github-token: ${{ secrets.GITHUB_TOKEN }}
           # The package has never been published, and this repo has no
           # NPM_TOKEN secret, so a bare `npx changeset publish` fails
           # every main push with npm ENEEDAUTH once there are no pending
@@ -57,22 +62,23 @@ jobs:
           # `npm run changeset-publish` publishes to npm only when
           # NPM_TOKEN is set (passed through as NPM_TOKEN and
           # NODE_AUTH_TOKEN). Without the token it runs `npx changeset
-          # tag` instead, which is enough for this action to push a `v*`
-          # git tag and open a GitHub Release from CHANGELOG.md.
-          # Version PRs still open as before via the version input
-          # below. `npm run check` above is unchanged.
-          publish: npm run changeset-publish
+          # git-tag` instead. The CLI writes git-tag events to the
+          # CHANGESETS_OUTPUT file that this action reads, which is
+          # enough to push a `v*` git tag and open a GitHub Release from
+          # CHANGELOG.md. Version PRs still open as before via the
+          # version-script input below. `npm run check` above is unchanged.
+          publish-script: npm run changeset-publish
           # `changeset version` only rewrites package.json/CHANGELOG.md; it
           # never touches package-lock.json, so a bare `npx changeset
           # version` silently leaves the lockfile's "version" field
           # pointing at the *previous* release on every future bump
           # (exactly what happened for the 0.1.0 -> 0.1.1 jump). The
-          # changesets/action `version` input is passed straight to a single
-          # command invocation (it errors with "too many arguments" on a
-          # compound `a && b` string), so the lockfile-sync step lives in
-          # the "changeset-version" npm script instead and this just calls
-          # that script.
-          version: npm run changeset-version
+          # changesets/action `version-script` input is passed straight to
+          # a single command invocation (it errors with "too many
+          # arguments" on a compound `a && b` string), so the
+          # lockfile-sync step lives in the "changeset-version" npm script
+          # instead and this just calls that script.
+          version-script: npm run changeset-version
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
