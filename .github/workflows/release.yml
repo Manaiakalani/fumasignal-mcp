@@ -51,8 +51,10 @@ jobs:
         with:
           # changesets/action v2 renamed these inputs (publish ->
           # publish-script, version -> version-script) and requires
-          # @changesets/cli v3. github-token is the supported way to pass
-          # the token; GITHUB_TOKEN in env is no longer read by the action.
+          # @changesets/cli v3. Pass github-token explicitly. The action
+          # still reads GITHUB_TOKEN from the environment and fails the
+          # step when that value is set and differs from github-token, so
+          # the env entry below is the same secret.
           github-token: ${{ secrets.GITHUB_TOKEN }}
           # The package has never been published, and this repo has no
           # NPM_TOKEN secret, so a bare `npx changeset publish` fails
