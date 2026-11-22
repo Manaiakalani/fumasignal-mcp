@@ -24,6 +24,13 @@ describe('parseSitemap', () => {
     expect(parseSitemap(xml)).toEqual(['https://example.com/a&b']);
   });
 
+  it('does not double-unescape xml entities', () => {
+    // Sequential replace of "&amp;" before "&lt;" would turn "&amp;lt;"
+    // into "<". A single-pass decoder must leave it as "&lt;".
+    const xml = `<urlset><url><loc>https://example.com/a&amp;lt;b</loc></url></urlset>`;
+    expect(parseSitemap(xml)).toEqual(['https://example.com/a&lt;b']);
+  });
+
   it('stays fast on an adversarial unclosed <loc> with a long run of spaces (ReDoS regression)', () => {
     // Regression: the old pattern `\s*([^<\s][^<]*?)\s*<\/loc>` had a lazy
     // inner quantifier immediately followed by another quantifier
