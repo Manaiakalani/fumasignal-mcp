@@ -984,6 +984,22 @@ describe('RemoteFumadocsSource', () => {
     expect(page.title).toBe('Age < 18');
   });
 
+  it('does not double-unescape HTML entities in a title', async () => {
+    // Sequential replace of "&amp;" before "&lt;" would turn "&amp;lt;"
+    // into "<". A single-pass decoder must leave it as "&lt;".
+    const html = `<!doctype html><html><head><title>A &amp;lt; B</title></head>
+<body><article><h1>Real</h1><p>content that should appear in the markdown output</p></article></body></html>`;
+    const src = new RemoteFumadocsSource({
+      baseUrl,
+      fetchImpl: makeFetch({
+        'https://example.com/docs/entities': { body: html, contentType: 'text/html' },
+      }),
+    });
+    const page = await src.getPage('/docs/entities');
+    expect(page.title).toBe('A &lt; B');
+    expect(page.title).not.toBe('A < B');
+  });
+
   it('returns null for missing llms.txt', async () => {
     const src = new RemoteFumadocsSource({
       baseUrl,

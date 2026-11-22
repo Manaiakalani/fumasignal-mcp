@@ -27,13 +27,19 @@ export function parseSitemap(xml: string): string[] {
   return urls;
 }
 
+const XML_ENTITIES: Record<string, string> = {
+  '&amp;': '&',
+  '&lt;': '<',
+  '&gt;': '>',
+  '&quot;': '"',
+  '&apos;': "'",
+};
+
+// Single-pass so "&amp;lt;" becomes "&lt;" rather than "<". Replacing
+// "&amp;" first would produce a leftover "&" that later replacements
+// treat as the start of another entity.
 function decodeXmlEntities(s: string): string {
-  return s
-    .replace(/&amp;/g, '&')
-    .replace(/&lt;/g, '<')
-    .replace(/&gt;/g, '>')
-    .replace(/&quot;/g, '"')
-    .replace(/&apos;/g, "'");
+  return s.replace(/&(?:amp|lt|gt|quot|apos);/g, (entity) => XML_ENTITIES[entity] ?? entity);
 }
 
 /**
