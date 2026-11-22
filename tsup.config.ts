@@ -3,7 +3,7 @@ import { defineConfig } from 'tsup';
 export default defineConfig({
   entry: ['src/index.ts'],
   format: ['esm'],
-  target: 'node20',
+  target: 'node22',
   outDir: 'dist',
   clean: true,
   // A CLI binary ships without its original TypeScript source, so a
