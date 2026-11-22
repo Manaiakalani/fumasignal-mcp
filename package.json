@@ -52,7 +52,7 @@
     "changeset-publish": "node scripts/changeset-publish.mjs"
   },
   "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.32.0",
+    "@modelcontextprotocol/sdk": "^1.32.2",
     "commander": "^12.1.0",
     "gray-matter": "^4.0.3",
     "pino": "^9.5.0",
