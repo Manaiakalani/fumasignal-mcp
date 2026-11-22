@@ -26,11 +26,10 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest]
-        # Vitest 5 requires Node >=22.12.0, so this matrix cannot run the
-        # suite on Node 20. engines.node stays >=20.18.1. The
-        # smoke-node20 job builds on Node 22 and runs that bundle on
-        # the engines floor.
-        node: [22]
+        # engines.node is >=22.19.0. Test the floor's major and the
+        # current LTS line. The smoke-node22-floor job covers the exact
+        # minimum patch version.
+        node: [22, 24]
         # This package resolves filesystem paths, compares them against a
         # root prefix, and normalizes URL<->path separators - all behavior
         # that differs on Windows (backslashes, drive letters, case-
@@ -56,13 +55,13 @@ jobs:
       - run: npm test
       - run: npm run build
 
-  # Release builds on Node 22. Consumers can still run the published
-  # bundle on the engines floor, which the test matrix no longer covers.
-  # Install and build with Node 22, then execute dist/index.js with
-  # Node 20.18.1. --version loads runtime dependencies and exits before
-  # the server starts. No native addons in the production tree, so the
-  # Node 22 install can be executed by Node 20.
-  smoke-node20:
+  # Release builds on the latest Node 22. Consumers can run the
+  # published bundle on the engines floor (22.19.0), which the test
+  # matrix does not pin. Install and build with Node 22, then execute
+  # dist/index.js with Node 22.19.0. --version loads runtime
+  # dependencies and exits before the server starts. No native addons
+  # in the production tree.
+  smoke-node22-floor:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -74,8 +73,8 @@ jobs:
       - run: npm run build
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
-          node-version: 20.18.1
-      - name: Run the built CLI on Node 20.18.1
+          node-version: 22.19.0
+      - name: Run the built CLI on Node 22.19.0
         run: |
           echo "node $(node -p process.version)"
           actual="$(node dist/index.js --version)"
