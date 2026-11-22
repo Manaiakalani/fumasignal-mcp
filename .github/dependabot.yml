@@ -4,6 +4,13 @@ updates:
     directory: /
     schedule:
       interval: weekly
+    ignore:
+      # typescript-eslint 8.x still requires typescript >=4.8.4 <6.1.0
+      # because TypeScript 7.0 ships no compiler API. A major bump to 7.x
+      # installs, then eslint crashes at startup. Keep majors ignored until
+      # typescript-eslint supports TS >=7.1.
+      - dependency-name: typescript
+        update-types: ["version-update:semver-major"]
   - package-ecosystem: github-actions
     directory: /
     schedule:

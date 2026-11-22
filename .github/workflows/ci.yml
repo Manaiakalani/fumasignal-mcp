@@ -23,7 +23,11 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest]
-        node: [20, 22]
+        # Vitest 5 requires Node >=22.12.0, so this matrix cannot run the
+        # suite on Node 20. engines.node stays >=20.18.1. The
+        # smoke-node20 job builds on Node 22 and runs that bundle on
+        # the engines floor.
+        node: [22]
         # This package resolves filesystem paths, compares them against a
         # root prefix, and normalizes URL<->path separators - all behavior
         # that differs on Windows (backslashes, drive letters, case-
@@ -48,6 +52,34 @@ jobs:
       - run: npm run lint
       - run: npm test
       - run: npm run build
+
+  # Release builds on Node 22. Consumers can still run the published
+  # bundle on the engines floor, which the test matrix no longer covers.
+  # Install and build with Node 22, then execute dist/index.js with
+  # Node 20.18.1. --version loads runtime dependencies and exits before
+  # the server starts. No native addons in the production tree, so the
+  # Node 22 install can be executed by Node 20.
+  smoke-node20:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run build
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 20.18.1
+      - name: Run the built CLI on Node 20.18.1
+        run: |
+          echo "node $(node -p process.version)"
+          actual="$(node dist/index.js --version)"
+          expected="$(node -p 'JSON.parse(require("fs").readFileSync("package.json","utf8")).version')"
+          echo "cli $actual"
+          test "$actual" = "$expected"
+          node dist/index.js --help >/dev/null
 
   # Kept out of the test matrix deliberately: this is the only step that
   # depends on the advisory registry being reachable, and there is nothing
